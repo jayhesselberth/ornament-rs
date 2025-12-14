@@ -10,6 +10,7 @@ fn main() {
 
     // Path to ext/ directory (two levels up from crates/infernal-sys)
     let ext_dir = manifest_dir.parent().unwrap().parent().unwrap().join("ext");
+    let _ = manifest_dir; // unused now
     let infernal_dir = ext_dir.join("infernal");
 
     // HMMER and Easel are inside the infernal directory
@@ -37,7 +38,6 @@ fn main() {
     println!("cargo:rustc-link-search=native={}", build_dir.join("hmmer/src").display());
     println!("cargo:rustc-link-search=native={}", build_dir.join("src").display());
 
-    // Link infernal first (depends on hmmer and easel)
     println!("cargo:rustc-link-lib=static=infernal");
     println!("cargo:rustc-link-lib=static=hmmer");
     println!("cargo:rustc-link-lib=static=easel");
@@ -161,29 +161,55 @@ fn generate_bindings(infernal_dir: &Path, hmmer_dir: &Path, easel_dir: &Path, ou
         .clang_arg(format!("-I{}", build_dir.join("hmmer/src").display()))
         .clang_arg(format!("-I{}", build_dir.join("easel").display()))
         // Allowlist the types/functions we need
+        // Infernal types
         .allowlist_type("CM_t")
         .allowlist_type("CM_FILE")
-        .allowlist_type("ESL_ALPHABET")
-        .allowlist_type("ESL_SQ")
-        .allowlist_type("ESL_DSQ")
-        .allowlist_type("ESL_MSA")
         .allowlist_type("CM_TOPHITS")
         .allowlist_type("CM_HIT")
         .allowlist_type("CM_PIPELINE")
         .allowlist_type("Parsetree_t")
+        // HMMER types (for HMM filter in pipeline)
+        .allowlist_type("P7_OPROFILE")
+        .allowlist_type("P7_PROFILE")
+        .allowlist_type("P7_BG")
+        .allowlist_type("P7_HMM")
+        .allowlist_type("P7_SCOREDATA")
+        // Easel types
+        .allowlist_type("ESL_ALPHABET")
+        .allowlist_type("ESL_SQ")
+        .allowlist_type("ESL_SQFILE")
+        .allowlist_type("ESL_DSQ")
+        .allowlist_type("ESL_MSA")
+        .allowlist_type("ESL_GETOPTS")
+        // Infernal functions
         .allowlist_function("cm_file_Open")
         .allowlist_function("cm_file_Read")
         .allowlist_function("cm_file_Close")
         .allowlist_function("cm_Configure")
         .allowlist_function("cm_pipeline_Create")
+        .allowlist_function("cm_pipeline_Destroy")
         .allowlist_function("cm_Pipeline")
         .allowlist_function("cm_tophits_.*")
+        .allowlist_function("CreateCMConsensus")
+        .allowlist_function("FreeCM")
+        // HMMER functions (for HMM filter setup)
+        .allowlist_function("p7_profile_Create")
+        .allowlist_function("p7_profile_Destroy")
+        .allowlist_function("p7_oprofile_Create")
+        .allowlist_function("p7_oprofile_Convert")
+        .allowlist_function("p7_oprofile_Destroy")
+        .allowlist_function("p7_bg_Create")
+        .allowlist_function("p7_bg_Destroy")
+        .allowlist_function("p7_ProfileConfig")
+        .allowlist_function("p7_hmm_ScoreDataCreate")
+        .allowlist_function("p7_hmm_ScoreDataDestroy")
+        // Easel functions
         .allowlist_function("esl_alphabet_Create")
         .allowlist_function("esl_alphabet_Destroy")
         .allowlist_function("esl_sq_.*")
         .allowlist_function("esl_sqfile_.*")
-        .allowlist_function("CreateCMConsensus")
-        .allowlist_function("FreeCM")
+        .allowlist_function("esl_sqio_.*")
+        .allowlist_function("esl_vec_FCopy")
         // Generate
         .generate()
         .expect("Unable to generate bindings");

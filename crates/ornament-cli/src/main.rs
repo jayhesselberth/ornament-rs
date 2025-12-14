@@ -3,7 +3,8 @@
 //! Scans genomic sequences for tRNAs and analyzes modification compatibility.
 
 use clap::{Parser, Subcommand};
-use anyhow::Result;
+use anyhow::{anyhow, Result};
+use std::path::Path;
 
 #[derive(Parser)]
 #[command(name = "ornament")]
@@ -80,13 +81,59 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Scan { input, cm, output: _, format: _ } => {
-            println!("Scanning {} for tRNAs...", input);
-            if let Some(cm_path) = cm {
-                println!("Using CM: {}", cm_path);
+        Commands::Scan { input, cm, output, format } => {
+            use ornament_core::infernal::InfernalRunner;
+
+            let cm_path = cm.ok_or_else(|| anyhow!("--cm is required"))?;
+
+            // Verify input file exists
+            if !Path::new(&input).exists() {
+                return Err(anyhow!("Input file not found: {}", input));
             }
-            // TODO: Implement scanning
-            println!("Scan not yet implemented");
+
+            // Verify CM file exists
+            if !Path::new(&cm_path).exists() {
+                return Err(anyhow!("CM file not found: {}", cm_path));
+            }
+
+            eprintln!("Scanning {} for tRNAs using {}...", input, cm_path);
+
+            // Run cmsearch subprocess
+            let runner = InfernalRunner::new()
+                .with_cm(&cm_path)
+                .with_e_value(1e-5);
+
+            let hits = runner.cmsearch(&input)?;
+
+            eprintln!("Found {} hits", hits.len());
+
+            // Format output
+            let output_str = match format.as_str() {
+                "json" => serde_json::to_string_pretty(&hits)?,
+                "tsv" => {
+                    let mut lines = vec!["target_name\tstart\tend\tstrand\tscore\te_value".to_string()];
+                    for hit in &hits {
+                        lines.push(format!("{}\t{}\t{}\t{}\t{:.1}\t{:.2e}",
+                            hit.target_name,
+                            hit.target_start,
+                            hit.target_end,
+                            hit.strand,
+                            hit.score,
+                            hit.e_value
+                        ));
+                    }
+                    lines.join("\n")
+                }
+                _ => return Err(anyhow!("Unknown format: {}. Use 'json' or 'tsv'", format)),
+            };
+
+            // Write output
+            if let Some(output_path) = output {
+                std::fs::write(&output_path, &output_str)?;
+                eprintln!("Results written to {}", output_path);
+            } else {
+                println!("{}", output_str);
+            }
         }
 
         Commands::Analyze { input, output: _, threshold } => {
