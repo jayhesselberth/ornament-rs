@@ -66,5 +66,5 @@ pub enum Severity {
     Minor,
 }
 
-pub use compatibility::analyze_compatibility;
+pub use compatibility::{analyze_compatibility, analyze_batch, BatchAnalysisResult};
 pub use odd_trna::detect_odd_trnas;

@@ -1,7 +1,9 @@
 //! Modification database - MODOMICS-derived tRNA modification expectations
 
 use crate::modification::types::*;
+use crate::modification::modomics;
 use rustc_hash::FxHashMap;
+use std::path::Path;
 
 /// Database of known tRNA modifications and their position expectations
 pub struct ModificationDatabase {
@@ -9,6 +11,8 @@ pub struct ModificationDatabase {
     modifications: FxHashMap<String, Modification>,
     /// Position-specific expectations (Sprinzl position -> expectations)
     position_expectations: FxHashMap<String, Vec<PositionModExpectation>>,
+    /// Alias mapping (e.g., "Psi" -> "Y")
+    aliases: FxHashMap<String, String>,
 }
 
 impl ModificationDatabase {
@@ -17,16 +21,68 @@ impl ModificationDatabase {
         let mut db = Self {
             modifications: FxHashMap::default(),
             position_expectations: FxHashMap::default(),
+            aliases: FxHashMap::default(),
         };
         db.load_default_modifications();
+        db.setup_aliases();
         db.load_eukaryotic_expectations();
         db
     }
 
-    /// Get a modification by short name
-    pub fn get_modification(&self, short_name: &str) -> Option<&Modification> {
-        self.modifications.get(short_name)
+    /// Create a database from a MODOMICS JSON file, with eukaryotic position expectations
+    pub fn from_modomics_file(path: &Path) -> Result<Self, modomics::ModomicsError> {
+        let modifications = modomics::parse_modomics_file(path)?;
+
+        let mut db = Self {
+            modifications,
+            position_expectations: FxHashMap::default(),
+            aliases: FxHashMap::default(),
+        };
+
+        db.setup_aliases();
+        db.load_eukaryotic_expectations();
+        Ok(db)
     }
+
+    /// Create a database from MODOMICS JSON string, with eukaryotic position expectations
+    pub fn from_modomics_json(json: &str) -> Result<Self, modomics::ModomicsError> {
+        let modifications = modomics::parse_modomics_json(json)?;
+
+        let mut db = Self {
+            modifications,
+            position_expectations: FxHashMap::default(),
+            aliases: FxHashMap::default(),
+        };
+
+        db.setup_aliases();
+        db.load_eukaryotic_expectations();
+        Ok(db)
+    }
+
+    /// Set up common aliases (e.g., "Psi" -> "Y")
+    fn setup_aliases(&mut self) {
+        // Pseudouridine: we use "Psi", MODOMICS uses "Y"
+        self.aliases.insert("Psi".to_string(), "Y".to_string());
+        self.aliases.insert("psi".to_string(), "Y".to_string());
+
+        // Ribothymidine aliases
+        self.aliases.insert("rT".to_string(), "m5U".to_string());
+        self.aliases.insert("T".to_string(), "m5U".to_string());
+    }
+
+    /// Get a modification by short name (checks aliases)
+    pub fn get_modification(&self, short_name: &str) -> Option<&Modification> {
+        // First try direct lookup
+        if let Some(m) = self.modifications.get(short_name) {
+            return Some(m);
+        }
+        // Then try alias lookup
+        if let Some(alias) = self.aliases.get(short_name) {
+            return self.modifications.get(alias);
+        }
+        None
+    }
+
 
     /// Get all modifications in the database
     pub fn modifications(&self) -> &FxHashMap<String, Modification> {
@@ -211,150 +267,187 @@ impl ModificationDatabase {
         });
     }
 
+    /// Helper to get a cloned modification by name, checking aliases
+    fn get_mod_cloned(&self, name: &str) -> Option<Modification> {
+        // First try direct lookup
+        if let Some(m) = self.modifications.get(name) {
+            return Some(m.clone());
+        }
+        // Then try alias lookup
+        if let Some(alias) = self.aliases.get(name) {
+            return self.modifications.get(alias).cloned();
+        }
+        None
+    }
+
     fn load_eukaryotic_expectations(&mut self) {
         // Position 8 - Usually A, sometimes modified
         // (Not adding modification requirement)
 
         // Position 13-17 - D-loop dihydrouridines
-        for pos in [16, 17, 20] {
+        if let Some(d) = self.get_mod_cloned("D") {
+            for pos in [16, 17, 20] {
+                self.add_position_expectation(PositionModExpectation {
+                    position: SprinzlPosition::from_num(pos),
+                    modifications: vec![d.clone()],
+                    conservation: ConservationLevel::Universal,
+                    functional_role: FunctionalRole::StructuralStability,
+                    isotypes: vec![],
+                });
+            }
+        }
+
+        // Position 32 - Cm in some tRNAs
+        if let Some(cm) = self.get_mod_cloned("Cm") {
             self.add_position_expectation(PositionModExpectation {
-                position: SprinzlPosition::from_num(pos),
-                modifications: vec![self.modifications.get("D").unwrap().clone()],
+                position: SprinzlPosition::from_num(32),
+                modifications: vec![cm],
+                conservation: ConservationLevel::IsotypeSpecific,
+                functional_role: FunctionalRole::AnticodonFunction,
+                isotypes: vec![Isotype::PHE.to_string(), Isotype::TRP.to_string()],
+            });
+        }
+
+        // Position 34 - Wobble position - various modifications
+        // Inosine in specific tRNAs
+        if let Some(i) = self.get_mod_cloned("I") {
+            self.add_position_expectation(PositionModExpectation {
+                position: SprinzlPosition::from_num(34),
+                modifications: vec![i],
+                conservation: ConservationLevel::IsotypeSpecific,
+                functional_role: FunctionalRole::AnticodonFunction,
+                isotypes: vec![
+                    Isotype::ALA.to_string(),
+                    Isotype::ARG.to_string(),
+                    Isotype::ILE.to_string(),
+                    Isotype::LEU.to_string(),
+                    Isotype::PRO.to_string(),
+                    Isotype::SER.to_string(),
+                    Isotype::THR.to_string(),
+                    Isotype::VAL.to_string(),
+                ],
+            });
+        }
+
+        // Queuosine at position 34 for specific isotypes
+        if let Some(q) = self.get_mod_cloned("Q") {
+            self.add_position_expectation(PositionModExpectation {
+                position: SprinzlPosition::from_num(34),
+                modifications: vec![q],
+                conservation: ConservationLevel::IsotypeSpecific,
+                functional_role: FunctionalRole::AnticodonFunction,
+                isotypes: vec![
+                    Isotype::ASN.to_string(),
+                    Isotype::ASP.to_string(),
+                    Isotype::HIS.to_string(),
+                    Isotype::TYR.to_string(),
+                ],
+            });
+        }
+
+        // Position 37 - 3' of anticodon - hypermodified in most tRNAs
+        // t6A is common
+        if let Some(t6a) = self.get_mod_cloned("t6A") {
+            self.add_position_expectation(PositionModExpectation {
+                position: SprinzlPosition::from_num(37),
+                modifications: vec![t6a],
+                conservation: ConservationLevel::DomainSpecific,
+                functional_role: FunctionalRole::AnticodonFunction,
+                isotypes: vec![
+                    Isotype::ILE.to_string(),
+                    Isotype::LYS.to_string(),
+                    Isotype::ASN.to_string(),
+                    Isotype::SER.to_string(),
+                    Isotype::THR.to_string(),
+                ],
+            });
+        }
+
+        // i6A at position 37
+        if let Some(i6a) = self.get_mod_cloned("i6A") {
+            self.add_position_expectation(PositionModExpectation {
+                position: SprinzlPosition::from_num(37),
+                modifications: vec![i6a],
+                conservation: ConservationLevel::IsotypeSpecific,
+                functional_role: FunctionalRole::AnticodonFunction,
+                isotypes: vec![
+                    Isotype::CYS.to_string(),
+                    Isotype::SER.to_string(),
+                    Isotype::TRP.to_string(),
+                ],
+            });
+        }
+
+        // m1G at position 37 for some isotypes
+        if let Some(m1g) = self.get_mod_cloned("m1G") {
+            self.add_position_expectation(PositionModExpectation {
+                position: SprinzlPosition::from_num(37),
+                modifications: vec![m1g],
+                conservation: ConservationLevel::IsotypeSpecific,
+                functional_role: FunctionalRole::AnticodonFunction,
+                isotypes: vec![
+                    Isotype::ALA.to_string(),
+                    Isotype::ARG.to_string(),
+                    Isotype::LEU.to_string(),
+                    Isotype::PRO.to_string(),
+                ],
+            });
+        }
+
+        // Position 46 - m7G
+        if let Some(m7g) = self.get_mod_cloned("m7G") {
+            self.add_position_expectation(PositionModExpectation {
+                position: SprinzlPosition::from_num(46),
+                modifications: vec![m7g],
                 conservation: ConservationLevel::Universal,
                 functional_role: FunctionalRole::StructuralStability,
                 isotypes: vec![],
             });
         }
 
-        // Position 32 - Cm in some tRNAs
-        self.add_position_expectation(PositionModExpectation {
-            position: SprinzlPosition::from_num(32),
-            modifications: vec![self.modifications.get("Cm").unwrap().clone()],
-            conservation: ConservationLevel::IsotypeSpecific,
-            functional_role: FunctionalRole::AnticodonFunction,
-            isotypes: vec![Isotype::PHE.to_string(), Isotype::TRP.to_string()],
-        });
-
-        // Position 34 - Wobble position - various modifications
-        // Inosine in specific tRNAs
-        self.add_position_expectation(PositionModExpectation {
-            position: SprinzlPosition::from_num(34),
-            modifications: vec![self.modifications.get("I").unwrap().clone()],
-            conservation: ConservationLevel::IsotypeSpecific,
-            functional_role: FunctionalRole::AnticodonFunction,
-            isotypes: vec![
-                Isotype::ALA.to_string(),
-                Isotype::ARG.to_string(),
-                Isotype::ILE.to_string(),
-                Isotype::LEU.to_string(),
-                Isotype::PRO.to_string(),
-                Isotype::SER.to_string(),
-                Isotype::THR.to_string(),
-                Isotype::VAL.to_string(),
-            ],
-        });
-
-        // Queuosine at position 34 for specific isotypes
-        self.add_position_expectation(PositionModExpectation {
-            position: SprinzlPosition::from_num(34),
-            modifications: vec![self.modifications.get("Q").unwrap().clone()],
-            conservation: ConservationLevel::IsotypeSpecific,
-            functional_role: FunctionalRole::AnticodonFunction,
-            isotypes: vec![
-                Isotype::ASN.to_string(),
-                Isotype::ASP.to_string(),
-                Isotype::HIS.to_string(),
-                Isotype::TYR.to_string(),
-            ],
-        });
-
-        // Position 37 - 3' of anticodon - hypermodified in most tRNAs
-        // t6A is common
-        self.add_position_expectation(PositionModExpectation {
-            position: SprinzlPosition::from_num(37),
-            modifications: vec![self.modifications.get("t6A").unwrap().clone()],
-            conservation: ConservationLevel::DomainSpecific,
-            functional_role: FunctionalRole::AnticodonFunction,
-            isotypes: vec![
-                Isotype::ILE.to_string(),
-                Isotype::LYS.to_string(),
-                Isotype::ASN.to_string(),
-                Isotype::SER.to_string(),
-                Isotype::THR.to_string(),
-            ],
-        });
-
-        // i6A at position 37
-        self.add_position_expectation(PositionModExpectation {
-            position: SprinzlPosition::from_num(37),
-            modifications: vec![self.modifications.get("i6A").unwrap().clone()],
-            conservation: ConservationLevel::IsotypeSpecific,
-            functional_role: FunctionalRole::AnticodonFunction,
-            isotypes: vec![
-                Isotype::CYS.to_string(),
-                Isotype::SER.to_string(),
-                Isotype::TRP.to_string(),
-            ],
-        });
-
-        // m1G at position 37 for some isotypes
-        self.add_position_expectation(PositionModExpectation {
-            position: SprinzlPosition::from_num(37),
-            modifications: vec![self.modifications.get("m1G").unwrap().clone()],
-            conservation: ConservationLevel::IsotypeSpecific,
-            functional_role: FunctionalRole::AnticodonFunction,
-            isotypes: vec![
-                Isotype::ALA.to_string(),
-                Isotype::ARG.to_string(),
-                Isotype::LEU.to_string(),
-                Isotype::PRO.to_string(),
-            ],
-        });
-
-        // Position 46 - m7G
-        self.add_position_expectation(PositionModExpectation {
-            position: SprinzlPosition::from_num(46),
-            modifications: vec![self.modifications.get("m7G").unwrap().clone()],
-            conservation: ConservationLevel::Universal,
-            functional_role: FunctionalRole::StructuralStability,
-            isotypes: vec![],
-        });
-
         // Position 48/49 - m5C
-        self.add_position_expectation(PositionModExpectation {
-            position: SprinzlPosition::from_num(48),
-            modifications: vec![self.modifications.get("m5C").unwrap().clone()],
-            conservation: ConservationLevel::DomainSpecific,
-            functional_role: FunctionalRole::StructuralStability,
-            isotypes: vec![],
-        });
+        if let Some(m5c) = self.get_mod_cloned("m5C") {
+            self.add_position_expectation(PositionModExpectation {
+                position: SprinzlPosition::from_num(48),
+                modifications: vec![m5c],
+                conservation: ConservationLevel::DomainSpecific,
+                functional_role: FunctionalRole::StructuralStability,
+                isotypes: vec![],
+            });
+        }
 
         // Position 54 - m5U (ribothymidine) - nearly universal
-        self.add_position_expectation(PositionModExpectation {
-            position: SprinzlPosition::from_num(54),
-            modifications: vec![self.modifications.get("m5U").unwrap().clone()],
-            conservation: ConservationLevel::Universal,
-            functional_role: FunctionalRole::StructuralStability,
-            isotypes: vec![],
-        });
+        if let Some(m5u) = self.get_mod_cloned("m5U") {
+            self.add_position_expectation(PositionModExpectation {
+                position: SprinzlPosition::from_num(54),
+                modifications: vec![m5u],
+                conservation: ConservationLevel::Universal,
+                functional_role: FunctionalRole::StructuralStability,
+                isotypes: vec![],
+            });
+        }
 
-        // Position 55 - Pseudouridine - universal
-        self.add_position_expectation(PositionModExpectation {
-            position: SprinzlPosition::from_num(55),
-            modifications: vec![self.modifications.get("Psi").unwrap().clone()],
-            conservation: ConservationLevel::Universal,
-            functional_role: FunctionalRole::StructuralStability,
-            isotypes: vec![],
-        });
+        // Position 55 - Pseudouridine - universal (try both Psi and Y)
+        if let Some(psi) = self.get_mod_cloned("Psi").or_else(|| self.get_mod_cloned("Y")) {
+            self.add_position_expectation(PositionModExpectation {
+                position: SprinzlPosition::from_num(55),
+                modifications: vec![psi],
+                conservation: ConservationLevel::Universal,
+                functional_role: FunctionalRole::StructuralStability,
+                isotypes: vec![],
+            });
+        }
 
         // Position 58 - m1A - very common
-        self.add_position_expectation(PositionModExpectation {
-            position: SprinzlPosition::from_num(58),
-            modifications: vec![self.modifications.get("m1A").unwrap().clone()],
-            conservation: ConservationLevel::Universal,
-            functional_role: FunctionalRole::StructuralStability,
-            isotypes: vec![],
-        });
+        if let Some(m1a) = self.get_mod_cloned("m1A") {
+            self.add_position_expectation(PositionModExpectation {
+                position: SprinzlPosition::from_num(58),
+                modifications: vec![m1a],
+                conservation: ConservationLevel::Universal,
+                functional_role: FunctionalRole::StructuralStability,
+                isotypes: vec![],
+            });
+        }
     }
 
     fn add_modification(&mut self, modification: Modification) {
@@ -405,5 +498,50 @@ mod tests {
         assert!(exp34_ala.iter().any(|e|
             e.modifications.iter().any(|m| m.short_name == "I")
         ));
+    }
+
+    #[test]
+    fn test_from_modomics_json() {
+        // Minimal MODOMICS-format JSON with key modifications
+        let json = r#"{
+            "14": {
+                "id": 14,
+                "name": "dihydrouridine",
+                "short_name": "D",
+                "new_abbrev": "D",
+                "reference_moiety": ["U"]
+            },
+            "118": {
+                "id": 118,
+                "name": "pseudouridine",
+                "short_name": "Y",
+                "new_abbrev": "P",
+                "reference_moiety": ["U"]
+            },
+            "113": {
+                "id": 113,
+                "name": "inosine",
+                "short_name": "I",
+                "new_abbrev": "I",
+                "reference_moiety": ["A"]
+            }
+        }"#;
+
+        let db = ModificationDatabase::from_modomics_json(json).unwrap();
+
+        // Should have loaded modifications
+        assert!(db.get_modification("D").is_some());
+        assert!(db.get_modification("Y").is_some());
+        assert!(db.get_modification("I").is_some());
+
+        // Alias should work: "Psi" -> "Y"
+        assert!(db.get_modification("Psi").is_some());
+
+        // Position expectations should be set for available mods
+        let exp16 = db.get_expectations(&SprinzlPosition::from_num(16));
+        assert!(!exp16.is_empty()); // D-loop dihydrouridine
+
+        let exp55 = db.get_expectations(&SprinzlPosition::from_num(55));
+        assert!(!exp55.is_empty()); // Pseudouridine
     }
 }
