@@ -1,0 +1,17 @@
+[package]
+name = "ornament-cli"
+description = "Modification-aware tRNA scanner CLI"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "ornament"
+path = "src/main.rs"
+
+[dependencies]
+ornament-core = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+serde_json = { workspace = true }

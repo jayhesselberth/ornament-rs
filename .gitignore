@@ -1,0 +1,31 @@
+# Build artifacts
+/target/
+**/*.rs.bk
+
+# Dependencies (cloned via scripts/setup-deps.sh)
+/ext/
+
+# Cargo lock for libraries (optional - uncomment if you want to track it)
+# Cargo.lock
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test/debug artifacts
+*.log
+*.tmp
+
+# Generated documentation
+/doc/
+
+# Profiling
+*.profraw
+*.profdata

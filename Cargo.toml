@@ -1,0 +1,40 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/infernal-sys",
+    "crates/ornament-core",
+    "crates/ornament-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["Jay Hesselberth"]
+repository = "https://github.com/jayhesselberth/ornament"
+
+[workspace.dependencies]
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Error handling
+anyhow = "1"
+thiserror = "1"
+
+# Performance
+rustc-hash = "1"
+
+# Utilities
+lazy_static = "1"
+regex = "1"
+
+# Bioinformatics
+bio = "1"
+
+# Internal crates
+infernal-sys = { path = "crates/infernal-sys" }
+ornament-core = { path = "crates/ornament-core" }
