@@ -110,6 +110,9 @@ fn multihit_both_strands_match_oracle() {
 
     // Sorted best-first by E-value.
     for w in hits.windows(2) {
-        assert!(w[0].evalue.unwrap() <= w[1].evalue.unwrap(), "sorted by E-value");
+        assert!(
+            w[0].evalue.unwrap() <= w[1].evalue.unwrap(),
+            "sorted by E-value"
+        );
     }
 }
