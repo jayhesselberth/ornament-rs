@@ -9,9 +9,13 @@
 //! - [`hmm`] — parser for the embedded HMMER3/f filter HMM (`fp7`).
 //! - `profile`, `msv`, `vit`, `fwd` — to come.
 
+pub mod fwd;
 pub mod hmm;
+pub mod profile;
 
+pub use fwd::{forward_bits, forward_nats};
 pub use hmm::{parse_p7_hmm, EvParam, P7Hmm};
+pub use profile::P7Profile;
 
 use thiserror::Error;
 

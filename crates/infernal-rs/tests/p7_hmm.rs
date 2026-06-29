@@ -1,8 +1,9 @@
 //! Parse the HMMER3/f filter HMM embedded in the RF00005 `.cm` and check it against the
 //! known header values + probability invariants.
 
+use easel_rs::{read_fasta, Alphabet};
 use hmmer_rs::hmm::tr;
-use hmmer_rs::parse_p7_hmm;
+use hmmer_rs::{forward_bits, parse_p7_hmm};
 use infernal_rs::parse_cm_file;
 
 #[test]
@@ -38,4 +39,29 @@ fn parses_embedded_filter_hmm() {
 
     // COMPO present.
     assert!(hmm.compo.is_some());
+}
+
+#[test]
+fn forward_filter_score_matches_hmmsearch() {
+    // The native p7 Forward filter must reproduce hmmsearch's full-sequence Forward bit
+    // score (hmmsearch --max on the extracted filter HMM): 53.5 on the consensus, 50.1 on
+    // the embedded tRNA.
+    let cm = parse_cm_file(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/tRNA.cm")).unwrap();
+    let hmm = parse_p7_hmm(cm.fp7_text.as_deref().unwrap()).unwrap();
+    let abc = Alphabet::rna();
+
+    for (file, want) in [
+        ("/tests/data/trna_cons.fa", 53.5f32),
+        ("/tests/data/trna_embedded.fa", 50.1f32),
+    ] {
+        let path = format!("{}{}", env!("CARGO_MANIFEST_DIR"), file);
+        let recs = read_fasta(&path).unwrap();
+        let dsq = abc.digitize(&recs[0].seq).unwrap();
+        let bits = forward_bits(&hmm, &abc, &dsq);
+        eprintln!("{file}: native Forward = {bits:.2} bits (oracle {want})");
+        assert!(
+            (bits - want).abs() < 0.5,
+            "{file}: native Forward {bits:.3} != hmmsearch {want}"
+        );
+    }
 }
