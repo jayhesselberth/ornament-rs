@@ -3,7 +3,7 @@
 //! Scans genomic sequences for tRNAs and analyzes modification compatibility.
 
 use anyhow::{anyhow, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use std::path::Path;
 
 #[derive(Parser)]
@@ -12,6 +12,16 @@ use std::path::Path;
 struct Cli {
     #[command(subcommand)]
     command: Commands,
+}
+
+/// Search engine used by the `scan` command.
+#[derive(ValueEnum, Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Engine {
+    /// Native pure-Rust CM engine (no external binary or C toolchain). Default.
+    #[default]
+    Native,
+    /// External `cmsearch` subprocess (Infernal must be on PATH). Oracle/fallback.
+    Cmsearch,
 }
 
 #[derive(Subcommand)]
@@ -33,6 +43,10 @@ enum Commands {
         /// Output format (json, tsv)
         #[arg(short, long, default_value = "json")]
         format: String,
+
+        /// Search engine: native (pure Rust, default) or cmsearch (subprocess)
+        #[arg(long, value_enum, default_value_t = Engine::Native)]
+        engine: Engine,
     },
 
     /// Analyze modification compatibility of tRNA sequences
@@ -94,8 +108,12 @@ fn main() -> Result<()> {
             cm,
             output,
             format,
+            engine,
         } => {
-            use ornament_core::infernal::InfernalRunner;
+            use ornament_core::infernal::{scan_native, InfernalRunner};
+
+            // E-value reporting threshold (mirrors `cmsearch -E`).
+            const E_VALUE: f64 = 1e-5;
 
             let cm_path = cm.ok_or_else(|| anyhow!("--cm is required"))?;
 
@@ -109,12 +127,25 @@ fn main() -> Result<()> {
                 return Err(anyhow!("CM file not found: {}", cm_path));
             }
 
-            eprintln!("Scanning {} for tRNAs using {}...", input, cm_path);
-
-            // Run cmsearch subprocess
-            let runner = InfernalRunner::new().with_cm(&cm_path).with_e_value(1e-5);
-
-            let hits = runner.cmsearch(&input)?;
+            let hits = match engine {
+                Engine::Native => {
+                    eprintln!(
+                        "Scanning {} for tRNAs using {} (native engine)...",
+                        input, cm_path
+                    );
+                    scan_native(&cm_path, &input, E_VALUE)?
+                }
+                Engine::Cmsearch => {
+                    eprintln!(
+                        "Scanning {} for tRNAs using {} (cmsearch subprocess)...",
+                        input, cm_path
+                    );
+                    let runner = InfernalRunner::new()
+                        .with_cm(&cm_path)
+                        .with_e_value(E_VALUE);
+                    runner.cmsearch(&input)?
+                }
+            };
 
             eprintln!("Found {} hits", hits.len());
 

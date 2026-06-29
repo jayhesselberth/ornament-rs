@@ -7,10 +7,12 @@
 // the differential-testing oracle and runtime fallback.
 #[cfg(feature = "ffi")]
 pub mod ffi;
+pub mod native;
 pub mod parser;
 pub mod runner;
 
 #[cfg(feature = "ffi")]
 pub use ffi::{Alphabet, CovarianceModel, HmmFilter, Sequence, SequenceFile, TopHits};
+pub use native::scan_native;
 pub use parser::{CMAlignment, CMHit};
 pub use runner::InfernalRunner;

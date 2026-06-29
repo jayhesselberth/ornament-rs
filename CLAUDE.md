@@ -109,7 +109,12 @@ covariance-model search internals. Crates:
   - `integration/` - modkit BedMethyl parsing
   - `output/` - JSON/TSV formatters
 
-- **ornament-cli**: CLI binary with subcommands: `scan`, `analyze`, `compare`, `mods`
+- **ornament-cli**: CLI binary with subcommands: `scan`, `analyze`, `compare`, `mods`.
+  `scan` takes `--engine native|cmsearch` (**default `native`**): `native` runs the
+  pure-Rust `infernal-rs` CYK scanner in-process (`infernal::scan_native`, no external
+  binary); `cmsearch` shells out to the Infernal subprocess (`InfernalRunner`) as an
+  oracle/fallback. Both yield the same `CMHit` records, so the downstream Sprinzl +
+  modification analysis is identical.
 
 ### Key Concepts
 

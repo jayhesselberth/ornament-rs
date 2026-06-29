@@ -1,6 +1,10 @@
 #!/bin/bash
-# Setup script for ornament dependencies
-# Run this once before building to clone Infernal, HMMER, and Easel
+# Clone the Infernal/HMMER/Easel 1.1.5 C sources into ext/.
+#
+# PORTING REFERENCE ONLY: ext/ is *not* a build dependency. The default build is
+# pure Rust (easel-rs/hmmer-rs/infernal-rs) and needs neither ext/ nor a C
+# toolchain. These sources exist only as a reference for the native port and for
+# the optional legacy C-FFI path (ornament-core --features ffi / -p infernal-sys).
 
 set -e
 
@@ -59,5 +63,6 @@ if [ ! -f "$EXT_DIR/infernal/configure" ]; then
 fi
 
 echo ""
-echo "Dependencies setup complete!"
-echo "You can now build ornament with: cargo build"
+echo "Porting-reference sources cloned into ext/."
+echo "Note: the default 'cargo build' is pure Rust and does NOT use ext/."
+echo "ext/ is only needed for porting work or the optional 'ffi' feature."
