@@ -1,8 +1,23 @@
 //! `hmmer-rs`: native Rust port of the HMMER p7 machinery Infernal uses as its CM
-//! acceleration filter (`P7_HMM`/`P7_PROFILE`/`P7_OPROFILE`/`P7_BG` + MSV/Viterbi/Forward).
+//! acceleration filter (`P7_HMM` / `P7_PROFILE` + MSV/Viterbi/Forward).
 //!
-//! Scaffolding only — implemented in Phase 5. The correctness-first CM core (Phases 1–4)
-//! runs the unfiltered CYK/Inside DP and does not depend on this crate yet.
+//! The CM core (`infernal-rs`) is functionally complete without this — the p7 filter is an
+//! acceleration stage that pre-selects windows for the expensive CYK/Inside DP. The final
+//! reported scores still come from the CM, so the filter only affects speed.
+//!
+//! Modules:
+//! - [`hmm`] — parser for the embedded HMMER3/f filter HMM (`fp7`).
+//! - `profile`, `msv`, `vit`, `fwd` — to come.
 
-/// Placeholder until the p7 filter pipeline lands in Phase 5.
-pub fn placeholder() {}
+pub mod hmm;
+
+pub use hmm::{parse_p7_hmm, EvParam, P7Hmm};
+
+use thiserror::Error;
+
+/// Errors from the HMMER p7 layer.
+#[derive(Debug, Error)]
+pub enum HmmerError {
+    #[error("p7 parse error: {0}")]
+    Parse(String),
+}
