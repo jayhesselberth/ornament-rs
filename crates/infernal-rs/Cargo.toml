@@ -15,6 +15,7 @@ bench = false
 easel-rs = { workspace = true }
 hmmer-rs = { workspace = true }
 thiserror = { workspace = true }
+rayon = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }

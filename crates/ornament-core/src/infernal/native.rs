@@ -8,6 +8,7 @@
 //! Sprinzl/modification analysis already consume.
 
 use anyhow::{anyhow, Result};
+use rayon::prelude::*;
 use std::path::Path;
 
 use infernal_rs::{configure_local, cyk_search, parse_cm_file, Strand};
@@ -42,38 +43,44 @@ pub fn scan_native<P: AsRef<Path>, Q: AsRef<Path>>(
     let w_max = cm.w as usize;
     let query_name = cm.name.clone();
 
-    let mut hits = Vec::new();
-    for rec in &records {
-        let dsq = cm
-            .abc
-            .digitize(&rec.seq)
-            .map_err(|e| anyhow!("failed to digitize sequence {}: {e}", rec.name))?;
+    // Records are independent scans — search them in parallel. The per-record collect is
+    // order-preserving, so the flattened result is identical regardless of thread count.
+    let per_record: Vec<Vec<CMHit>> = records
+        .par_iter()
+        .map(|rec| -> Result<Vec<CMHit>> {
+            let dsq = cm
+                .abc
+                .digitize(&rec.seq)
+                .map_err(|e| anyhow!("failed to digitize sequence {}: {e}", rec.name))?;
 
-        for h in cyk_search(&cm, &dsq, w_max, REPORTING_BITS) {
-            // Filter on E-value when the model is calibrated (mirrors `cmsearch -E`).
-            if let Some(ev) = h.evalue {
-                if ev > e_value {
-                    continue;
+            let mut rec_hits = Vec::new();
+            for h in cyk_search(&cm, &dsq, w_max, REPORTING_BITS) {
+                // Filter on E-value when the model is calibrated (mirrors `cmsearch -E`).
+                if let Some(ev) = h.evalue {
+                    if ev > e_value {
+                        continue;
+                    }
                 }
+                let strand = match h.strand {
+                    Strand::Plus => '+',
+                    Strand::Minus => '-',
+                };
+                rec_hits.push(CMHit {
+                    target_name: rec.name.clone(),
+                    target_start: h.i,
+                    target_end: h.j,
+                    strand,
+                    query_name: query_name.clone(),
+                    score: h.score as f64,
+                    e_value: h.evalue.unwrap_or(f64::NAN),
+                    gc_content: gc_fraction(&rec.seq, h.i, h.j),
+                });
             }
-            let strand = match h.strand {
-                Strand::Plus => '+',
-                Strand::Minus => '-',
-            };
-            hits.push(CMHit {
-                target_name: rec.name.clone(),
-                target_start: h.i,
-                target_end: h.j,
-                strand,
-                query_name: query_name.clone(),
-                score: h.score as f64,
-                e_value: h.evalue.unwrap_or(f64::NAN),
-                gc_content: gc_fraction(&rec.seq, h.i, h.j),
-            });
-        }
-    }
+            Ok(rec_hits)
+        })
+        .collect::<Result<Vec<_>>>()?;
 
-    Ok(hits)
+    Ok(per_record.into_iter().flatten().collect())
 }
 
 /// GC fraction over the inclusive 1-based span `[min(i,j), max(i,j)]` of `seq`.

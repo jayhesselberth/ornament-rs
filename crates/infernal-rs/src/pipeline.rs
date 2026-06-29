@@ -26,6 +26,7 @@
 use easel_rs::Dsq;
 use hmmer_rs::profile::{bg_freqs, null_one, P7Profile};
 use hmmer_rs::{forward_nats, forward_pvalue, parse_p7_hmm, P7Hmm};
+use rayon::prelude::*;
 
 use crate::evalues::{evalue, SearchMode};
 use crate::model::Cm;
@@ -97,57 +98,80 @@ pub fn cm_pipeline_search(
         residues_searched: 2 * l,
         ..Default::default()
     };
-    let mut hits: Vec<Hit> = Vec::new();
     if l == 0 {
-        return Ok((hits, stats));
+        return Ok((Vec::new(), stats));
     }
 
-    // Configure the p7 Forward filter once; the length model is reconfigured per window.
+    // Configure the p7 Forward filter once; the per-tile filter clones it to reconfigure the
+    // length model (so the tile sweep can run in parallel), and the immutable base is shared
+    // read-only across both strands.
     let hmm = parse_filter_hmm(cm)?;
     let bg = bg_freqs(hmm.k);
-    let mut prof = P7Profile::config_local(&hmm, cm.abc.as_ref(), &bg, l);
+    let prof = P7Profile::config_local(&hmm, cm.abc.as_ref(), &bg, l);
     let w = w_max.min(l).max(1);
     let searched = 2.0 * l as f64;
-
-    // Forward strand: filter survivors, then CM scan each (coords are already original).
-    let (surv, nw) = strand_survivors(&mut prof, &hmm, dsq, w, params.f3);
-    stats.n_windows += nw;
-    for &(s, e) in &surv {
-        stats.n_survivors += 1;
-        stats.residues_to_cm += e - s + 1;
-        let sub = subseq(dsq, s, e);
-        for (score, i, j) in scan_subseq(cm, &sub, w_max, cutoff_bits, params.do_inside) {
-            hits.push(Hit {
-                score,
-                evalue: evalue(cm, mode, score, searched),
-                i: i + s - 1,
-                j: j + s - 1,
-                strand: Strand::Plus,
-            });
-        }
-    }
+    let do_inside = params.do_inside;
 
     // Reverse-complement strand. A window survivor in revcomp coordinate `x` maps back to
     // original coordinate `L - x + 1`; the alignment's 5' end is the high coordinate, so a
     // hit `i..j` (i ≤ j in revcomp) is reported `i' > j'`, matching `cmsearch`.
     let mut rc = dsq.to_vec();
     cm.abc.revcomp(&mut rc)?;
-    let (surv, nw) = strand_survivors(&mut prof, &hmm, &rc, w, params.f3);
-    stats.n_windows += nw;
-    for &(s, e) in &surv {
-        stats.n_survivors += 1;
-        stats.residues_to_cm += e - s + 1;
-        let sub = subseq(&rc, s, e);
-        for (score, i, j) in scan_subseq(cm, &sub, w_max, cutoff_bits, params.do_inside) {
-            hits.push(Hit {
-                score,
-                evalue: evalue(cm, mode, score, searched),
-                i: l - (i + s - 1) + 1,
-                j: l - (j + s - 1) + 1,
-                strand: Strand::Minus,
-            });
-        }
-    }
+
+    // Each strand filters its survivors then CM-scans each survivor window; the windows are
+    // independent (a hit reads only its own span), so they're scanned in parallel and the two
+    // strands run concurrently via `rayon::join`. Output is order-independent: hits are sorted
+    // below, so the result is identical regardless of thread count.
+    let plus = || {
+        let (surv, nw) = strand_survivors(&prof, &hmm, dsq, w, params.f3);
+        let hits: Vec<Hit> = surv
+            .par_iter()
+            .flat_map_iter(|&(s, e)| {
+                let sub = subseq(dsq, s, e);
+                scan_subseq(cm, &sub, w_max, cutoff_bits, do_inside)
+                    .into_iter()
+                    .map(move |(score, i, j)| Hit {
+                        score,
+                        evalue: evalue(cm, mode, score, searched),
+                        i: i + s - 1,
+                        j: j + s - 1,
+                        strand: Strand::Plus,
+                    })
+            })
+            .collect();
+        (surv, nw, hits)
+    };
+    let minus = || {
+        let (surv, nw) = strand_survivors(&prof, &hmm, &rc, w, params.f3);
+        let hits: Vec<Hit> = surv
+            .par_iter()
+            .flat_map_iter(|&(s, e)| {
+                let sub = subseq(&rc, s, e);
+                scan_subseq(cm, &sub, w_max, cutoff_bits, do_inside)
+                    .into_iter()
+                    .map(move |(score, i, j)| Hit {
+                        score,
+                        evalue: evalue(cm, mode, score, searched),
+                        i: l - (i + s - 1) + 1,
+                        j: l - (j + s - 1) + 1,
+                        strand: Strand::Minus,
+                    })
+            })
+            .collect();
+        (surv, nw, hits)
+    };
+    let ((fsurv, fnw, fhits), (rsurv, rnw, rhits)) = rayon::join(plus, minus);
+
+    stats.n_windows = fnw + rnw;
+    stats.n_survivors = fsurv.len() + rsurv.len();
+    stats.residues_to_cm = fsurv
+        .iter()
+        .chain(rsurv.iter())
+        .map(|&(s, e)| e - s + 1)
+        .sum();
+
+    let mut hits: Vec<Hit> = fhits;
+    hits.extend(rhits);
 
     // Best-first, identical ordering to `search::search` (E-value asc, else score desc).
     hits.sort_by(|a, b| match (a.evalue, b.evalue) {
@@ -187,7 +211,7 @@ fn parse_filter_hmm(cm: &Cm) -> Result<P7Hmm, InfernalError> {
 /// Tiling is length `2W`, step `W` (overlap `W`) so every length-`≤W` hit is contained in
 /// at least one tile. Survivors are padded by `W` and merged into maximal disjoint regions.
 fn strand_survivors(
-    prof: &mut P7Profile,
+    prof: &P7Profile,
     hmm: &P7Hmm,
     dsq: &[Dsq],
     w: usize,
@@ -196,24 +220,41 @@ fn strand_survivors(
     let l = dsq.len().saturating_sub(2);
     let tile = (2 * w).max(1);
     let step = w.max(1);
-    let mut survivors: Vec<(usize, usize)> = Vec::new();
-    let mut n_windows = 0usize;
 
+    // Enumerate the tile spans (1-based inclusive) left-to-right, deterministically.
+    let mut tiles: Vec<(usize, usize)> = Vec::new();
     let mut start = 1usize;
     loop {
         let end = (start + tile - 1).min(l);
-        n_windows += 1;
-        if forward_pvalue(hmm, window_forward_bits(prof, dsq, start, end)) <= f3 {
-            let ps = start.saturating_sub(w).max(1);
-            let pe = (end + w).min(l);
-            push_merge(&mut survivors, ps, pe);
-        }
+        tiles.push((start, end));
         if end >= l {
             break;
         }
         start += step;
     }
-    (survivors, n_windows)
+
+    // Score each tile's Forward filter independently. Each task clones the profile so it can
+    // reconfigure the length model without contention; the order-preserving collect keeps the
+    // subsequent merge (which assumes non-decreasing `start`) deterministic.
+    let kept: Vec<Option<(usize, usize)>> = tiles
+        .par_iter()
+        .map(|&(s, e)| {
+            let mut p = prof.clone();
+            if forward_pvalue(hmm, window_forward_bits(&mut p, dsq, s, e)) <= f3 {
+                let ps = s.saturating_sub(w).max(1);
+                let pe = (e + w).min(l);
+                Some((ps, pe))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    let mut survivors: Vec<(usize, usize)> = Vec::new();
+    for (ps, pe) in kept.into_iter().flatten() {
+        push_merge(&mut survivors, ps, pe);
+    }
+    (survivors, tiles.len())
 }
 
 /// Forward **bit** score of `dsq[start..=end]` against the length-reconfigured profile,

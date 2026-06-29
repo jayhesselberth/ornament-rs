@@ -236,10 +236,20 @@ fn search<S: Semiring>(
 ) -> Vec<Hit> {
     let l = dsq.len().saturating_sub(2);
     let searched = 2.0 * l as f64;
-    let mut hits: Vec<Hit> = Vec::new();
 
-    // Forward strand.
-    for h in scan_core::<S>(cm, dsq, w_max, Some(cutoff_bits)).1 {
+    // The two strands are independent DP scans; run them concurrently. `rayon::join` is a
+    // synchronous fork-join, so `rc` (borrowed by the second closure) outlives the call.
+    let mut rc = dsq.to_vec();
+    cm.abc.revcomp(&mut rc).expect("revcomp digital sequence");
+    let (fwd, rev) = rayon::join(
+        || scan_core::<S>(cm, dsq, w_max, Some(cutoff_bits)).1,
+        || scan_core::<S>(cm, &rc, w_max, Some(cutoff_bits)).1,
+    );
+
+    let mut hits: Vec<Hit> = Vec::with_capacity(fwd.len() + rev.len());
+
+    // Forward strand: coordinates are already original.
+    for h in fwd {
         hits.push(Hit {
             score: h.score,
             evalue: evalue(cm, mode, h.score, searched),
@@ -252,9 +262,7 @@ fn search<S: Semiring>(
     // Reverse-complement strand. A window (a..b) in the revcomp (a<=b) maps to original
     // coordinates [L-b+1 .. L-a+1]; the alignment's 5' end is the high coordinate, so report
     // i = L-a+1 (start, high) and j = L-b+1 (stop, low), giving i > j as cmsearch does.
-    let mut rc = dsq.to_vec();
-    cm.abc.revcomp(&mut rc).expect("revcomp digital sequence");
-    for h in scan_core::<S>(cm, &rc, w_max, Some(cutoff_bits)).1 {
+    for h in rev {
         hits.push(Hit {
             score: h.score,
             evalue: evalue(cm, mode, h.score, searched),

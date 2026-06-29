@@ -12,7 +12,7 @@
 
 use std::hint::black_box;
 
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use easel_rs::{read_fasta, Alphabet, Dsq};
 use infernal_rs::{
     align_glocal, cm_pipeline_search, configure_local, configure_scores, cyk_scan, cyk_search,
@@ -48,6 +48,31 @@ fn synthetic_with_trnas(abc: &Alphabet, consensus: &str, n: usize) -> Vec<Dsq> {
     let q = n / 4;
     seq.replace_range(q..q + consensus.len(), consensus);
     seq.replace_range(3 * q..3 * q + consensus.len(), consensus);
+    abc.digitize(&seq).expect("digitize")
+}
+
+/// Deterministic ~`n`-nt RNA with `copies` tRNA consensus blocks spread evenly along it, so
+/// the filtered pipeline yields several independent survivor windows for rayon to scan in
+/// parallel (the thread-scaling bench wants more than the 2 windows above).
+fn synthetic_multi(abc: &Alphabet, consensus: &str, n: usize, copies: usize) -> Vec<Dsq> {
+    let mut s: u64 = 0xC0FFEE;
+    let bases = [b'A', b'C', b'G', b'U'];
+    let mut seq: String = (0..n)
+        .map(|_| {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            bases[(s % 4) as usize] as char
+        })
+        .collect();
+    let cl = consensus.len();
+    let span = n / (copies + 1);
+    for c in 1..=copies {
+        let pos = c * span;
+        if pos + cl <= n {
+            seq.replace_range(pos..pos + cl, consensus);
+        }
+    }
     abc.digitize(&seq).expect("digitize")
 }
 
@@ -103,5 +128,51 @@ fn bench_cm_search(c: &mut Criterion) {
     g.finish();
 }
 
-criterion_group!(benches, bench_cm_dp, bench_cm_search);
+/// rayon thread-scaling: the same both-strand filtered pipeline run under rayon pools of
+/// increasing width, on a longer sequence with several filter tiles + survivor windows so
+/// the parallel tile sweep, per-window CM scans, and both-strand fork-join have work to
+/// spread. Thread count 1 is the scalar reference; the speed-up shows the rayon win (#5).
+fn bench_threads(c: &mut Criterion) {
+    let abc = Alphabet::rna();
+    let consensus = {
+        let recs = read_fasta(data("trna_cons.fa")).unwrap();
+        recs[0].seq.clone()
+    };
+    // Space the tRNAs ~1.7 kb apart — wider than a survivor window's W-padded footprint
+    // (W=218 here) — so each stays a separate survivor the per-window par_iter can scan
+    // concurrently, rather than merging into one sequential region.
+    let dsq = synthetic_multi(&abc, &consensus, 12000, 6);
+
+    let mut cm = load_cm();
+    configure_local(&mut cm);
+    let w = cm.w as usize;
+    let params = PipelineParams::default();
+
+    let max = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(8);
+    let mut threads: Vec<usize> = [1usize, 2, 4, 8, max]
+        .into_iter()
+        .filter(|&t| t <= max)
+        .collect();
+    threads.sort_unstable();
+    threads.dedup();
+
+    let mut g = c.benchmark_group("cm_search_threads");
+    g.sample_size(10); // heavy full-pipeline scan; few samples
+    for t in threads {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(t)
+            .build()
+            .expect("build rayon pool");
+        g.bench_with_input(BenchmarkId::from_parameter(t), &t, |b, _| {
+            pool.install(|| {
+                b.iter(|| cm_pipeline_search(black_box(&cm), black_box(&dsq), w, 0.0, params))
+            })
+        });
+    }
+    g.finish();
+}
+
+criterion_group!(benches, bench_cm_dp, bench_cm_search, bench_threads);
 criterion_main!(benches);
