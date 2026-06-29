@@ -29,3 +29,9 @@ Thumbs.db
 # Profiling
 *.profraw
 *.profdata
+
+# pixi (dev environment: mold, cargo-nextest, infernal oracle)
+/.pixi/
+
+# nextest
+junit.xml
