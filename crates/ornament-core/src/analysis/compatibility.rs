@@ -169,9 +169,11 @@ fn grade_measured_mods(
                 } else {
                     mod_db.get_expectations(pos)
                 };
-                let expected = expectations
-                    .iter()
-                    .any(|e| e.modifications.iter().any(|em| em.short_name == m.short_name));
+                let expected = expectations.iter().any(|e| {
+                    e.modifications
+                        .iter()
+                        .any(|em| em.short_name == m.short_name)
+                });
                 if expected {
                     MeasuredVerdict::Consistent
                 } else {

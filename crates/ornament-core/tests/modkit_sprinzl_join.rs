@@ -14,8 +14,7 @@ use ornament_core::modification::{align_to_sprinzl, ModificationDatabase};
 use ornament_core::SprinzlPosition;
 
 // S. cerevisiae nuc-tRNA-Phe-GAA-1-1 (standard length, 73 nt) from the Sprinzl test set.
-const PHE_SEQ: &str =
-    "GCGGACUUAGCUCAGUUGGGAGAGCGCCAGACUGAAGAUCUGGAGGUCCUGUGUUCGAUCCACAGAGUUCGCA";
+const PHE_SEQ: &str = "GCGGACUUAGCUCAGUUGGGAGAGCGCCAGACUGAAGAUCUGGAGGUCCUGUGUUCGAUCCACAGAGUUCGCA";
 
 fn phe_hit() -> TRNAHit {
     TRNAHit {
@@ -75,7 +74,10 @@ fn modkit_calls_join_to_sprinzl_and_drive_oddness() {
             .map(|(pos, &idx)| (pos.clone(), idx))
             .collect();
         candidates.sort_by_key(|(_, idx)| *idx);
-        candidates.into_iter().next().expect("a G with no expectation")
+        candidates
+            .into_iter()
+            .next()
+            .expect("a G with no expectation")
     };
 
     // -- Synthetic bedMethyl file --------------------------------------------------------
@@ -123,7 +125,10 @@ fn modkit_calls_join_to_sprinzl_and_drive_oddness() {
 
     // Adding the chemically-impossible m1A call must flag the tRNA as odd.
     let full = analyze_compatibility_with_mods(&hit, &db, &observed);
-    assert!(full.is_odd, "an incompatible measured mod makes the tRNA odd");
+    assert!(
+        full.is_odd,
+        "an incompatible measured mod makes the tRNA odd"
+    );
     let vg = full
         .measured
         .iter()
