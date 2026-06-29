@@ -1,0 +1,94 @@
+//! Native CM search path (pure-Rust `infernal-rs` engine).
+//!
+//! This is the default `scan` engine: a drop-in replacement for the `cmsearch`
+//! subprocess that needs no external binary or C toolchain. It parses a `.cm`,
+//! configures it in local mode (the `cmsearch` default), runs the native CYK
+//! scanner over every FASTA record (both strands, multi-hit, gamma overlap
+//! resolution), and yields the same [`CMHit`] records the CLI and the downstream
+//! Sprinzl/modification analysis already consume.
+
+use anyhow::{anyhow, Result};
+use std::path::Path;
+
+use infernal_rs::{configure_local, cyk_search, parse_cm_file, Strand};
+
+use super::CMHit;
+
+/// Bit-score floor handed to the scanner's overlap-resolution pass. Hits below this
+/// are dropped before E-value filtering; it keeps significant tRNAs while discarding
+/// the spurious low-scoring hits, mirroring the differential-test reporting floor.
+const REPORTING_BITS: f32 = 20.0;
+
+/// Scan a FASTA file for CM hits using the native `infernal-rs` engine.
+///
+/// `e_value` is the maximum E-value reported (mirrors `cmsearch -E`); hits from
+/// calibrated models above it are filtered out. Uncalibrated models (no E-value)
+/// fall back to the [`REPORTING_BITS`] floor only.
+pub fn scan_native<P: AsRef<Path>, Q: AsRef<Path>>(
+    cm_path: P,
+    fasta: Q,
+    e_value: f64,
+) -> Result<Vec<CMHit>> {
+    let cm_path = cm_path.as_ref();
+    let fasta = fasta.as_ref();
+
+    let mut cm = parse_cm_file(cm_path)
+        .map_err(|e| anyhow!("failed to parse CM {}: {e}", cm_path.display()))?;
+    configure_local(&mut cm); // cmsearch default (local mode)
+
+    let records = easel_rs::read_fasta(fasta)
+        .map_err(|e| anyhow!("failed to read FASTA {}: {e}", fasta.display()))?;
+
+    let w_max = cm.w as usize;
+    let query_name = cm.name.clone();
+
+    let mut hits = Vec::new();
+    for rec in &records {
+        let dsq = cm
+            .abc
+            .digitize(&rec.seq)
+            .map_err(|e| anyhow!("failed to digitize sequence {}: {e}", rec.name))?;
+
+        for h in cyk_search(&cm, &dsq, w_max, REPORTING_BITS) {
+            // Filter on E-value when the model is calibrated (mirrors `cmsearch -E`).
+            if let Some(ev) = h.evalue {
+                if ev > e_value {
+                    continue;
+                }
+            }
+            let strand = match h.strand {
+                Strand::Plus => '+',
+                Strand::Minus => '-',
+            };
+            hits.push(CMHit {
+                target_name: rec.name.clone(),
+                target_start: h.i,
+                target_end: h.j,
+                strand,
+                query_name: query_name.clone(),
+                score: h.score as f64,
+                e_value: h.evalue.unwrap_or(f64::NAN),
+                gc_content: gc_fraction(&rec.seq, h.i, h.j),
+            });
+        }
+    }
+
+    Ok(hits)
+}
+
+/// GC fraction over the inclusive 1-based span `[min(i,j), max(i,j)]` of `seq`.
+fn gc_fraction(seq: &str, i: usize, j: usize) -> f64 {
+    let (lo, hi) = if i <= j { (i, j) } else { (j, i) };
+    let bytes = seq.as_bytes();
+    let start = lo.saturating_sub(1);
+    let end = hi.min(bytes.len());
+    if start >= end {
+        return 0.0;
+    }
+    let span = &bytes[start..end];
+    let gc = span
+        .iter()
+        .filter(|b| matches!(b.to_ascii_uppercase(), b'G' | b'C'))
+        .count();
+    gc as f64 / span.len() as f64
+}

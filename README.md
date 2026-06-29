@@ -6,7 +6,8 @@ Ornament identifies tRNAs in genomic sequences using Infernal covariance models,
 
 ## Features
 
-- **tRNA scanning** via Infernal covariance models (FFI bindings to libinfernal)
+- **tRNA scanning** with a native, pure-Rust covariance-model engine
+  (`infernal-rs`) — no external `cmsearch` binary or C toolchain required
 - **Modification database** with 12+ tRNA modifications from MODOMICS
 - **Sprinzl position mapping** (standard tRNA numbering 1-76)
 - **Compatibility analysis** to detect modification-incompatible variants
@@ -16,9 +17,12 @@ Ornament identifies tRNAs in genomic sequences using Infernal covariance models,
 
 ### Prerequisites
 
-- Rust 1.70+ (with cargo)
-- C compiler (gcc or clang)
-- autoconf
+- Rust 1.96+ (with cargo)
+
+That's it — the default build is pure Rust. No C compiler, autoconf, `ext/`, or
+external Infernal binaries are needed. (The optional legacy C-FFI path behind
+`--features ffi`, and the `cmsearch` differential-testing oracle, do require the
+Infernal toolchain; see below.)
 
 ### Setup
 
@@ -28,17 +32,15 @@ git clone https://github.com/jayhesselberth/ornament.git
 cd ornament
 ```
 
-2. Set up dependencies (clones Infernal, HMMER, and Easel):
-```bash
-./scripts/setup-deps.sh
-```
-
-3. Build:
+2. Build:
 ```bash
 cargo build --release
 ```
 
 The binary will be at `target/release/ornament`.
+
+> The `ext/` Infernal/HMMER/Easel C sources (via `./scripts/setup-deps.sh`) are a
+> **porting reference only** — they are not linked into the default build.
 
 ## Usage
 
@@ -60,8 +62,20 @@ ornament mods --position 34 --verbose
 ### Scan sequences for tRNAs
 
 ```bash
+# Default: native pure-Rust engine (no external binary)
 ornament scan --input genome.fa --cm tRNA.cm --output results.json
+
+# Opt into the external cmsearch subprocess (Infernal must be on PATH).
+# Useful as an oracle/fallback for cross-checking the native engine.
+ornament scan --input genome.fa --cm tRNA.cm --engine cmsearch
 ```
+
+The `--engine` flag selects the search backend:
+
+| `--engine`  | Backend                                   | Requirements           |
+|-------------|-------------------------------------------|------------------------|
+| `native`    | pure-Rust `infernal-rs` CYK scanner (**default**) | none           |
+| `cmsearch`  | external `cmsearch` subprocess            | Infernal on `PATH`     |
 
 ### Analyze modification compatibility
 
@@ -82,10 +96,13 @@ ornament/
 ├── Cargo.toml                 # Workspace manifest
 ├── scripts/
 │   └── setup-deps.sh          # Dependency setup script
-├── ext/                       # External deps (gitignored)
+├── ext/                       # Infernal C source — porting reference only (gitignored)
 │   └── infernal/              # Infernal with hmmer/ and easel/
 ├── crates/
-│   ├── infernal-sys/          # FFI bindings to Infernal/HMMER/Easel
+│   ├── easel-rs/              # Native Rust port of the Easel subset
+│   ├── hmmer-rs/             # Native Rust port of the HMMER p7 filters
+│   ├── infernal-rs/          # Native Rust CM engine (default scan backend)
+│   ├── infernal-sys/          # Legacy FFI bindings (optional, --features ffi)
 │   │   ├── build.rs           # Compiles C libraries, generates bindings
 │   │   └── src/lib.rs
 │   ├── ornament-core/         # Core library
@@ -121,7 +138,8 @@ The database includes common eukaryotic tRNA modifications:
 
 ## How It Works
 
-1. **Scan**: Use Infernal cmsearch to find tRNAs in input sequences
+1. **Scan**: Use the native `infernal-rs` covariance-model engine (or, with
+   `--engine cmsearch`, the external `cmsearch` subprocess) to find tRNAs in input sequences
 2. **Map**: Align hits to Sprinzl tRNA positions (1-76)
 3. **Analyze**: Check each position for modification compatibility
    - If a position expects modification X (derived from base Y)
