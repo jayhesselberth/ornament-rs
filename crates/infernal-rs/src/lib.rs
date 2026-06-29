@@ -6,6 +6,7 @@
 //! - `config`   — `cm_Configure` equivalent (log-odds scores, local/glocal, consensus) [Phase 2/3].
 //! - `search`   — non-banded CYK + Inside scanning DP [Phase 3].
 //! - `align`    — CYK traceback -> parsetree -> aligned residues + RF/SS_cons [Phase 4].
+//! - [`pipeline`] — p7 Forward-filter windowing that runs the CM only on survivors [Phase 5b].
 
 pub mod align;
 pub mod cmfile;
@@ -14,6 +15,7 @@ pub mod emit;
 pub mod emitmap;
 pub mod evalues;
 pub mod model;
+pub mod pipeline;
 pub mod search;
 
 pub use align::{align_glocal, AlignedResidue, Alignment};
@@ -22,6 +24,7 @@ pub use config::{configure_local, configure_scores};
 pub use emitmap::EmitMap;
 pub use evalues::{evalue, score_to_evalue, SearchMode};
 pub use model::{Cm, ExpInfo};
+pub use pipeline::{cm_pipeline_inside, cm_pipeline_search, PipelineParams, PipelineStats};
 pub use search::{
     cyk_scan, cyk_scan_glocal, cyk_search, inside_scan, inside_scan_glocal, inside_search, CykHit,
     CykScan, Hit, Strand,

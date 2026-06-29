@@ -280,6 +280,30 @@ fn scan<S: Semiring>(cm: &Cm, dsq: &[Dsq], w_max: usize) -> CykScan {
     scan_core::<S>(cm, dsq, w_max, None).0
 }
 
+/// Multi-hit gamma scan over a *standalone* sub-sequence `sub` (its own sentinels at 0 and
+/// `len+1`), returning each above-`cutoff_bits` hit as `(score, i, j)` in `sub`'s local
+/// 1-based coordinates. `do_inside` selects Inside (sum-over-parses) vs CYK (best-parse).
+///
+/// This is the primitive the [`crate::pipeline`] windowing path runs on filter survivors.
+/// It reuses [`scan_core`] unchanged, so scores and coordinates are bit-identical to the
+/// brute-force whole-strand scan: a CM hit rooted at ROOT_S over `i..j` reads only
+/// `sub[i..=j]`, so flanking context outside a window can never change its parse — provided
+/// the window fully contains the hit (the caller guarantees this with W-padding).
+pub(crate) fn scan_subseq(
+    cm: &Cm,
+    sub: &[Dsq],
+    w_max: usize,
+    cutoff_bits: f32,
+    do_inside: bool,
+) -> Vec<(f32, usize, usize)> {
+    let raw = if do_inside {
+        scan_core::<LogSum>(cm, sub, w_max, Some(cutoff_bits)).1
+    } else {
+        scan_core::<MaxPlus>(cm, sub, w_max, Some(cutoff_bits)).1
+    };
+    raw.into_iter().map(|h| (h.score, h.i, h.j)).collect()
+}
+
 /// Shared scanning recursion, parameterized by the within-cell ⊕ ([`Semiring`]). Handles
 /// both glocal and local mode (the latter when the CM was `configure_local`-ized): local
 /// adds EL local-end initialization and ROOT local begins.
