@@ -1,7 +1,7 @@
 //! Modification database - MODOMICS-derived tRNA modification expectations
 
-use crate::modification::types::*;
 use crate::modification::modomics;
+use crate::modification::types::*;
 use rustc_hash::FxHashMap;
 use std::path::Path;
 
@@ -82,7 +82,6 @@ impl ModificationDatabase {
         }
         None
     }
-
 
     /// Get all modifications in the database
     pub fn modifications(&self) -> &FxHashMap<String, Modification> {
@@ -428,7 +427,10 @@ impl ModificationDatabase {
         }
 
         // Position 55 - Pseudouridine - universal (try both Psi and Y)
-        if let Some(psi) = self.get_mod_cloned("Psi").or_else(|| self.get_mod_cloned("Y")) {
+        if let Some(psi) = self
+            .get_mod_cloned("Psi")
+            .or_else(|| self.get_mod_cloned("Y"))
+        {
             self.add_position_expectation(PositionModExpectation {
                 position: SprinzlPosition::from_num(55),
                 modifications: vec![psi],
@@ -491,13 +493,11 @@ mod tests {
         let db = ModificationDatabase::eukaryotic();
 
         // Position 34 for Ala should have Inosine
-        let exp34_ala = db.get_expectations_for_isotype(
-            &SprinzlPosition::from_num(34),
-            &Isotype::new("Ala"),
-        );
-        assert!(exp34_ala.iter().any(|e|
-            e.modifications.iter().any(|m| m.short_name == "I")
-        ));
+        let exp34_ala =
+            db.get_expectations_for_isotype(&SprinzlPosition::from_num(34), &Isotype::new("Ala"));
+        assert!(exp34_ala
+            .iter()
+            .any(|e| e.modifications.iter().any(|m| m.short_name == "I")));
     }
 
     #[test]

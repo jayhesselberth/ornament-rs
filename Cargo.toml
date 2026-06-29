@@ -2,6 +2,19 @@
 resolver = "2"
 members = [
     "crates/infernal-sys",
+    "crates/easel-rs",
+    "crates/hmmer-rs",
+    "crates/infernal-rs",
+    "crates/ornament-core",
+    "crates/ornament-cli",
+]
+# The legacy C-FFI crate is excluded from default builds (it needs ext/ + a C toolchain).
+# Bare `cargo build`/`nextest` skip it; build it explicitly with `-p infernal-sys` or the
+# `ornament-core` `ffi` feature.
+default-members = [
+    "crates/easel-rs",
+    "crates/hmmer-rs",
+    "crates/infernal-rs",
     "crates/ornament-core",
     "crates/ornament-cli",
 ]
@@ -9,6 +22,7 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.96"
 license = "MIT"
 authors = ["Jay Hesselberth"]
 repository = "https://github.com/jayhesselberth/ornament"
@@ -36,6 +50,48 @@ tempfile = "3"
 # Bioinformatics
 bio = "1"
 
+# Parallelism
+rayon = "1"
+
 # Internal crates
 infernal-sys = { path = "crates/infernal-sys" }
+easel-rs = { path = "crates/easel-rs" }
+hmmer-rs = { path = "crates/hmmer-rs" }
+infernal-rs = { path = "crates/infernal-rs" }
 ornament-core = { path = "crates/ornament-core" }
+
+# Fast dev builds, but with optimized third-party crates so the numeric DP and
+# differential tests run at a reasonable speed.
+[profile.dev.package."*"]
+opt-level = 2
+
+# Pin release codegen here so benchmarks measure what ships.
+[profile.bench]
+inherits = "release"
+strip = false
+
+# Optimized release build: LTO + single codegen unit for maximum performance of
+# the CYK/Inside DP and SIMD kernels.
+[profile.release]
+opt-level = 3
+strip = true
+lto = "fat"
+panic = "abort"
+codegen-units = 1
+
+# Profiling build: drops LTO and splits codegen so frames aren't inlined away
+# from profilers (perf, samply, valgrind). Slower than release, faithful graphs.
+[profile.profiling]
+inherits = "release"
+debug = 2
+split-debuginfo = "packed"
+strip = false
+lto = false
+codegen-units = 16
+
+# Release-speed build with symbols preserved, for samply/perf recordings.
+[profile.release-with-debug]
+inherits = "release"
+debug = 2
+split-debuginfo = "packed"
+strip = false

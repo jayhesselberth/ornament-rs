@@ -3,8 +3,8 @@
 //! Maps covariance model alignment positions to standard Sprinzl tRNA positions.
 //! Sprinzl numbering uses positions 1-76 with variable regions using letters (e.g., 17a).
 
-use std::collections::HashMap;
 use super::types::SprinzlPosition;
+use std::collections::HashMap;
 
 /// Maps CM alignment positions to Sprinzl positions
 pub struct SprinzlMapper {
@@ -24,24 +24,19 @@ impl SprinzlMapper {
         // Based on the canonical tRNA structure
         let positions = vec![
             // Acceptor stem (1-7, 66-72)
-            "1", "2", "3", "4", "5", "6", "7",
-            // D-stem/loop (8-16, 21-25)
+            "1", "2", "3", "4", "5", "6", "7", // D-stem/loop (8-16, 21-25)
             "8", "9", "10", "11", "12", "13", "14", "15", "16",
             // Variable D-loop positions
-            "17", "17a", "18", "19", "20", "20a", "20b",
-            "21", "22", "23", "24", "25",
+            "17", "17a", "18", "19", "20", "20a", "20b", "21", "22", "23", "24", "25",
             // Anticodon stem/loop (26-44)
-            "26", "27", "28", "29", "30", "31", "32", "33", "34", "35", "36", "37", "38",
-            "39", "40", "41", "42", "43", "44",
-            // Variable loop (45-47, variable length)
+            "26", "27", "28", "29", "30", "31", "32", "33", "34", "35", "36", "37", "38", "39",
+            "40", "41", "42", "43", "44", // Variable loop (45-47, variable length)
             "45", "e11", "e12", "e13", "e14", "e15", "e16", "e17", "e1", "e2", "e3", "e4", "e5",
             "e21", "e22", "e23", "e24", "e25", "e26", "e27", "46", "47",
             // T-stem/loop (48-65)
             "48", "49", "50", "51", "52", "53", "54", "55", "56", "57", "58", "59", "60", "61",
-            "62", "63", "64", "65",
-            // 3' acceptor stem
-            "66", "67", "68", "69", "70", "71", "72",
-            // Discriminator and CCA
+            "62", "63", "64", "65", // 3' acceptor stem
+            "66", "67", "68", "69", "70", "71", "72", // Discriminator and CCA
             "73", "74", "75", "76",
         ];
 
@@ -128,8 +123,14 @@ mod tests {
 
     #[test]
     fn test_critical_positions() {
-        assert!(SprinzlMapper::is_critical_position(&SprinzlPosition("34".to_string())));
-        assert!(SprinzlMapper::is_critical_position(&SprinzlPosition("55".to_string())));
-        assert!(!SprinzlMapper::is_critical_position(&SprinzlPosition("1".to_string())));
+        assert!(SprinzlMapper::is_critical_position(&SprinzlPosition(
+            "34".to_string()
+        )));
+        assert!(SprinzlMapper::is_critical_position(&SprinzlPosition(
+            "55".to_string()
+        )));
+        assert!(!SprinzlMapper::is_critical_position(&SprinzlPosition(
+            "1".to_string()
+        )));
     }
 }

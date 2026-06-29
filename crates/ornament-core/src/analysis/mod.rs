@@ -5,8 +5,8 @@
 pub mod compatibility;
 pub mod odd_trna;
 
-use serde::{Deserialize, Serialize};
 use crate::SprinzlPosition;
+use serde::{Deserialize, Serialize};
 
 /// Represents a tRNA hit with associated metadata
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,5 +66,5 @@ pub enum Severity {
     Minor,
 }
 
-pub use compatibility::{analyze_compatibility, analyze_batch, BatchAnalysisResult};
+pub use compatibility::{analyze_batch, analyze_compatibility, BatchAnalysisResult};
 pub use odd_trna::detect_odd_trnas;

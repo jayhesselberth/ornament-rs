@@ -1,0 +1,21 @@
+# Pinned rustflags for local Linux/x86_64 builds.
+#
+# Baseline: `x86-64-v3` = SSE4.2 + AVX + AVX2 + FMA + BMI1/BMI2 + POPCNT + F16C.
+# Every x86_64 CPU in this cluster (Broadwell login node, Cascade Lake rna,
+# Ice Lake gpu) supports this. We deliberately do NOT use `target-cpu=native`:
+# a binary built on an Ice Lake gpu node with AVX-512 fails to load on the rna
+# partition, which lacks those flags. The hot CYK/Inside DP and p7 filter
+# kernels (Phase 6) that want AVX-512 should use `#[target_feature]` + runtime
+# `is_x86_feature_detected!` dispatch, not a global baseline bump.
+#
+# This v3 baseline gives the scalar DP free use of AVX2/FMA and is portable
+# across any x86_64 CPU since ~2013.
+#
+# Faster linking (mold) is provided by the pixi `dev` environment, which
+# installs `mold` from conda-forge and exposes wrapper tasks
+# (`pixi run -e dev build|test|check|clippy`). Those invoke `mold -run cargo ...`,
+# which intercepts the linker exec via LD_PRELOAD and works with the system gcc
+# — no `-fuse-ld=mold` and no linker override here (a conda-clang sysroot route
+# would require glibc-static, which isn't installed on the compute nodes).
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "target-cpu=x86-64-v3"]

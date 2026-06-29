@@ -2,8 +2,8 @@
 //!
 //! Scans genomic sequences for tRNAs and analyzes modification compatibility.
 
-use clap::{Parser, Subcommand};
 use anyhow::{anyhow, Result};
+use clap::{Parser, Subcommand};
 use std::path::Path;
 
 #[derive(Parser)]
@@ -89,7 +89,12 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Scan { input, cm, output, format } => {
+        Commands::Scan {
+            input,
+            cm,
+            output,
+            format,
+        } => {
             use ornament_core::infernal::InfernalRunner;
 
             let cm_path = cm.ok_or_else(|| anyhow!("--cm is required"))?;
@@ -107,9 +112,7 @@ fn main() -> Result<()> {
             eprintln!("Scanning {} for tRNAs using {}...", input, cm_path);
 
             // Run cmsearch subprocess
-            let runner = InfernalRunner::new()
-                .with_cm(&cm_path)
-                .with_e_value(1e-5);
+            let runner = InfernalRunner::new().with_cm(&cm_path).with_e_value(1e-5);
 
             let hits = runner.cmsearch(&input)?;
 
@@ -119,9 +122,11 @@ fn main() -> Result<()> {
             let output_str = match format.as_str() {
                 "json" => serde_json::to_string_pretty(&hits)?,
                 "tsv" => {
-                    let mut lines = vec!["target_name\tstart\tend\tstrand\tscore\te_value".to_string()];
+                    let mut lines =
+                        vec!["target_name\tstart\tend\tstrand\tscore\te_value".to_string()];
                     for hit in &hits {
-                        lines.push(format!("{}\t{}\t{}\t{}\t{:.1}\t{:.2e}",
+                        lines.push(format!(
+                            "{}\t{}\t{}\t{}\t{:.1}\t{:.2e}",
                             hit.target_name,
                             hit.target_start,
                             hit.target_end,
@@ -144,8 +149,13 @@ fn main() -> Result<()> {
             }
         }
 
-        Commands::Analyze { input, output, threshold, modomics } => {
-            use ornament_core::analysis::{TRNAHit, analyze_batch};
+        Commands::Analyze {
+            input,
+            output,
+            threshold,
+            modomics,
+        } => {
+            use ornament_core::analysis::{analyze_batch, TRNAHit};
 
             // Verify input file exists
             if !Path::new(&input).exists() {
@@ -157,28 +167,43 @@ fn main() -> Result<()> {
 
             // Read input file (JSON from scan command)
             let content = std::fs::read_to_string(&input)?;
-            let hits: Vec<TRNAHit> = serde_json::from_str(&content)
-                .map_err(|e| anyhow!("Failed to parse input JSON: {}. Expected output from 'ornament scan'.", e))?;
+            let hits: Vec<TRNAHit> = serde_json::from_str(&content).map_err(|e| {
+                anyhow!(
+                    "Failed to parse input JSON: {}. Expected output from 'ornament scan'.",
+                    e
+                )
+            })?;
 
             eprintln!("Loaded {} tRNA hits", hits.len());
 
             // Load modification database
             let db = if let Some(modomics_path) = modomics {
                 eprintln!("Loading MODOMICS database from {}...", modomics_path);
-                ornament_core::modification::ModificationDatabase::from_modomics_file(Path::new(&modomics_path))
-                    .map_err(|e| anyhow!("Failed to load MODOMICS file: {}", e))?
+                ornament_core::modification::ModificationDatabase::from_modomics_file(Path::new(
+                    &modomics_path,
+                ))
+                .map_err(|e| anyhow!("Failed to load MODOMICS file: {}", e))?
             } else {
                 ornament_core::modification::ModificationDatabase::eukaryotic()
             };
             let results = analyze_batch(&hits, &db);
 
             // Filter to odd tRNAs based on threshold
-            let odd_results: Vec<_> = results.results.iter()
+            let odd_results: Vec<_> = results
+                .results
+                .iter()
                 .filter(|r| r.compatibility_score < threshold)
                 .collect();
 
-            eprintln!("Found {} odd tRNAs (score < {})", odd_results.len(), threshold);
-            eprintln!("Average compatibility: {:.2}%", results.average_compatibility * 100.0);
+            eprintln!(
+                "Found {} odd tRNAs (score < {})",
+                odd_results.len(),
+                threshold
+            );
+            eprintln!(
+                "Average compatibility: {:.2}%",
+                results.average_compatibility * 100.0
+            );
 
             // Format output
             let output_data = serde_json::json!({
@@ -221,7 +246,11 @@ fn main() -> Result<()> {
             }
         }
 
-        Commands::Compare { trna, modkit, output } => {
+        Commands::Compare {
+            trna,
+            modkit,
+            output,
+        } => {
             use ornament_core::analysis::ModCompatibilityResult;
             use ornament_core::integration::modkit::parse_bedmethyl;
 
@@ -240,12 +269,13 @@ fn main() -> Result<()> {
             let trna_data: serde_json::Value = serde_json::from_str(&trna_content)?;
 
             // Extract results from analysis output
-            let trna_results: Vec<ModCompatibilityResult> = if let Some(results) = trna_data.get("all_results") {
-                serde_json::from_value(results.clone())?
-            } else {
-                // Try parsing as direct array of results
-                serde_json::from_str(&trna_content)?
-            };
+            let trna_results: Vec<ModCompatibilityResult> =
+                if let Some(results) = trna_data.get("all_results") {
+                    serde_json::from_value(results.clone())?
+                } else {
+                    // Try parsing as direct array of results
+                    serde_json::from_str(&trna_content)?
+                };
 
             eprintln!("Loaded {} tRNA results", trna_results.len());
 
@@ -262,12 +292,9 @@ fn main() -> Result<()> {
                 let hit = &trna_result.hit;
 
                 // Find modkit records overlapping this tRNA
-                let overlapping: Vec<_> = modkit_records.iter()
-                    .filter(|r| {
-                        r.chrom == hit.seq_name &&
-                        r.start >= hit.start &&
-                        r.end <= hit.end
-                    })
+                let overlapping: Vec<_> = modkit_records
+                    .iter()
+                    .filter(|r| r.chrom == hit.seq_name && r.start >= hit.start && r.end <= hit.end)
                     .collect();
 
                 if !overlapping.is_empty() {
@@ -319,11 +346,17 @@ fn main() -> Result<()> {
             }
         }
 
-        Commands::Mods { position, verbose, modomics } => {
+        Commands::Mods {
+            position,
+            verbose,
+            modomics,
+        } => {
             let db = if let Some(modomics_path) = modomics {
                 eprintln!("Loading MODOMICS database from {}...", modomics_path);
-                ornament_core::modification::ModificationDatabase::from_modomics_file(Path::new(&modomics_path))
-                    .map_err(|e| anyhow!("Failed to load MODOMICS file: {}", e))?
+                ornament_core::modification::ModificationDatabase::from_modomics_file(Path::new(
+                    &modomics_path,
+                ))
+                .map_err(|e| anyhow!("Failed to load MODOMICS file: {}", e))?
             } else {
                 ornament_core::modification::ModificationDatabase::eukaryotic()
             };
@@ -336,10 +369,10 @@ fn main() -> Result<()> {
                     for exp in expectations {
                         for modification in &exp.modifications {
                             if verbose {
-                                println!("  {} ({}) - {:?} conservation",
-                                         modification.name,
-                                         modification.short_name,
-                                         exp.conservation);
+                                println!(
+                                    "  {} ({}) - {:?} conservation",
+                                    modification.name, modification.short_name, exp.conservation
+                                );
                             } else {
                                 println!("  {}", modification.short_name);
                             }
@@ -349,14 +382,19 @@ fn main() -> Result<()> {
                     println!("No modifications expected at position {}", pos);
                 }
             } else {
-                println!("Modification database ({} modifications):", db.modifications().len());
+                println!(
+                    "Modification database ({} modifications):",
+                    db.modifications().len()
+                );
                 for (name, modification) in db.modifications() {
                     if verbose {
-                        println!("  {} ({}) - derived from {:?}, genomic: {:?}",
-                                 name,
-                                 modification.short_name,
-                                 modification.parent_base,
-                                 modification.genomic_expectation);
+                        println!(
+                            "  {} ({}) - derived from {:?}, genomic: {:?}",
+                            name,
+                            modification.short_name,
+                            modification.parent_base,
+                            modification.genomic_expectation
+                        );
                     } else {
                         println!("  {} ({})", modification.short_name, name);
                     }

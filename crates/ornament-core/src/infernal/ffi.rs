@@ -11,8 +11,8 @@ use super::CMHit;
 
 // Re-export the raw types for internal use
 use infernal_sys::{
-    CM_FILE, CM_HIT, CM_PIPELINE, CM_TOPHITS, CM_t, ESL_ALPHABET, ESL_SQ, ESL_SQFILE,
-    P7_BG, P7_OPROFILE, P7_SCOREDATA,
+    CM_t, CM_FILE, CM_HIT, CM_PIPELINE, CM_TOPHITS, ESL_ALPHABET, ESL_SQ, ESL_SQFILE, P7_BG,
+    P7_OPROFILE, P7_SCOREDATA,
 };
 
 /// Alphabet type constants from Easel
@@ -98,10 +98,8 @@ impl CovarianceModel {
             let mut cm: *mut CM_t = ptr::null_mut();
 
             let status = infernal_sys::cm_file_Read(
-                cmfp,
-                1, // read_fp7 = true (read the embedded HMM)
-                &mut abc,
-                &mut cm,
+                cmfp, 1, // read_fp7 = true (read the embedded HMM)
+                &mut abc, &mut cm,
             );
 
             // Get the offset before closing
@@ -309,7 +307,7 @@ impl SequenceFile {
             // Open with format autodetection (format = 0)
             let status = infernal_sys::esl_sqfile_Open(
                 c_path.as_ptr() as *mut i8,
-                0, // format = unknown (autodetect)
+                0,               // format = unknown (autodetect)
                 ptr::null_mut(), // env
                 &mut sqfp,
             );

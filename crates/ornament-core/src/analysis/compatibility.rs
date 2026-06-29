@@ -1,9 +1,9 @@
 //! Modification compatibility analysis
 
-use super::{TRNAHit, ModCompatibilityResult, ModificationIncompatibility, Severity};
-use crate::modification::{ModificationDatabase, SprinzlMapper};
-use crate::{RnaBase, SprinzlPosition, ConservationLevel};
+use super::{ModCompatibilityResult, ModificationIncompatibility, Severity, TRNAHit};
 use crate::modification::Isotype;
+use crate::modification::{ModificationDatabase, SprinzlMapper};
+use crate::{ConservationLevel, RnaBase, SprinzlPosition};
 use std::collections::HashMap;
 
 /// Analyze modification compatibility for a tRNA hit
@@ -23,7 +23,7 @@ pub fn analyze_compatibility(
     let mut positions_compatible = 0;
 
     // Get isotype for isotype-specific checks
-    let isotype = hit.isotype.as_ref().map(|s| Isotype::new(s));
+    let isotype = hit.isotype.as_ref().map(Isotype::new);
 
     for (sprinzl_pos, seq_idx) in &sprinzl_alignment {
         // Get the base at this position
@@ -92,7 +92,8 @@ pub fn analyze_compatibility(
 
     // Determine if this is an "odd" tRNA
     // Odd if: score < 1.0 AND has critical/major incompatibilities
-    let has_significant_incompatibility = incompatibilities.iter()
+    let has_significant_incompatibility = incompatibilities
+        .iter()
         .any(|i| matches!(i.severity, Severity::Critical | Severity::Major));
     let is_odd = compatibility_score < 1.0 && has_significant_incompatibility;
 
@@ -105,19 +106,23 @@ pub fn analyze_compatibility(
     }
 }
 
-/// Map a tRNA sequence to Sprinzl positions
-/// Uses the structure string as an alignment guide
+/// Map a tRNA sequence to Sprinzl positions.
+///
+/// Primary path: align the hit sequence to the native Sprinzl reference covariance model
+/// (`modification::align_to_sprinzl`), which gives a real consensus-column → Sprinzl
+/// mapping that handles insertions/deletions in the D-loop and variable arm. Only if that
+/// produces nothing (e.g. a non-tRNA / non-standard-residue sequence the model can't
+/// digitize) do we fall back to the naive 1:1 mapping.
 fn map_sequence_to_sprinzl(
     hit: &TRNAHit,
     mapper: &SprinzlMapper,
 ) -> HashMap<SprinzlPosition, usize> {
-    // If structure is available, use it as alignment to CM
-    if !hit.structure.is_empty() {
-        return mapper.map_alignment(&hit.structure);
+    let aligned = crate::modification::align_to_sprinzl(&hit.sequence);
+    if !aligned.is_empty() {
+        return aligned;
     }
 
-    // Fallback: assume sequence is already aligned to standard positions
-    // This is a simple 1:1 mapping for ungapped sequences
+    // Fallback: assume sequence is already aligned to standard positions (1:1, ungapped).
     let mut result = HashMap::new();
     for (seq_idx, _) in hit.sequence.chars().enumerate() {
         if let Some(sprinzl) = mapper.get_sprinzl(seq_idx) {
@@ -128,10 +133,7 @@ fn map_sequence_to_sprinzl(
 }
 
 /// Analyze multiple tRNA hits and return summary statistics
-pub fn analyze_batch(
-    hits: &[TRNAHit],
-    mod_db: &ModificationDatabase,
-) -> BatchAnalysisResult {
+pub fn analyze_batch(hits: &[TRNAHit], mod_db: &ModificationDatabase) -> BatchAnalysisResult {
     let results: Vec<ModCompatibilityResult> = hits
         .iter()
         .map(|hit| analyze_compatibility(hit, mod_db))
@@ -179,8 +181,12 @@ mod tests {
             isotype: Some("Ala".to_string()),
             anticodon: Some("AGC".to_string()),
             // U at position 55 (compatible with Psi)
-            sequence: "GCGGAUUUAGCUCAGUUGGGAGAGCGCCAGACUGAAGAUCUGGAGGUCCUGUGUUCGAUCCACAGAAUUCGCACCA".to_string(),
-            structure: "(((((((..((((.........)))).(((((.......))))).....(((((.......))))))))))))....".to_string(),
+            sequence:
+                "GCGGAUUUAGCUCAGUUGGGAGAGCGCCAGACUGAAGAUCUGGAGGUCCUGUGUUCGAUCCACAGAAUUCGCACCA"
+                    .to_string(),
+            structure:
+                "(((((((..((((.........)))).(((((.......))))).....(((((.......))))))))))))...."
+                    .to_string(),
         };
 
         let db = ModificationDatabase::eukaryotic();
@@ -192,20 +198,20 @@ mod tests {
 
     #[test]
     fn test_analyze_batch() {
-        let hits = vec![
-            TRNAHit {
-                id: "test1".to_string(),
-                seq_name: "chr1".to_string(),
-                start: 1000,
-                end: 1072,
-                strand: Strand::Plus,
-                score: 80.0,
-                isotype: Some("Ala".to_string()),
-                anticodon: Some("AGC".to_string()),
-                sequence: "GCGGAUUUAGCUCAGUUGGGAGAGCGCCAGACUGAAGAUCUGGAGGUCCUGUGUUCGAUCCACAGAAUUCGCACCA".to_string(),
-                structure: "".to_string(),
-            },
-        ];
+        let hits = vec![TRNAHit {
+            id: "test1".to_string(),
+            seq_name: "chr1".to_string(),
+            start: 1000,
+            end: 1072,
+            strand: Strand::Plus,
+            score: 80.0,
+            isotype: Some("Ala".to_string()),
+            anticodon: Some("AGC".to_string()),
+            sequence:
+                "GCGGAUUUAGCUCAGUUGGGAGAGCGCCAGACUGAAGAUCUGGAGGUCCUGUGUUCGAUCCACAGAAUUCGCACCA"
+                    .to_string(),
+            structure: "".to_string(),
+        }];
 
         let db = ModificationDatabase::eukaryotic();
         let batch_result = analyze_batch(&hits, &db);
