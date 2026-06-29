@@ -8,6 +8,16 @@ members = [
     "crates/ornament-core",
     "crates/ornament-cli",
 ]
+# The legacy C-FFI crate is excluded from default builds (it needs ext/ + a C toolchain).
+# Bare `cargo build`/`nextest` skip it; build it explicitly with `-p infernal-sys` or the
+# `ornament-core` `ffi` feature.
+default-members = [
+    "crates/easel-rs",
+    "crates/hmmer-rs",
+    "crates/infernal-rs",
+    "crates/ornament-core",
+    "crates/ornament-cli",
+]
 
 [workspace.package]
 version = "0.1.0"

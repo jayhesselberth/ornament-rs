@@ -105,19 +105,23 @@ pub fn analyze_compatibility(
     }
 }
 
-/// Map a tRNA sequence to Sprinzl positions
-/// Uses the structure string as an alignment guide
+/// Map a tRNA sequence to Sprinzl positions.
+///
+/// Primary path: align the hit sequence to the native Sprinzl reference covariance model
+/// (`modification::align_to_sprinzl`), which gives a real consensus-column → Sprinzl
+/// mapping that handles insertions/deletions in the D-loop and variable arm. Only if that
+/// produces nothing (e.g. a non-tRNA / non-standard-residue sequence the model can't
+/// digitize) do we fall back to the naive 1:1 mapping.
 fn map_sequence_to_sprinzl(
     hit: &TRNAHit,
     mapper: &SprinzlMapper,
 ) -> HashMap<SprinzlPosition, usize> {
-    // If structure is available, use it as alignment to CM
-    if !hit.structure.is_empty() {
-        return mapper.map_alignment(&hit.structure);
+    let aligned = crate::modification::align_to_sprinzl(&hit.sequence);
+    if !aligned.is_empty() {
+        return aligned;
     }
 
-    // Fallback: assume sequence is already aligned to standard positions
-    // This is a simple 1:1 mapping for ungapped sequences
+    // Fallback: assume sequence is already aligned to standard positions (1:1, ungapped).
     let mut result = HashMap::new();
     for (seq_idx, _) in hit.sequence.chars().enumerate() {
         if let Some(sprinzl) = mapper.get_sprinzl(seq_idx) {

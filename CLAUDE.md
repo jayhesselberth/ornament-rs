@@ -41,6 +41,17 @@ pixi run -e dev check            # mold -run cargo check
 pixi run -e dev clippy           # mold -run cargo clippy --workspace --all-targets
 ```
 
+**Run builds/tests on SLURM, not the login node** — prefix with `srun -p rna -c 24`:
+
+```bash
+srun -p rna -c 24 pixi run -e dev test
+srun -p rna -c 24 pixi run -e dev build
+```
+
+Only build `--release` when actually needed (release LTO is slow). The workspace
+`default-members` excludes the legacy `infernal-sys` C-FFI crate, so bare `cargo`/`nextest`
+commands skip it (build it explicitly with `-p infernal-sys` or `ornament-core`'s `ffi` feature).
+
 `.cargo/config.toml` pins `target-cpu=x86-64-v3` (AVX2/FMA baseline, portable
 across the cluster). AVX-512 hot kernels use runtime `is_x86_feature_detected!`
 dispatch rather than a global baseline bump. See `.config/nextest.toml` for the
