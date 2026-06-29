@@ -15,6 +15,7 @@ use easel_rs::Dsq;
 
 use crate::config::IMPOSSIBLE;
 use crate::emit::Oesc;
+use crate::evalues::{evalue, SearchMode};
 use crate::model::{emits_right, n_emit, st, stid, Cm};
 
 /// A single hit (1-based, inclusive coordinates on the forward strand).
@@ -34,6 +35,95 @@ pub struct CykScan {
     pub best: Option<CykHit>,
     /// Best ROOT_S score at each end position `j` (1-based; index 0 unused).
     pub bestsc_per_j: Vec<f32>,
+}
+
+/// Which strand a hit was found on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Strand {
+    /// Forward (top) strand.
+    Plus,
+    /// Reverse-complement (bottom) strand.
+    Minus,
+}
+
+/// A reported hit in ORIGINAL sequence coordinates, mirroring `CM_HIT` / `cmsearch --tblout`.
+///
+/// `i`/`j` follow the tblout `seq from`/`seq to` convention: on the [`Strand::Plus`] strand
+/// `i < j`; on [`Strand::Minus`] the alignment runs 3'→5' along the top strand so `i > j`
+/// (`i` is the high coordinate, `j` the low). The matched span is always `i.min(j)..=i.max(j)`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Hit {
+    /// Bit score.
+    pub score: f32,
+    /// E-value for the search mode, if the model is calibrated for it.
+    pub evalue: Option<f64>,
+    /// Start coordinate (1-based) on the original (forward) sequence.
+    pub i: usize,
+    /// End coordinate (1-based) on the original (forward) sequence.
+    pub j: usize,
+    /// Strand the hit was found on.
+    pub strand: Strand,
+}
+
+/// A raw hit on the strand that was scanned, in that strand's local 1-based coordinates.
+#[derive(Debug, Clone, Copy)]
+struct RawHit {
+    score: f32,
+    i: usize,
+    j: usize,
+}
+
+/// Gamma semi-HMM for optimal resolution of overlapping hits, ported from
+/// `CreateGammaHitMx` / `UpdateGammaHitMx` / `TBackGammaHitMx` (`src/cm_mx.c`). This is the
+/// non-greedy (default) Infernal path: it picks the maximum-total-score set of
+/// non-overlapping hits, then a traceback recovers each above-cutoff hit.
+struct Gamma {
+    /// `mx[j]` = best cumulative score of all chosen hits ending at or before `j`.
+    mx: Vec<f32>,
+    /// `gback[j]` = start `i` of the hit ending at `j` (0 = no hit ends here).
+    gback: Vec<usize>,
+    /// `savesc[j]` = bit score of the hit ending at `j`.
+    savesc: Vec<f32>,
+    /// Reporting cutoff (bits); a recovered hit is kept iff `savesc >= cutoff`.
+    cutoff: f32,
+}
+
+impl Gamma {
+    fn new(l: usize, cutoff: f32) -> Self {
+        Gamma {
+            mx: vec![0.0; l + 1],
+            gback: vec![0; l + 1],
+            savesc: vec![IMPOSSIBLE; l + 1],
+            cutoff,
+        }
+    }
+
+    /// Traceback recovering all above-cutoff non-overlapping hits (`TBackGammaHitMx`),
+    /// returned in ascending coordinate order.
+    fn traceback(&self, l: usize) -> Vec<RawHit> {
+        let mut hits = Vec::new();
+        let mut j = l;
+        while j >= 1 {
+            let i = self.gback[j];
+            if i == 0 {
+                j -= 1; // no hit ends at j
+            } else {
+                if self.savesc[j] >= self.cutoff {
+                    hits.push(RawHit {
+                        score: self.savesc[j],
+                        i,
+                        j,
+                    });
+                }
+                if i <= 1 {
+                    break;
+                }
+                j = i - 1;
+            }
+        }
+        hits.reverse();
+        hits
+    }
 }
 
 /// The "⊕" operation that combines alternative sub-parses within a DP cell.
@@ -110,19 +200,113 @@ pub fn inside_scan_glocal(cm: &Cm, dsq: &[Dsq], w_max: usize) -> CykScan {
     scan::<LogSum>(cm, dsq, w_max)
 }
 
+/// CYK search of BOTH strands, returning all hits scoring `>= cutoff_bits`, with overlapping
+/// windows resolved by the gamma semi-HMM (Infernal's default), sorted best-first (by
+/// E-value when calibrated, else by score). Honours the CM's configured glocal/local mode.
+pub fn cyk_search(cm: &Cm, dsq: &[Dsq], w_max: usize, cutoff_bits: f32) -> Vec<Hit> {
+    let mode = if cm.is_local {
+        SearchMode::LocalCyk
+    } else {
+        SearchMode::GlocalCyk
+    };
+    search::<MaxPlus>(cm, dsq, w_max, cutoff_bits, mode)
+}
+
+/// Inside counterpart of [`cyk_search`] (sum-over-parses scoring).
+pub fn inside_search(cm: &Cm, dsq: &[Dsq], w_max: usize, cutoff_bits: f32) -> Vec<Hit> {
+    let mode = if cm.is_local {
+        SearchMode::LocalInside
+    } else {
+        SearchMode::GlocalInside
+    };
+    search::<LogSum>(cm, dsq, w_max, cutoff_bits, mode)
+}
+
+/// Both-strand multi-hit driver shared by [`cyk_search`]/[`inside_search`].
+///
+/// Scans the forward strand, then the reverse complement, mapping minus-strand windows back
+/// to original coordinates. E-values use the total residues searched on both strands
+/// (`2*L`), matching `cmsearch`'s default reporting.
+fn search<S: Semiring>(
+    cm: &Cm,
+    dsq: &[Dsq],
+    w_max: usize,
+    cutoff_bits: f32,
+    mode: SearchMode,
+) -> Vec<Hit> {
+    let l = dsq.len().saturating_sub(2);
+    let searched = 2.0 * l as f64;
+    let mut hits: Vec<Hit> = Vec::new();
+
+    // Forward strand.
+    for h in scan_core::<S>(cm, dsq, w_max, Some(cutoff_bits)).1 {
+        hits.push(Hit {
+            score: h.score,
+            evalue: evalue(cm, mode, h.score, searched),
+            i: h.i,
+            j: h.j,
+            strand: Strand::Plus,
+        });
+    }
+
+    // Reverse-complement strand. A window (a..b) in the revcomp (a<=b) maps to original
+    // coordinates [L-b+1 .. L-a+1]; the alignment's 5' end is the high coordinate, so report
+    // i = L-a+1 (start, high) and j = L-b+1 (stop, low), giving i > j as cmsearch does.
+    let mut rc = dsq.to_vec();
+    cm.abc.revcomp(&mut rc).expect("revcomp digital sequence");
+    for h in scan_core::<S>(cm, &rc, w_max, Some(cutoff_bits)).1 {
+        hits.push(Hit {
+            score: h.score,
+            evalue: evalue(cm, mode, h.score, searched),
+            i: l - h.i + 1,
+            j: l - h.j + 1,
+            strand: Strand::Minus,
+        });
+    }
+
+    // Best-first: by E-value ascending when available, otherwise by score descending.
+    hits.sort_by(|a, b| match (a.evalue, b.evalue) {
+        (Some(ea), Some(eb)) => ea
+            .partial_cmp(&eb)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(b.score.total_cmp(&a.score)),
+        _ => b.score.total_cmp(&a.score),
+    });
+    hits
+}
+
+/// Single-best convenience wrapper over [`scan_core`] (no multi-hit gamma resolution).
+fn scan<S: Semiring>(cm: &Cm, dsq: &[Dsq], w_max: usize) -> CykScan {
+    scan_core::<S>(cm, dsq, w_max, None).0
+}
+
 /// Shared scanning recursion, parameterized by the within-cell ⊕ ([`Semiring`]). Handles
 /// both glocal and local mode (the latter when the CM was `configure_local`-ized): local
 /// adds EL local-end initialization and ROOT local begins.
-fn scan<S: Semiring>(cm: &Cm, dsq: &[Dsq], w_max: usize) -> CykScan {
+///
+/// Returns the single best hit (`CykScan`) and, when `gamma_cutoff` is `Some`, the full set
+/// of non-overlapping above-cutoff hits resolved by the gamma semi-HMM (in this strand's
+/// local coordinates). With `gamma_cutoff = None` the gamma pass is skipped and the hit
+/// vector is empty.
+fn scan_core<S: Semiring>(
+    cm: &Cm,
+    dsq: &[Dsq],
+    w_max: usize,
+    gamma_cutoff: Option<f32>,
+) -> (CykScan, Vec<RawHit>) {
     let l = dsq.len().saturating_sub(2);
     let w = w_max.min(l);
     let mut bestsc_per_j = vec![IMPOSSIBLE; l + 1];
     if l == 0 {
-        return CykScan {
-            best: None,
-            bestsc_per_j,
-        };
+        return (
+            CykScan {
+                best: None,
+                bestsc_per_j,
+            },
+            Vec::new(),
+        );
     }
+    let mut gamma = gamma_cutoff.map(|c| Gamma::new(l, c));
 
     let oesc = Oesc::build(cm);
     let kp = oesc.kp;
@@ -272,6 +456,12 @@ fn scan<S: Semiring>(cm: &Cm, dsq: &[Dsq], w_max: usize) -> CykScan {
         let ych = cm.cfirst[0] as usize;
         let cnum0 = cm.cnum[0] as usize;
         let mut bestsc_j = IMPOSSIBLE;
+        // Gamma cell init (UpdateGammaHitMx): default to "no hit ends at j".
+        if let Some(g) = gamma.as_mut() {
+            g.mx[j] = g.mx[j - 1];
+            g.gback[j] = 0;
+            g.savesc[j] = IMPOSSIBLE;
+        }
         for d in 1..=dx {
             let mut sc = IMPOSSIBLE;
             for yoff in 0..cnum0 {
@@ -292,9 +482,23 @@ fn scan<S: Semiring>(cm: &Cm, dsq: &[Dsq], w_max: usize) -> CykScan {
                     j,
                 });
             }
+            // Gamma update: a hit of length d ending at j, chained to the best resolution
+            // ending before its start. Keep it if it improves the cumulative total.
+            if let Some(g) = gamma.as_mut() {
+                if sc > IMPOSSIBLE {
+                    let i = j - d + 1;
+                    let cumulative = g.mx[i - 1] + sc;
+                    if cumulative > g.mx[j] {
+                        g.mx[j] = cumulative;
+                        g.gback[j] = i;
+                        g.savesc[j] = sc;
+                    }
+                }
+            }
         }
         bestsc_per_j[j] = bestsc_j;
     }
 
-    CykScan { best, bestsc_per_j }
+    let hits = gamma.map(|g| g.traceback(l)).unwrap_or_default();
+    (CykScan { best, bestsc_per_j }, hits)
 }
