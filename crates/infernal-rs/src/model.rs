@@ -229,9 +229,14 @@ pub struct Cm {
     /// Log-odds scores, filled by `config`.
     pub tsc: Vec<Vec<f32>>,
     pub esc: Vec<Vec<f32>>,
-    /// Local begin/end probabilities, filled by `config`.
+    /// Local begin/end probabilities, filled by `configure_local`.
     pub begin: Vec<f32>,
     pub end: Vec<f32>,
+    /// Local begin/end log-odds scores (`ROOT_S -> v` and `v -> EL`). IMPOSSIBLE in glocal.
+    pub beginsc: Vec<f32>,
+    pub endsc: Vec<f32>,
+    /// True once the model has been configured for local alignment.
+    pub is_local: bool,
 
     pub pbegin: f32,
     pub pend: f32,

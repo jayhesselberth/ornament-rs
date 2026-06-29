@@ -4,7 +4,21 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Ornament is a modification-aware tRNA scanner in Rust. It identifies tRNAs using Infernal covariance models, then analyzes sequence compatibility with known RNA modifications to flag "odd" tRNAs with modification-incompatible variants.
+This repository contains two layers:
+
+1. **A native Rust reimplementation of Infernal** — a general-purpose covariance-model
+   (profile-SCFG) homology search engine, *not* tRNA-specific. The `easel-rs` + `hmmer-rs`
+   + `infernal-rs` crate stack reads standard `.cm` models and runs CYK/Inside search,
+   alignment, and E-value calculation natively, replacing the C library + FFI (and the
+   external `cmsearch`/`cmalign` binaries). It works with any Infernal covariance model
+   (any Rfam family), validated for parity against the upstream `cmsearch` oracle. It is
+   additionally **extended beyond Infernal** with a modification-aware alphabet (modified
+   bases as first-class symbols) for RNA-modification analysis and discovery.
+
+2. **Ornament** — a tRNA-modification application built on that engine. It identifies tRNAs
+   with a covariance model, assigns Sprinzl positions via native alignment, and analyzes
+   sequence compatibility with known RNA modifications to flag "odd" tRNAs with
+   modification-incompatible variants. This is one consumer of the general engine.
 
 ## Build Commands
 

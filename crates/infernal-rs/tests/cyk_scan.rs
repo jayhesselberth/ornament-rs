@@ -7,8 +7,8 @@
 //! filters/bands). The native scanner targets the same number.
 
 use easel_rs::{read_fasta, Alphabet};
-use infernal_rs::search::{cyk_scan_glocal, inside_scan_glocal};
-use infernal_rs::{configure_scores, evalue, parse_cm_file, SearchMode};
+use infernal_rs::search::{cyk_scan, cyk_scan_glocal, inside_scan, inside_scan_glocal};
+use infernal_rs::{configure_local, configure_scores, evalue, parse_cm_file, SearchMode};
 
 fn cm() -> infernal_rs::Cm {
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/tRNA.cm");
@@ -99,4 +99,49 @@ fn glocal_inside_matches_oracle() {
         let cyk = cyk_scan_glocal(&cm, &dsq, cm.w as usize).best.unwrap();
         assert!(best.score >= cyk.score - 1e-3, "Inside < CYK");
     }
+}
+
+#[test]
+fn local_cyk_and_inside_match_oracle() {
+    // Local mode (cmsearch default, no -g). Oracle with --max [--cyk]: the consensus and the
+    // embedded tRNA both score 87.2 bits (slightly below glocal's 87.3 — the local begin/end
+    // penalty), best hit at the same coordinates.
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/tRNA.cm");
+    let mut cm = parse_cm_file(path).expect("parse");
+    configure_local(&mut cm); // local instead of glocal
+    assert!(cm.is_local);
+    let abc = Alphabet::rna();
+
+    for (file, coords) in [
+        ("/tests/data/trna_cons.fa", (1usize, 71usize)),
+        ("/tests/data/trna_embedded.fa", (61, 131)),
+    ] {
+        let p = format!("{}{}", env!("CARGO_MANIFEST_DIR"), file);
+        let recs = read_fasta(&p).expect("read");
+        let dsq = abc.digitize(&recs[0].seq).expect("digitize");
+
+        let cyk = cyk_scan(&cm, &dsq, cm.w as usize).best.expect("cyk hit");
+        eprintln!("local CYK {file}: {:.3} {}..{}", cyk.score, cyk.i, cyk.j);
+        assert_eq!((cyk.i, cyk.j), coords, "{file} local CYK coords");
+        assert!((cyk.score - 87.2).abs() < 0.2, "{file} local CYK {:.3} != 87.2", cyk.score);
+
+        let ins = inside_scan(&cm, &dsq, cm.w as usize).best.expect("inside hit");
+        assert!((ins.score - 87.2).abs() < 0.3, "{file} local Inside {:.3} != 87.2", ins.score);
+        assert!(ins.score >= cyk.score - 1e-3);
+    }
+}
+
+#[test]
+fn glocal_config_unaffected_by_local_paths() {
+    // A glocal-configured CM must produce exactly the glocal result (local code paths are
+    // no-ops when is_local is false / beginsc/endsc are IMPOSSIBLE).
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/tRNA.cm");
+    let mut cm = parse_cm_file(path).expect("parse");
+    configure_scores(&mut cm);
+    assert!(!cm.is_local);
+    let abc = Alphabet::rna();
+    let recs = read_fasta(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/trna_cons.fa")).unwrap();
+    let dsq = abc.digitize(&recs[0].seq).unwrap();
+    let best = cyk_scan(&cm, &dsq, cm.w as usize).best.unwrap();
+    assert!((best.score - 87.3).abs() < 0.2, "glocal still 87.3");
 }

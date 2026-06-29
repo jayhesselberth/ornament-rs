@@ -89,19 +89,31 @@ fn add(a: f32, b: f32) -> f32 {
     }
 }
 
-/// Glocal CYK scan (best single parse). Coordinates of the best hit are reported.
+/// CYK scan (best single parse). Honours the model's configured mode: glocal if the CM was
+/// configured with `configure_scores`, local if with `configure_local`.
+pub fn cyk_scan(cm: &Cm, dsq: &[Dsq], w_max: usize) -> CykScan {
+    scan::<MaxPlus>(cm, dsq, w_max)
+}
+
+/// Inside scan (sum over all parses), mode per the CM's configuration.
+pub fn inside_scan(cm: &Cm, dsq: &[Dsq], w_max: usize) -> CykScan {
+    scan::<LogSum>(cm, dsq, w_max)
+}
+
+/// Glocal CYK scan. Alias for [`cyk_scan`]; the CM must be configured glocal.
 pub fn cyk_scan_glocal(cm: &Cm, dsq: &[Dsq], w_max: usize) -> CykScan {
-    scan_glocal::<MaxPlus>(cm, dsq, w_max)
+    scan::<MaxPlus>(cm, dsq, w_max)
 }
 
-/// Glocal Inside scan (sum over all parses). The reported hit score is the Inside score
-/// at the best end position; coordinates mark that endpoint.
+/// Glocal Inside scan. Alias for [`inside_scan`]; the CM must be configured glocal.
 pub fn inside_scan_glocal(cm: &Cm, dsq: &[Dsq], w_max: usize) -> CykScan {
-    scan_glocal::<LogSum>(cm, dsq, w_max)
+    scan::<LogSum>(cm, dsq, w_max)
 }
 
-/// Shared glocal scanning recursion, parameterized by the within-cell ⊕ ([`Semiring`]).
-fn scan_glocal<S: Semiring>(cm: &Cm, dsq: &[Dsq], w_max: usize) -> CykScan {
+/// Shared scanning recursion, parameterized by the within-cell ⊕ ([`Semiring`]). Handles
+/// both glocal and local mode (the latter when the CM was `configure_local`-ized): local
+/// adds EL local-end initialization and ROOT local begins.
+fn scan<S: Semiring>(cm: &Cm, dsq: &[Dsq], w_max: usize) -> CykScan {
     let l = dsq.len().saturating_sub(2);
     let w = w_max.min(l);
     let mut bestsc_per_j = vec![IMPOSSIBLE; l + 1];
@@ -127,13 +139,32 @@ fn scan_glocal<S: Semiring>(cm: &Cm, dsq: &[Dsq], w_max: usize) -> CykScan {
     let mut alpha = vec![vec![IMPOSSIBLE; m * width]; 2];
     let mut alpha_begl = vec![vec![IMPOSSIBLE; n_begl.max(1) * width]; width];
 
+    // Local-mode initialization: a state may end locally (v -> EL), emitting `dd` further
+    // residues at `el_selfsc` each. init_sc(v, dd) = endsc[v] + el_selfsc*dd (IMPOSSIBLE in
+    // glocal, where endsc is IMPOSSIBLE). Mirrors FCalcInitDPScores.
+    let el = cm.el_selfsc;
+    let init_sc = |v: usize, dd: usize| -> f32 {
+        let e = cm.endsc[v];
+        if e <= IMPOSSIBLE {
+            IMPOSSIBLE
+        } else {
+            e + el * dd as f32
+        }
+    };
+    // Local begin target states (first state of each MATP/MATL/MATR/BIF node). Empty in glocal.
+    let begin_states: Vec<usize> = if cm.is_local {
+        (1..m).filter(|&y| cm.beginsc[y] > IMPOSSIBLE).collect()
+    } else {
+        Vec::new()
+    };
+
     // --- d=0 base case (empty-fragment scores), per cm_scan_mx_InitializeFloats. ---
     // Only E/S/D/B states get a finite d=0; emitters stay IMPOSSIBLE. Glocal => endsc is
     // IMPOSSIBLE everywhere (no local ends).
     for v in (0..m).rev() {
         if cm.stid[v] == stid::BEGL_S {
             let ych = cm.cfirst[v] as usize;
-            let mut s = IMPOSSIBLE; // endsc[v]
+            let mut s = init_sc(v, 0); // endsc[v] (IMPOSSIBLE in glocal)
             for yoff in 0..cm.cnum[v] as usize {
                 s = S::or(s, add(alpha[0][(ych + yoff) * width], cm.tsc[v][yoff]));
             }
@@ -146,7 +177,7 @@ fn scan_glocal<S: Semiring>(cm: &Cm, dsq: &[Dsq], w_max: usize) -> CykScan {
             alpha[1][v * width] = 0.0;
         } else if cm.sttype[v] == st::S || cm.sttype[v] == st::D {
             let ych = cm.cfirst[v] as usize;
-            let mut s = IMPOSSIBLE;
+            let mut s = init_sc(v, 0);
             for yoff in 0..cm.cnum[v] as usize {
                 s = S::or(s, add(alpha[0][(ych + yoff) * width], cm.tsc[v][yoff]));
             }
@@ -182,7 +213,7 @@ fn scan_glocal<S: Semiring>(cm: &Cm, dsq: &[Dsq], w_max: usize) -> CykScan {
                 let wbi = begl_idx[cm.cfirst[v] as usize];
                 let ych = cm.cnum[v] as usize;
                 for d in 1..=dx {
-                    let mut sc = IMPOSSIBLE;
+                    let mut sc = init_sc(v, d); // B sd=0; IMPOSSIBLE unless v can local-end
                     for k in 0..=d {
                         let left = alpha_begl[(j - k) % width][wbi * width + (d - k)];
                         let rightsc = alpha[cur][ych * width + k];
@@ -204,8 +235,8 @@ fn scan_glocal<S: Semiring>(cm: &Cm, dsq: &[Dsq], w_max: usize) -> CykScan {
                 if d < sd {
                     continue; // emitters with too few residues stay IMPOSSIBLE
                 }
-                let mut sc = IMPOSSIBLE;
                 let cd = d - sd;
+                let mut sc = init_sc(v, cd); // local-end path: emit sd, then EL emits cd
                 for yoff in 0..cnum {
                     sc = S::or(sc, add(alpha[child_row][(ych + yoff) * width + cd], tsc[yoff]));
                 }
@@ -229,7 +260,8 @@ fn scan_glocal<S: Semiring>(cm: &Cm, dsq: &[Dsq], w_max: usize) -> CykScan {
             }
         }
 
-        // ROOT_S (v = 0): glocal, transitions only. Report hits d >= 1.
+        // ROOT_S (v = 0). Glocal: transitions to children. Local: ROOT transitions are
+        // zeroed and entry is via local begins into internal start states. Report hits d>=1.
         let tsc0 = &cm.tsc[0];
         let ych = cm.cfirst[0] as usize;
         let cnum0 = cm.cnum[0] as usize;
@@ -238,6 +270,10 @@ fn scan_glocal<S: Semiring>(cm: &Cm, dsq: &[Dsq], w_max: usize) -> CykScan {
             let mut sc = IMPOSSIBLE;
             for yoff in 0..cnum0 {
                 sc = S::or(sc, add(alpha[cur][(ych + yoff) * width + d], tsc0[yoff]));
+            }
+            // Local begins: ROOT_S -> internal start state y (never a BEGL_S).
+            for &y in &begin_states {
+                sc = S::or(sc, add(alpha[cur][y * width + d], cm.beginsc[y]));
             }
             alpha[cur][d] = sc; // ROOT stored at v=0 offset (read by nobody)
             if sc > bestsc_j {
