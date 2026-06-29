@@ -22,7 +22,10 @@ pub use config::{configure_local, configure_scores};
 pub use emitmap::EmitMap;
 pub use evalues::{evalue, score_to_evalue, SearchMode};
 pub use model::{Cm, ExpInfo};
-pub use search::{cyk_scan, cyk_scan_glocal, inside_scan, inside_scan_glocal, CykHit, CykScan};
+pub use search::{
+    cyk_scan, cyk_scan_glocal, cyk_search, inside_scan, inside_scan_glocal, inside_search, CykHit,
+    CykScan, Hit, Strand,
+};
 
 use thiserror::Error;
 
