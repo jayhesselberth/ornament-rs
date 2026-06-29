@@ -104,7 +104,10 @@ fn filter_scores_are_sane() {
 
         assert!(msv.is_finite() && vit.is_finite() && fwd.is_finite());
         // The guaranteed cross-filter bound (same profile, max ≤ sum).
-        assert!(vit <= fwd + eps, "{file}: Viterbi {vit:.3} > Forward {fwd:.3}");
+        assert!(
+            vit <= fwd + eps,
+            "{file}: Viterbi {vit:.3} > Forward {fwd:.3}"
+        );
         // All three should land well above the null on a true tRNA.
         assert!(
             msv > 0.0 && vit > 0.0 && fwd > 0.0,
@@ -168,7 +171,11 @@ fn nat_and_bit_wrappers_agree() {
     let abc = Alphabet::rna();
     let bg = bg_freqs(hmm.k);
 
-    let path = format!("{}{}", env!("CARGO_MANIFEST_DIR"), "/tests/data/trna_cons.fa");
+    let path = format!(
+        "{}{}",
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/data/trna_cons.fa"
+    );
     let recs = read_fasta(&path).unwrap();
     let dsq = abc.digitize(&recs[0].seq).unwrap();
     let l = dsq.len().saturating_sub(2);
