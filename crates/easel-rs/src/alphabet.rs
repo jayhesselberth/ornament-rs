@@ -128,7 +128,11 @@ impl Alphabet {
         let k = canon.len(); // 4
 
         // (degenerate symbol, the canonical residues it covers) — Easel order RYMKSWHBVD.
-        let u = if atype == AlphabetType::Rna { b'U' } else { b'T' };
+        let u = if atype == AlphabetType::Rna {
+            b'U'
+        } else {
+            b'T'
+        };
         let degens: [(u8, Vec<u8>); 10] = [
             (b'R', vec![b'A', b'G']),
             (b'Y', vec![b'C', u]),
@@ -185,9 +189,7 @@ impl Alphabet {
             }
         }
         // "any" character (N) at Kp-3 covers all canonical residues.
-        for x in 0..k {
-            degen[kp - 3][x] = true;
-        }
+        degen[kp - 3].fill(true);
         ndegen[kp - 3] = k;
 
         // Modified symbols: degeneracy = indicator of parent canonical base.
@@ -261,7 +263,7 @@ impl Alphabet {
             complement[i] = canon_index[&cc] as Dsq;
         }
         complement[k] = k as Dsq; // gap -> gap
-        // Degenerate complements (R<->Y, M<->K, S/W self, H<->D, B<->V) by residue set.
+                                  // Degenerate complements (R<->Y, M<->K, S/W self, H<->D, B<->V) by residue set.
         for di in 0..degens.len() {
             let code = k + 1 + di;
             // complement of a degenerate code = the code whose residue set is the
@@ -359,7 +361,9 @@ impl Alphabet {
                 continue;
             }
             if b >= 128 {
-                return Err(EaselError::Alphabet(format!("non-ASCII byte {b} in sequence")));
+                return Err(EaselError::Alphabet(format!(
+                    "non-ASCII byte {b} in sequence"
+                )));
             }
             let code = self.inmap[b as usize];
             if code == ILLEGAL {
@@ -393,9 +397,9 @@ impl Alphabet {
         }
         let xi = x as usize;
         let mut result = 0.0f32;
-        for i in 0..self.k {
+        for (i, &s) in sc.iter().enumerate().take(self.k) {
             if self.degen[xi][i] {
-                result += sc[i];
+                result += s;
             }
         }
         result / self.ndegen[xi] as f32
@@ -431,7 +435,10 @@ mod tests {
         let a = Alphabet::rna();
         assert_eq!(a.k, 4);
         assert_eq!(a.kp, 18);
-        assert_eq!(a.sym.iter().map(|&b| b as char).collect::<String>(), "ACGU-RYMKSWHBVDN*~");
+        assert_eq!(
+            a.sym.iter().map(|&b| b as char).collect::<String>(),
+            "ACGU-RYMKSWHBVDN*~"
+        );
         // canonical
         assert_eq!(a.inmap[b'A' as usize], 0);
         assert_eq!(a.inmap[b'U' as usize], 3);
@@ -458,7 +465,7 @@ mod tests {
     fn favg_marginalizes_degenerate() {
         let a = Alphabet::rna();
         let sc = [1.0f32, 2.0, 4.0, 8.0]; // A C G U
-        // R = {A,G} -> (1+4)/2 = 2.5
+                                          // R = {A,G} -> (1+4)/2 = 2.5
         let r = a.inmap[b'R' as usize];
         assert!((a.favg_score(r, &sc) - 2.5).abs() < 1e-6);
         // canonical G -> 4
@@ -478,8 +485,16 @@ mod tests {
         // Pseudouridine 'P' (parent U), dihydrouridine 'D' would collide with degen D,
         // so use 'O' for a U-derived mod and 'L' for an A-derived mod in this test.
         let mods = vec![
-            ModSpec { symbol: 'P', parent: 'U', name: "pseudouridine".into() },
-            ModSpec { symbol: 'L', parent: 'A', name: "m1A".into() },
+            ModSpec {
+                symbol: 'P',
+                parent: 'U',
+                name: "pseudouridine".into(),
+            },
+            ModSpec {
+                symbol: 'L',
+                parent: 'A',
+                name: "m1A".into(),
+            },
         ];
         let a = Alphabet::rna_with_modifications(&mods).unwrap();
         // Kp grew by 2.
@@ -507,7 +522,11 @@ mod tests {
         // The key invariant: adding modified symbols does not perturb canonical/degenerate
         // scoring relative to the stock alphabet.
         let base = Alphabet::rna();
-        let mods = vec![ModSpec { symbol: 'P', parent: 'U', name: "Y".into() }];
+        let mods = vec![ModSpec {
+            symbol: 'P',
+            parent: 'U',
+            name: "Y".into(),
+        }];
         let ext = Alphabet::rna_with_modifications(&mods).unwrap();
         let sc = [1.5f32, -0.3, 2.2, 0.7];
         for c in [b'A', b'C', b'G', b'U', b'R', b'Y', b'N'] {

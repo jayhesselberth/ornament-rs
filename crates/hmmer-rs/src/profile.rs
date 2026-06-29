@@ -109,8 +109,8 @@ impl P7Profile {
             for (x, c) in canon.iter_mut().enumerate() {
                 *c = ln(hmm.mat[kk][x] / bg[x]);
             }
-            for x in 0..kp {
-                msc[x][kk] = if abc.is_residue(x as u8) {
+            for (x, row) in msc.iter_mut().enumerate() {
+                row[kk] = if abc.is_residue(x as u8) {
                     abc.favg_score(x as u8, &canon)
                 } else {
                     ninf
@@ -118,11 +118,9 @@ impl P7Profile {
             }
         }
         // Insert emissions hardwired to 0 (background) for k < M; I_M impossible.
-        for x in 0..kp {
+        for (x, row) in isc.iter_mut().enumerate() {
             if abc.is_residue(x as u8) {
-                for kk in 1..m {
-                    isc[x][kk] = 0.0;
-                }
+                row[1..m].fill(0.0);
             }
         }
 

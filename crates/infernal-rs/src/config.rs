@@ -15,6 +15,9 @@ pub const IMPOSSIBLE: f32 = -1e36;
 /// `sreLOG2(x) = log2(x)` for `x > 0`, else [`IMPOSSIBLE`]. Uses Infernal's exact constant
 /// (`log(x) * 1.44269504`) so scores reproduce the `.cm` file bit-for-bit.
 #[inline]
+// The truncated 1.44269504 (not f64::consts::LOG2_E) is intentional: it matches
+// Infernal's `sreLOG2` macro exactly so scores reproduce the `.cm` file bit-for-bit.
+#[allow(clippy::approx_constant)]
 pub fn sre_log2(x: f32) -> f32 {
     if x > 0.0 {
         ((x as f64).ln() * 1.44269504) as f32
@@ -68,7 +71,9 @@ pub fn configure_local(cm: &mut Cm) {
     let is_exit_nd = |t: u8| matches!(t, nd::MATP | nd::MATL | nd::MATR | nd::BEGL | nd::BEGR);
 
     // --- Local begins: spread p_start over internal start nodes (nd >= 2); node 1 gets the rest.
-    let nstarts = (2..cm.nodes).filter(|&nd_i| is_start_nd(cm.ndtype[nd_i])).count();
+    let nstarts = (2..cm.nodes)
+        .filter(|&nd_i| is_start_nd(cm.ndtype[nd_i]))
+        .count();
     for b in cm.begin.iter_mut() {
         *b = 0.0;
     }
@@ -99,7 +104,8 @@ pub fn configure_local(cm: &mut Cm) {
     }
     if nexits > 0 {
         for nd_i in 1..cm.nodes {
-            if is_exit_nd(cm.ndtype[nd_i]) && nd_i + 1 < cm.nodes && cm.ndtype[nd_i + 1] != nd::END {
+            if is_exit_nd(cm.ndtype[nd_i]) && nd_i + 1 < cm.nodes && cm.ndtype[nd_i + 1] != nd::END
+            {
                 let v = cm.nodemap[nd_i];
                 cm.end[v] = p_exit / nexits as f32;
                 let denom: f32 = cm.t[v].iter().sum::<f32>() + cm.end[v];

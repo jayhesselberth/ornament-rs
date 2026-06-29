@@ -1,6 +1,6 @@
 //! Odd tRNA detection
 
-use super::{TRNAHit, ModCompatibilityResult};
+use super::{ModCompatibilityResult, TRNAHit};
 use crate::modification::ModificationDatabase;
 
 /// Detect odd tRNAs from a set of hits

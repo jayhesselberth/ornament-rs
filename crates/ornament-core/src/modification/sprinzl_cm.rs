@@ -88,7 +88,10 @@ mod tests {
         let p34 = m.get(&SprinzlPosition("34".into())).copied();
         let p35 = m.get(&SprinzlPosition("35".into())).copied();
         let p36 = m.get(&SprinzlPosition("36".into())).copied();
-        assert!(p34.is_some() && p35.is_some() && p36.is_some(), "anticodon mapped");
+        assert!(
+            p34.is_some() && p35.is_some() && p36.is_some(),
+            "anticodon mapped"
+        );
         // Anticodon residues are consecutive.
         assert_eq!(p35, p34.map(|x| x + 1));
         assert_eq!(p36, p35.map(|x| x + 1));

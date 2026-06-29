@@ -35,7 +35,10 @@ fn parses_embedded_filter_hmm() {
     }
     // Node transitions are probabilities; M->{M,I,D} sums to ~1.
     let tsum = hmm.t[1][tr::MM] + hmm.t[1][tr::MI] + hmm.t[1][tr::MD];
-    assert!((tsum - 1.0).abs() < 1e-2, "node1 M-transitions sum = {tsum}");
+    assert!(
+        (tsum - 1.0).abs() < 1e-2,
+        "node1 M-transitions sum = {tsum}"
+    );
 
     // COMPO present.
     assert!(hmm.compo.is_some());

@@ -91,7 +91,11 @@ pub fn parse_p7_hmm(text: &str) -> Result<P7Hmm, HmmerError> {
             "MAXL" => maxl = it.next().and_then(|s| s.parse().ok()).unwrap_or(0),
             "ALPH" => {
                 let a = it.next().unwrap_or("");
-                k = if a.eq_ignore_ascii_case("amino") { 20 } else { 4 };
+                k = if a.eq_ignore_ascii_case("amino") {
+                    20
+                } else {
+                    4
+                };
             }
             "STATS" => {
                 // STATS LOCAL <MSV|VITERBI|FORWARD> <mu> <lambda>
@@ -137,16 +141,31 @@ pub fn parse_p7_hmm(text: &str) -> Result<P7Hmm, HmmerError> {
         Ok(out)
     };
 
-    let l0 = lines.next().ok_or_else(|| HmmerError::Parse("missing COMPO/node0".into()))?;
+    let l0 = lines
+        .next()
+        .ok_or_else(|| HmmerError::Parse("missing COMPO/node0".into()))?;
     if l0.trim_start().starts_with("COMPO") {
         compo = Some(read_k(l0.trim_start().trim_start_matches("COMPO"), k)?);
         // node-0 insert emissions, then node-0 transitions
-        ins[0] = read_k(lines.next().ok_or_else(|| HmmerError::Parse("missing ins0".into()))?, k)?;
-        t[0] = read_t(lines.next().ok_or_else(|| HmmerError::Parse("missing t0".into()))?)?;
+        ins[0] = read_k(
+            lines
+                .next()
+                .ok_or_else(|| HmmerError::Parse("missing ins0".into()))?,
+            k,
+        )?;
+        t[0] = read_t(
+            lines
+                .next()
+                .ok_or_else(|| HmmerError::Parse("missing t0".into()))?,
+        )?;
     } else {
         // No COMPO: l0 is the node-0 insert emissions.
         ins[0] = read_k(l0, k)?;
-        t[0] = read_t(lines.next().ok_or_else(|| HmmerError::Parse("missing t0".into()))?)?;
+        t[0] = read_t(
+            lines
+                .next()
+                .ok_or_else(|| HmmerError::Parse("missing t0".into()))?,
+        )?;
     }
 
     // Nodes 1..=M: match-emission line (k values + annotations), insert line, transition line.
@@ -172,8 +191,17 @@ pub fn parse_p7_hmm(text: &str) -> Result<P7Hmm, HmmerError> {
             })?)?);
         }
         mat[node] = me;
-        ins[node] = read_k(lines.next().ok_or_else(|| HmmerError::Parse("missing ins".into()))?, k)?;
-        t[node] = read_t(lines.next().ok_or_else(|| HmmerError::Parse("missing t".into()))?)?;
+        ins[node] = read_k(
+            lines
+                .next()
+                .ok_or_else(|| HmmerError::Parse("missing ins".into()))?,
+            k,
+        )?;
+        t[node] = read_t(
+            lines
+                .next()
+                .ok_or_else(|| HmmerError::Parse("missing t".into()))?,
+        )?;
     }
 
     Ok(P7Hmm {

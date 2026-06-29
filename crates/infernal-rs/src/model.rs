@@ -203,16 +203,16 @@ pub struct Cm {
     pub nodes: usize, // number of nodes
     pub w: i32,       // max hit length
 
-    pub sttype: Vec<u8>, // [M]
+    pub sttype: Vec<u8>,   // [M]
     pub ndidx: Vec<usize>, // [M] node each state belongs to
-    pub stid: Vec<u8>,   // [M] unique state id
-    pub cfirst: Vec<i32>, // [M] first child (or BEGL child for B_st)
-    pub cnum: Vec<i32>,  // [M] # connections (or BEGR child index for B_st)
-    pub plast: Vec<i32>, // [M] first parent
-    pub pnum: Vec<i32>,  // [M] # parents
+    pub stid: Vec<u8>,     // [M] unique state id
+    pub cfirst: Vec<i32>,  // [M] first child (or BEGL child for B_st)
+    pub cnum: Vec<i32>,    // [M] # connections (or BEGR child index for B_st)
+    pub plast: Vec<i32>,   // [M] first parent
+    pub pnum: Vec<i32>,    // [M] # parents
 
-    pub nodemap: Vec<usize>, // [nodes] first state of each node
-    pub ndtype: Vec<u8>,     // [nodes]
+    pub nodemap: Vec<usize>,        // [nodes] first state of each node
+    pub ndtype: Vec<u8>,            // [nodes]
     pub node_annot: Vec<NodeAnnot>, // [nodes] raw map/cons/rf columns
 
     /// QDB bands (read but not yet used by the non-banded DP).

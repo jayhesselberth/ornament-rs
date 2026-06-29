@@ -27,8 +27,8 @@ fn ascii2prob(s: &str, null: f32) -> Result<f32, InfernalError> {
         .parse()
         .map_err(|_| InfernalError::Parse(format!("invalid score token {s:?}")))?;
     // p = 2^score · null. Since score/log2(e) = score·ln2, exp(score/log2(e)) = 2^score.
-    // 1.4426950408889634 == log2(e), matching Infernal's `ascii2prob` constant.
-    Ok((score / 1.4426950408889634).exp() as f32 * null)
+    // log2(e) matches Infernal's `ascii2prob` constant.
+    Ok((score / std::f64::consts::LOG2_E).exp() as f32 * null)
 }
 
 fn opt_i32(tok: &str) -> Option<i32> {
@@ -83,13 +83,16 @@ pub fn parse_cm_str(text: &str) -> Result<Cm, InfernalError> {
 
     let abc = Arc::new(Alphabet::rna());
     let k = abc.k;
-    let m = h.states.ok_or_else(|| InfernalError::Parse("missing STATES".into()))?;
-    let nodes = h.nodes.ok_or_else(|| InfernalError::Parse("missing NODES".into()))?;
-    let clen_hdr = h.clen.ok_or_else(|| InfernalError::Parse("missing CLEN".into()))?;
-    let null = h
-        .null
-        .clone()
-        .unwrap_or_else(|| vec![1.0 / k as f32; k]);
+    let m = h
+        .states
+        .ok_or_else(|| InfernalError::Parse("missing STATES".into()))?;
+    let nodes = h
+        .nodes
+        .ok_or_else(|| InfernalError::Parse("missing NODES".into()))?;
+    let clen_hdr = h
+        .clen
+        .ok_or_else(|| InfernalError::Parse("missing CLEN".into()))?;
+    let null = h.null.clone().unwrap_or_else(|| vec![1.0 / k as f32; k]);
 
     // --- Body section: node lines and state lines, until "//". ---
     let mut cm = Cm {

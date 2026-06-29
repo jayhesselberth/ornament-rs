@@ -52,8 +52,8 @@ pub fn forward_nats(prof: &P7Profile, dsq: &[Dsq]) -> f32 {
     xmx[mx::B] = prof.xsc[xstate::N][xstate::MOVE];
     // E, C, J already NINF; M/I/D row 0 already NINF.
 
-    for i in 1..=l {
-        let x = dsq[i] as usize;
+    for (i, &xb) in dsq.iter().enumerate().take(l + 1).skip(1) {
+        let x = xb as usize;
         let msc = &prof.msc; // [Kp][M+1]
         let isc = &prof.isc;
         let row = i * stride;
@@ -81,7 +81,10 @@ pub fn forward_nats(prof: &P7Profile, dsq: &[Dsq]) -> f32 {
             mmx[row + k] = sc + msc[x][k];
 
             // insert
-            let sc = flogsum(mmx[prow + k] + tsc(p7p::MI, k), imx[prow + k] + tsc(p7p::II, k));
+            let sc = flogsum(
+                mmx[prow + k] + tsc(p7p::MI, k),
+                imx[prow + k] + tsc(p7p::II, k),
+            );
             imx[row + k] = sc + isc[x][k];
 
             // delete

@@ -88,11 +88,7 @@ pub fn read_fasta_from<R: Read>(reader: R) -> Result<Vec<Sequence>, EaselError> 
         } else {
             match cur.as_mut() {
                 Some(rec) => rec.seq.push_str(trimmed.trim()),
-                None => {
-                    return Err(EaselError::Io(
-                        "FASTA data before first '>' header".into(),
-                    ))
-                }
+                None => return Err(EaselError::Io("FASTA data before first '>' header".into())),
             }
         }
     }

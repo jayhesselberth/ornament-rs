@@ -2,9 +2,9 @@
 //!
 //! Executes cmsearch as subprocess for tRNA detection.
 
+use anyhow::{anyhow, Result};
 use std::path::Path;
 use std::process::Command;
-use anyhow::{anyhow, Result};
 
 use super::parser::parse_tblout;
 use super::CMHit;
@@ -60,9 +60,9 @@ impl InfernalRunner {
         // Run cmsearch with tabular output to stdout
         let output = Command::new("cmsearch")
             .arg("--tblout")
-            .arg("/dev/stdout")  // Write tabular output to stdout
+            .arg("/dev/stdout") // Write tabular output to stdout
             .arg("-o")
-            .arg("/dev/null")    // Suppress alignment output
+            .arg("/dev/null") // Suppress alignment output
             .arg("--cpu")
             .arg(self.cpu.to_string())
             .arg("-E")
@@ -72,7 +72,9 @@ impl InfernalRunner {
             .output()
             .map_err(|e| {
                 if e.kind() == std::io::ErrorKind::NotFound {
-                    anyhow!("cmsearch not found. Please install Infernal: http://eddylab.org/infernal/")
+                    anyhow!(
+                        "cmsearch not found. Please install Infernal: http://eddylab.org/infernal/"
+                    )
                 } else {
                     anyhow!("Failed to run cmsearch: {}", e)
                 }

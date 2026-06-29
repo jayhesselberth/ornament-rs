@@ -118,7 +118,10 @@ fn scan<S: Semiring>(cm: &Cm, dsq: &[Dsq], w_max: usize) -> CykScan {
     let w = w_max.min(l);
     let mut bestsc_per_j = vec![IMPOSSIBLE; l + 1];
     if l == 0 {
-        return CykScan { best: None, bestsc_per_j };
+        return CykScan {
+            best: None,
+            bestsc_per_j,
+        };
     }
 
     let oesc = Oesc::build(cm);
@@ -128,9 +131,9 @@ fn scan<S: Semiring>(cm: &Cm, dsq: &[Dsq], w_max: usize) -> CykScan {
     // Compact indexing for BEGL_S states (the only states needing the W+1 rolling deck).
     let mut begl_idx = vec![usize::MAX; m];
     let mut n_begl = 0;
-    for v in 0..m {
+    for (v, slot) in begl_idx.iter_mut().enumerate() {
         if cm.stid[v] == stid::BEGL_S {
-            begl_idx[v] = n_begl;
+            *slot = n_begl;
             n_begl += 1;
         }
     }
@@ -169,8 +172,8 @@ fn scan<S: Semiring>(cm: &Cm, dsq: &[Dsq], w_max: usize) -> CykScan {
                 s = S::or(s, add(alpha[0][(ych + yoff) * width], cm.tsc[v][yoff]));
             }
             let bi = begl_idx[v];
-            for jp in 0..width {
-                alpha_begl[jp][bi * width] = s;
+            for deck in &mut alpha_begl {
+                deck[bi * width] = s;
             }
         } else if cm.sttype[v] == st::E {
             alpha[0][v * width] = 0.0;
@@ -238,7 +241,10 @@ fn scan<S: Semiring>(cm: &Cm, dsq: &[Dsq], w_max: usize) -> CykScan {
                 let cd = d - sd;
                 let mut sc = init_sc(v, cd); // local-end path: emit sd, then EL emits cd
                 for yoff in 0..cnum {
-                    sc = S::or(sc, add(alpha[child_row][(ych + yoff) * width + cd], tsc[yoff]));
+                    sc = S::or(
+                        sc,
+                        add(alpha[child_row][(ych + yoff) * width + cd], tsc[yoff]),
+                    );
                 }
                 let val = match sttype {
                     st::ML | st::IL => {
@@ -279,7 +285,7 @@ fn scan<S: Semiring>(cm: &Cm, dsq: &[Dsq], w_max: usize) -> CykScan {
             if sc > bestsc_j {
                 bestsc_j = sc;
             }
-            if best.map_or(true, |b| sc > b.score) {
+            if best.is_none_or(|b| sc > b.score) {
                 best = Some(CykHit {
                     score: sc,
                     i: j - d + 1,

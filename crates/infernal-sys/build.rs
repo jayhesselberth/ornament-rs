@@ -34,9 +34,18 @@ fn main() {
     build_infernal(&infernal_dir, &build_dir, &target_arch);
 
     // Link the libraries
-    println!("cargo:rustc-link-search=native={}", build_dir.join("easel").display());
-    println!("cargo:rustc-link-search=native={}", build_dir.join("hmmer/src").display());
-    println!("cargo:rustc-link-search=native={}", build_dir.join("src").display());
+    println!(
+        "cargo:rustc-link-search=native={}",
+        build_dir.join("easel").display()
+    );
+    println!(
+        "cargo:rustc-link-search=native={}",
+        build_dir.join("hmmer/src").display()
+    );
+    println!(
+        "cargo:rustc-link-search=native={}",
+        build_dir.join("src").display()
+    );
 
     println!("cargo:rustc-link-lib=static=infernal");
     println!("cargo:rustc-link-lib=static=hmmer");
@@ -67,23 +76,25 @@ fn check_dependencies(infernal_dir: &Path, hmmer_dir: &Path, easel_dir: &Path) {
         eprintln!("=======================================================");
         eprintln!("ERROR: Missing dependencies!");
         eprintln!("=======================================================");
-        eprintln!("");
+        eprintln!();
         eprintln!("The following directories are missing:");
         for m in &missing {
             eprintln!("  - {}", m);
         }
-        eprintln!("");
+        eprintln!();
         eprintln!("Please run the setup script to clone dependencies:");
-        eprintln!("");
+        eprintln!();
         eprintln!("  ./scripts/setup-deps.sh");
-        eprintln!("");
+        eprintln!();
         eprintln!("Or manually clone:");
-        eprintln!("  git clone -b develop https://github.com/EddyRivasLab/infernal.git ext/infernal");
+        eprintln!(
+            "  git clone -b develop https://github.com/EddyRivasLab/infernal.git ext/infernal"
+        );
         eprintln!("  cd ext/infernal");
         eprintln!("  git clone -b develop https://github.com/EddyRivasLab/hmmer.git");
         eprintln!("  git clone -b develop https://github.com/EddyRivasLab/easel.git");
         eprintln!("  autoconf");
-        eprintln!("");
+        eprintln!();
         eprintln!("=======================================================\n");
         panic!("Missing dependencies. See instructions above.");
     }
@@ -94,15 +105,15 @@ fn check_dependencies(infernal_dir: &Path, hmmer_dir: &Path, easel_dir: &Path) {
         eprintln!("=======================================================");
         eprintln!("ERROR: Infernal not configured!");
         eprintln!("=======================================================");
-        eprintln!("");
+        eprintln!();
         eprintln!("Please run autoconf in the infernal directory:");
-        eprintln!("");
+        eprintln!();
         eprintln!("  cd ext/infernal && autoconf");
-        eprintln!("");
+        eprintln!();
         eprintln!("Or run the setup script:");
-        eprintln!("");
+        eprintln!();
         eprintln!("  ./scripts/setup-deps.sh");
-        eprintln!("");
+        eprintln!();
         eprintln!("=======================================================\n");
         panic!("Infernal not configured. See instructions above.");
     }
@@ -141,7 +152,7 @@ fn build_infernal(src_dir: &Path, build_dir: &Path, target_arch: &str) {
             .current_dir(build_dir)
             .arg("-j")
             .arg(num_cpus().to_string()),
-        "make infernal"
+        "make infernal",
     );
 }
 

@@ -52,7 +52,10 @@ fn add(a: f32, b: f32) -> f32 {
 /// Align the hit window `dsq[i0..=j0]` (1-based, inclusive) to the model in glocal mode.
 /// Returns the CYK score and the per-residue consensus mapping.
 pub fn align_glocal(cm: &Cm, dsq: &[Dsq], i0: usize, j0: usize, emap: &EmitMap) -> Alignment {
-    assert!(i0 >= 1 && j0 >= i0 && j0 + 1 < dsq.len(), "window out of range");
+    assert!(
+        i0 >= 1 && j0 >= i0 && j0 + 1 < dsq.len(),
+        "window out of range"
+    );
     let l = j0 - i0 + 1;
     let m = cm.m;
     let oesc = Oesc::build(cm);

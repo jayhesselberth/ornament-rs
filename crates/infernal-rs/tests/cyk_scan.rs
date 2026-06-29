@@ -30,7 +30,10 @@ fn glocal_cyk_matches_oracle_on_consensus() {
     let scan = cyk_scan_glocal(&cm, &dsq, cm.w as usize);
     let best = scan.best.expect("a hit");
 
-    eprintln!("native best: score={:.3} i={} j={}", best.score, best.i, best.j);
+    eprintln!(
+        "native best: score={:.3} i={} j={}",
+        best.score, best.i, best.j
+    );
     // Oracle: 87.3 bits over seq 1..71.
     assert!(
         (best.score - 87.3).abs() < 0.2,
@@ -61,7 +64,10 @@ fn glocal_cyk_finds_embedded_trna() {
 
     let scan = cyk_scan_glocal(&cm, &dsq, cm.w as usize);
     let best = scan.best.expect("a hit");
-    eprintln!("embedded best: score={:.3} i={} j={}", best.score, best.i, best.j);
+    eprintln!(
+        "embedded best: score={:.3} i={} j={}",
+        best.score, best.i, best.j
+    );
 
     // Oracle: seq 61..131 at 87.3 bits.
     assert_eq!((best.i, best.j), (61, 131), "located the embedded tRNA");
@@ -88,7 +94,10 @@ fn glocal_inside_matches_oracle() {
         let dsq = abc.digitize(&recs[0].seq).expect("digitize");
         let scan = inside_scan_glocal(&cm, &dsq, cm.w as usize);
         let best = scan.best.expect("a hit");
-        eprintln!("inside {file}: score={:.3} i={} j={}", best.score, best.i, best.j);
+        eprintln!(
+            "inside {file}: score={:.3} i={} j={}",
+            best.score, best.i, best.j
+        );
         assert_eq!((best.i, best.j), coords, "{file} coordinates");
         assert!(
             (best.score - 87.3).abs() < 0.25,
@@ -123,10 +132,20 @@ fn local_cyk_and_inside_match_oracle() {
         let cyk = cyk_scan(&cm, &dsq, cm.w as usize).best.expect("cyk hit");
         eprintln!("local CYK {file}: {:.3} {}..{}", cyk.score, cyk.i, cyk.j);
         assert_eq!((cyk.i, cyk.j), coords, "{file} local CYK coords");
-        assert!((cyk.score - 87.2).abs() < 0.2, "{file} local CYK {:.3} != 87.2", cyk.score);
+        assert!(
+            (cyk.score - 87.2).abs() < 0.2,
+            "{file} local CYK {:.3} != 87.2",
+            cyk.score
+        );
 
-        let ins = inside_scan(&cm, &dsq, cm.w as usize).best.expect("inside hit");
-        assert!((ins.score - 87.2).abs() < 0.3, "{file} local Inside {:.3} != 87.2", ins.score);
+        let ins = inside_scan(&cm, &dsq, cm.w as usize)
+            .best
+            .expect("inside hit");
+        assert!(
+            (ins.score - 87.2).abs() < 0.3,
+            "{file} local Inside {:.3} != 87.2",
+            ins.score
+        );
         assert!(ins.score >= cyk.score - 1e-3);
     }
 }
@@ -140,7 +159,11 @@ fn glocal_config_unaffected_by_local_paths() {
     configure_scores(&mut cm);
     assert!(!cm.is_local);
     let abc = Alphabet::rna();
-    let recs = read_fasta(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/trna_cons.fa")).unwrap();
+    let recs = read_fasta(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/data/trna_cons.fa"
+    ))
+    .unwrap();
     let dsq = abc.digitize(&recs[0].seq).unwrap();
     let best = cyk_scan(&cm, &dsq, cm.w as usize).best.unwrap();
     assert!((best.score - 87.3).abs() < 0.2, "glocal still 87.3");

@@ -3,7 +3,7 @@
 //! Parses modification data from the MODOMICS REST API JSON format.
 //! Download data from: https://genesilico.pl/modomics/api/modifications
 
-use super::types::{Modification, ModCode, RnaBase};
+use super::types::{ModCode, Modification, RnaBase};
 use rustc_hash::FxHashMap;
 use serde::Deserialize;
 use std::path::Path;
@@ -28,16 +28,16 @@ pub struct ModomicsEntry {
 
 /// Parse MODOMICS JSON file into modification entries
 pub fn parse_modomics_file(path: &Path) -> Result<FxHashMap<String, Modification>, ModomicsError> {
-    let content = std::fs::read_to_string(path)
-        .map_err(|e| ModomicsError::IoError(e.to_string()))?;
+    let content =
+        std::fs::read_to_string(path).map_err(|e| ModomicsError::IoError(e.to_string()))?;
     parse_modomics_json(&content)
 }
 
 /// Parse MODOMICS JSON string into modification entries
 pub fn parse_modomics_json(json: &str) -> Result<FxHashMap<String, Modification>, ModomicsError> {
     // MODOMICS returns a map with string keys (modification IDs)
-    let raw: FxHashMap<String, ModomicsEntry> = serde_json::from_str(json)
-        .map_err(|e| ModomicsError::ParseError(e.to_string()))?;
+    let raw: FxHashMap<String, ModomicsEntry> =
+        serde_json::from_str(json).map_err(|e| ModomicsError::ParseError(e.to_string()))?;
 
     let mut modifications = FxHashMap::default();
 
@@ -68,8 +68,7 @@ fn convert_entry(entry: &ModomicsEntry) -> Option<Modification> {
         .collect();
 
     // Get unicode character if available
-    let modomics_unicode = entry.new_abbrev.as_ref()
-        .and_then(|s| s.chars().next());
+    let modomics_unicode = entry.new_abbrev.as_ref().and_then(|s| s.chars().next());
 
     // Create primary code
     let code = if let Some(unicode) = modomics_unicode {
@@ -131,7 +130,7 @@ pub fn get_common_aliases() -> FxHashMap<&'static str, &'static str> {
     aliases.insert("Ψ", "Y");
 
     // Other common aliases
-    aliases.insert("rT", "m5U");  // ribothymidine
+    aliases.insert("rT", "m5U"); // ribothymidine
     aliases.insert("T", "m5U");
 
     aliases

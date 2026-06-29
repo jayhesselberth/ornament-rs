@@ -36,7 +36,10 @@ fn column_labels() -> HashMap<usize, String> {
 #[test]
 fn reference_cm_parses_and_is_all_match() {
     let mut cm = parse_cm_file(data("sprinzl_euk.cm")).expect("parse sprinzl_euk.cm");
-    assert_eq!(cm.clen, 115, "all-match reference has 115 consensus columns");
+    assert_eq!(
+        cm.clen, 115,
+        "all-match reference has 115 consensus columns"
+    );
     configure_scores(&mut cm);
     // 115 global columns label the full Sprinzl set incl. variable positions; global
     // column index != Sprinzl number (variable columns 17/17a/20a/e* shift it). Check the
@@ -47,7 +50,10 @@ fn reference_cm_parses_and_is_all_match() {
     // Anticodon (34-36), a D-loop insertion (20a), variable-loop (e11), discriminator (73)
     // and CCA (76) all appear in the yeast-derived column set.
     for landmark in ["34", "35", "36", "20a", "e11", "73", "76"] {
-        assert!(set.contains(landmark), "Sprinzl landmark {landmark} present");
+        assert!(
+            set.contains(landmark),
+            "Sprinzl landmark {landmark} present"
+        );
     }
 }
 
@@ -102,7 +108,11 @@ fn standard_trnas_match_clover_exactly() {
             .filter(|(i, w)| assigned.get(&(i + 1)).map(String::as_str) == Some(**w))
             .count();
         eprintln!("{id}: {correct}/{} (standard)", truth.len());
-        assert_eq!(correct, truth.len(), "{id}: standard tRNA must match clover exactly");
+        assert_eq!(
+            correct,
+            truth.len(),
+            "{id}: standard tRNA must match clover exactly"
+        );
         checked += 1;
     }
     assert!(checked >= 2);
