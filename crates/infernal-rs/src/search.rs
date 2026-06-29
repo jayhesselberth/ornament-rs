@@ -14,6 +14,7 @@
 use easel_rs::Dsq;
 
 use crate::config::IMPOSSIBLE;
+use crate::emit::Oesc;
 use crate::model::{emits_right, n_emit, st, stid, Cm};
 
 /// A single hit (1-based, inclusive coordinates on the forward strand).
@@ -85,72 +86,6 @@ fn add(a: f32, b: f32) -> f32 {
         IMPOSSIBLE
     } else {
         a + b
-    }
-}
-
-/// Precomputed optimized emission scores indexed by digital code (`oesc`).
-struct Oesc {
-    kp: usize,
-    single: Vec<Option<Vec<f32>>>, // singlet emitters: length Kp
-    pair: Vec<Option<Vec<f32>>>,   // MP: length Kp*Kp
-}
-
-impl Oesc {
-    fn build(cm: &Cm) -> Oesc {
-        let abc = &cm.abc;
-        let kp = abc.kp;
-        let k = abc.k;
-        let mut single = vec![None; cm.m];
-        let mut pair = vec![None; cm.m];
-
-        for v in 0..cm.m {
-            match cm.sttype[v] {
-                st::ML | st::MR | st::IL | st::IR => {
-                    let esc = &cm.esc[v];
-                    let row: Vec<f32> = (0..kp)
-                        .map(|a| {
-                            if abc.is_residue(a as Dsq) {
-                                abc.favg_score(a as Dsq, esc)
-                            } else {
-                                IMPOSSIBLE
-                            }
-                        })
-                        .collect();
-                    single[v] = Some(row);
-                }
-                st::MP => {
-                    let esc = &cm.esc[v]; // length k*k
-                    let mut row = vec![IMPOSSIBLE; kp * kp];
-                    for a in 0..kp {
-                        if !abc.is_residue(a as Dsq) {
-                            continue;
-                        }
-                        for b in 0..kp {
-                            if !abc.is_residue(b as Dsq) {
-                                continue;
-                            }
-                            let mut sum = 0.0f32;
-                            let mut n = 0u32;
-                            for x in 0..k {
-                                if !abc.degen[a][x] {
-                                    continue;
-                                }
-                                for y in 0..k {
-                                    if abc.degen[b][y] {
-                                        sum += esc[x * k + y];
-                                        n += 1;
-                                    }
-                                }
-                            }
-                            row[a * kp + b] = if n > 0 { sum / n as f32 } else { IMPOSSIBLE };
-                        }
-                    }
-                    pair[v] = Some(row);
-                }
-                _ => {}
-            }
-        }
-        Oesc { kp, single, pair }
     }
 }
 

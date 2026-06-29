@@ -7,14 +7,19 @@
 //! - `search`   — non-banded CYK + Inside scanning DP [Phase 3].
 //! - `align`    — CYK traceback -> parsetree -> aligned residues + RF/SS_cons [Phase 4].
 
+pub mod align;
 pub mod cmfile;
 pub mod config;
+pub mod emit;
+pub mod emitmap;
 pub mod evalues;
 pub mod model;
 pub mod search;
 
+pub use align::{align_glocal, AlignedResidue, Alignment};
 pub use cmfile::{parse_cm_file, parse_cm_str};
 pub use config::configure_scores;
+pub use emitmap::EmitMap;
 pub use evalues::{evalue, score_to_evalue, SearchMode};
 pub use model::{Cm, ExpInfo};
 pub use search::{cyk_scan_glocal, inside_scan_glocal, CykHit, CykScan};
