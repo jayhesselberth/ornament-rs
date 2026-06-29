@@ -11,6 +11,7 @@
 //! - [`fwd`] — the shared full-model DP: Forward and Viterbi, one recursion over a semiring.
 //! - [`vit`] — the Viterbi bit-score wrapper.
 //! - [`msv`] — the ungapped MSV filter (`p7_GMSV`).
+//! - [`pvalue`] — filter bit score → P-value via the calibrated Gumbel/exponential tails.
 //!
 //! `Viterbi ≤ Forward` always holds (same profile, max ≤ sum). MSV is a *different*, more
 //! permissive model (it waives core transition penalties and uses a flat entry), so it is
@@ -20,12 +21,14 @@ pub mod fwd;
 pub mod hmm;
 pub mod msv;
 pub mod profile;
+pub mod pvalue;
 pub mod vit;
 
 pub use fwd::{forward_bits, forward_nats, viterbi_nats};
 pub use hmm::{parse_p7_hmm, EvParam, P7Hmm};
 pub use msv::{msv_bits, msv_nats};
 pub use profile::P7Profile;
+pub use pvalue::{forward_pvalue, msv_pvalue, viterbi_pvalue};
 pub use vit::viterbi_bits;
 
 use thiserror::Error;
