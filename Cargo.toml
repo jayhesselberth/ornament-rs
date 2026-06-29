@@ -53,6 +53,9 @@ bio = "1"
 # Parallelism
 rayon = "1"
 
+# Benchmarking
+criterion = { version = "0.8", features = ["html_reports"] }
+
 # Internal crates
 infernal-sys = { path = "crates/infernal-sys" }
 easel-rs = { path = "crates/easel-rs" }

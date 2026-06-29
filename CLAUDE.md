@@ -52,15 +52,36 @@ pixi install -e dev              # one-time: solve mold + nextest + infernal
 pixi run -e dev build            # mold -run cargo build
 pixi run -e dev test             # mold -run cargo nextest run
 pixi run -e dev check            # mold -run cargo check
-pixi run -e dev clippy           # mold -run cargo clippy --workspace --all-targets
+pixi run -e dev fmt              # cargo fmt --all
+pixi run -e dev clippy           # clippy --workspace --exclude infernal-sys --all-targets
+pixi run -e dev bench            # criterion microbenchmarks (release codegen)
 ```
+
+**Always run `fmt` + `clippy` before committing.**
 
 **Run builds/tests on SLURM, not the login node** — prefix with `srun -p rna -c 24`:
 
 ```bash
 srun -p rna -c 24 pixi run -e dev test
-srun -p rna -c 24 pixi run -e dev build
+srun -p rna -c 24 pixi run -e dev bench
 ```
+
+### Benchmarks
+
+Criterion microbenchmarks establish the scalar baseline for the SIMD/rayon work and act as
+a regression guard. They live in `crates/{hmmer-rs,infernal-rs}/benches/`:
+- `hmmer-rs --bench p7_filters` — MSV / Viterbi / Forward filter DP throughput.
+- `infernal-rs --bench cm_search` — `cm_dp` (scanning CYK/Inside + alignment DP) and
+  `cm_search` (both-strand multi-hit search vs. the p7-filtered pipeline).
+
+```bash
+srun -p rna -c 24 cargo bench -p infernal-rs --bench cm_search
+srun -p rna -c 24 cargo bench -p hmmer-rs --bench p7_filters -- forward   # filter by name
+```
+
+The `[profile.bench]` inherits `release` (fat LTO, 1 codegen unit) so benchmarks measure
+shipping codegen. Compare a SIMD/rayon branch against the `main` baseline with criterion's
+saved baselines (`cargo bench -- --save-baseline main` / `--baseline main`).
 
 Only build `--release` when actually needed (release LTO is slow). The workspace
 `default-members` excludes the legacy `infernal-sys` C-FFI crate, so bare `cargo`/`nextest`
