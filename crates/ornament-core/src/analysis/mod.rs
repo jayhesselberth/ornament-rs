@@ -47,6 +47,10 @@ pub struct ModCompatibilityResult {
     pub incompatibilities: Vec<ModificationIncompatibility>,
     pub is_odd: bool,
     pub compatibility_score: f64,
+    /// Measured modifications (e.g. from modkit) joined onto Sprinzl positions, with a
+    /// verdict per call. Empty when no modkit data was supplied.
+    #[serde(default)]
+    pub measured: Vec<MeasuredModification>,
 }
 
 /// A specific modification incompatibility found at a position
@@ -66,5 +70,32 @@ pub enum Severity {
     Minor,
 }
 
-pub use compatibility::{analyze_batch, analyze_compatibility, BatchAnalysisResult};
+/// A measured modification (e.g. a modkit call) joined onto a Sprinzl position, together
+/// with how it squares against the genomic sequence and the MODOMICS expectations.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MeasuredModification {
+    pub position: SprinzlPosition,
+    /// modkit modification code as reported in the bedMethyl.
+    pub mod_code: String,
+    /// Genomic base underlying the call at this position.
+    pub observed_base: crate::RnaBase,
+    pub mod_frequency: f64,
+    pub coverage: u32,
+    pub verdict: MeasuredVerdict,
+}
+
+/// Verdict for a measured modification relative to sequence + MODOMICS expectations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MeasuredVerdict {
+    /// Chemically possible on this base and expected by MODOMICS at this position.
+    Consistent,
+    /// Chemically possible, but MODOMICS does not expect this modification here.
+    Unexpected,
+    /// The underlying base cannot carry this modification (impossible chemistry).
+    Incompatible,
+}
+
+pub use compatibility::{
+    analyze_batch, analyze_compatibility, analyze_compatibility_with_mods, BatchAnalysisResult,
+};
 pub use odd_trna::detect_odd_trnas;

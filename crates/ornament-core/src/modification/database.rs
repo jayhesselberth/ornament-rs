@@ -88,6 +88,49 @@ impl ModificationDatabase {
         &self.modifications
     }
 
+    /// Resolve a modkit modification code to a known modification.
+    ///
+    /// modkit writes the modification code from the BAM `MM` tag into bedMethyl column 4.
+    /// That may be a short name we already index ("m5C"), a ChEBI id ("17802"), or a single
+    /// SAM/MODOMICS character ("a", "m", "Ψ"). We try these forms in turn. To stay
+    /// deterministic when scanning the (unordered) modification map, ties break on short name.
+    pub fn get_by_modkit_code(&self, code: &str) -> Option<&Modification> {
+        // Short name or alias (e.g. "m5C", "Psi").
+        if let Some(m) = self.get_modification(code) {
+            return Some(m);
+        }
+        // Numeric ChEBI id (e.g. "17802" for pseudouridine).
+        if let Ok(chebi) = code.parse::<u32>() {
+            if let Some(m) = self
+                .modifications
+                .values()
+                .filter(|m| m.chebi_id == Some(chebi))
+                .min_by(|a, b| a.short_name.cmp(&b.short_name))
+            {
+                return Some(m);
+            }
+        }
+        // Single character: MODOMICS unicode or a single-char code/alt-code.
+        let mut chars = code.chars();
+        if let (Some(c), None) = (chars.next(), chars.next()) {
+            if let Some(m) = self
+                .modifications
+                .values()
+                .filter(|m| {
+                    m.modomics_unicode == Some(c)
+                        || matches!(&m.code, ModCode::SingleChar(x) if *x == c)
+                        || m.alt_codes
+                            .iter()
+                            .any(|ac| matches!(ac, ModCode::SingleChar(x) if *x == c))
+                })
+                .min_by(|a, b| a.short_name.cmp(&b.short_name))
+            {
+                return Some(m);
+            }
+        }
+        None
+    }
+
     /// Get all expected modifications at a Sprinzl position
     pub fn get_expectations(&self, position: &SprinzlPosition) -> Vec<&PositionModExpectation> {
         self.position_expectations
