@@ -6,9 +6,19 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[lib]
+# Only the explicit criterion bench below runs under `cargo bench`; disable the default
+# libtest bench harness (which doesn't accept criterion's CLI args).
+bench = false
+
 [dependencies]
 easel-rs = { workspace = true }
 hmmer-rs = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "cm_search"
+harness = false
