@@ -9,11 +9,15 @@
 
 pub mod cmfile;
 pub mod config;
+pub mod evalues;
 pub mod model;
+pub mod search;
 
 pub use cmfile::{parse_cm_file, parse_cm_str};
 pub use config::configure_scores;
+pub use evalues::{evalue, score_to_evalue, SearchMode};
 pub use model::{Cm, ExpInfo};
+pub use search::{cyk_scan_glocal, inside_scan_glocal, CykHit, CykScan};
 
 use thiserror::Error;
 
