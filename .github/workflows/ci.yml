@@ -1,0 +1,109 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -Dwarnings
+
+jobs:
+  check:
+    name: Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace --all-targets
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    # Fast, oracle-free run: the cmsearch differential tests skip-gate when
+    # the Infernal binaries are absent. The `oracle` job below installs them
+    # and exercises the differential parity tests for real.
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@nextest
+      - run: cargo nextest run --workspace --profile ci
+      - name: Upload JUnit report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: junit-test
+          path: target/nextest/ci/junit.xml
+          retention-days: 14
+
+  oracle:
+    name: Differential tests (cmsearch oracle)
+    runs-on: ubuntu-latest
+    # The native DP/alignment output is validated against the upstream
+    # `cmsearch` oracle. The pixi `dev` environment provides the Infernal
+    # binaries (cmsearch/cmstat/cmemit) plus cargo-nextest; the system Rust
+    # toolchain supplies cargo. Running nextest inside the pixi env puts
+    # cmsearch on PATH so the skip-gated parity tests actually execute.
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: prefix-dev/setup-pixi@v0.9.6
+        with:
+          environments: dev
+          cache: true
+      - name: Run differential tests with the Infernal oracle
+        run: pixi run -e dev cargo nextest run --workspace --profile ci
+      - name: Upload JUnit report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: junit-oracle
+          path: target/nextest/ci/junit.xml
+          retention-days: 14
+
+  doctest:
+    name: Doctest
+    runs-on: ubuntu-latest
+    # nextest does not run doctests; keep them alive on a separate job.
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --doc --workspace
+
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets
+
+  msrv:
+    name: MSRV (1.96)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96"
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace
