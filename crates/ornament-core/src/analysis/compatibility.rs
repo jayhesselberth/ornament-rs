@@ -1,15 +1,34 @@
 //! Modification compatibility analysis
 
-use super::{ModCompatibilityResult, ModificationIncompatibility, Severity, TRNAHit};
+use super::{
+    MeasuredModification, MeasuredVerdict, ModCompatibilityResult, ModificationIncompatibility,
+    Severity, TRNAHit,
+};
+use crate::integration::modkit::ObservedModCall;
 use crate::modification::Isotype;
 use crate::modification::{ModificationDatabase, SprinzlMapper};
 use crate::{ConservationLevel, RnaBase, SprinzlPosition};
 use std::collections::HashMap;
 
-/// Analyze modification compatibility for a tRNA hit
+/// Analyze modification compatibility for a tRNA hit (sequence only, no measured data).
 pub fn analyze_compatibility(
     hit: &TRNAHit,
     mod_db: &ModificationDatabase,
+) -> ModCompatibilityResult {
+    analyze_compatibility_with_mods(hit, mod_db, &HashMap::new())
+}
+
+/// Analyze modification compatibility, additionally folding in measured modifications
+/// (e.g. modkit calls joined onto Sprinzl positions via `integration::join_to_sprinzl`).
+///
+/// Behaves identically to [`analyze_compatibility`] when `observed` is empty. Each measured
+/// call is graded against the genomic base (impossible chemistry -> `Incompatible`) and the
+/// MODOMICS expectation (`Consistent` vs `Unexpected`). A call that is `Incompatible` or
+/// `Unexpected` marks the tRNA "odd", in addition to the sequence-based criteria.
+pub fn analyze_compatibility_with_mods(
+    hit: &TRNAHit,
+    mod_db: &ModificationDatabase,
+    observed: &HashMap<SprinzlPosition, ObservedModCall>,
 ) -> ModCompatibilityResult {
     let mapper = SprinzlMapper::new_standard();
 
@@ -95,7 +114,17 @@ pub fn analyze_compatibility(
     let has_significant_incompatibility = incompatibilities
         .iter()
         .any(|i| matches!(i.severity, Severity::Critical | Severity::Major));
-    let is_odd = compatibility_score < 1.0 && has_significant_incompatibility;
+    let mut is_odd = compatibility_score < 1.0 && has_significant_incompatibility;
+
+    // Fold in measured modifications (e.g. modkit calls). A call that is impossible on the
+    // underlying base, or unexpected vs MODOMICS, also makes the tRNA "odd".
+    let measured = grade_measured_mods(hit, mod_db, &sprinzl_alignment, isotype.as_ref(), observed);
+    if measured
+        .iter()
+        .any(|m| !matches!(m.verdict, MeasuredVerdict::Consistent))
+    {
+        is_odd = true;
+    }
 
     ModCompatibilityResult {
         hit: hit.clone(),
@@ -103,7 +132,70 @@ pub fn analyze_compatibility(
         incompatibilities,
         is_odd,
         compatibility_score,
+        measured,
     }
+}
+
+/// Grade each measured modification call against the genomic base and MODOMICS expectations.
+fn grade_measured_mods(
+    hit: &TRNAHit,
+    mod_db: &ModificationDatabase,
+    sprinzl_alignment: &HashMap<SprinzlPosition, usize>,
+    isotype: Option<&Isotype>,
+    observed: &HashMap<SprinzlPosition, ObservedModCall>,
+) -> Vec<MeasuredModification> {
+    let mut measured = Vec::new();
+    for (pos, call) in observed {
+        // Locate the genomic base under this measured call.
+        let Some(&seq_idx) = sprinzl_alignment.get(pos) else {
+            continue; // position not aligned in this hit
+        };
+        let Some(base) = hit
+            .sequence
+            .chars()
+            .nth(seq_idx)
+            .and_then(RnaBase::from_dna_char)
+        else {
+            continue;
+        };
+
+        let verdict = match mod_db.get_by_modkit_code(&call.mod_code) {
+            // Impossible chemistry: the called modification can't sit on this base.
+            Some(m) if !m.is_compatible(base) => MeasuredVerdict::Incompatible,
+            // Possible: is it expected here by MODOMICS?
+            Some(m) => {
+                let expectations = if let Some(iso) = isotype {
+                    mod_db.get_expectations_for_isotype(pos, iso)
+                } else {
+                    mod_db.get_expectations(pos)
+                };
+                let expected = expectations.iter().any(|e| {
+                    e.modifications
+                        .iter()
+                        .any(|em| em.short_name == m.short_name)
+                });
+                if expected {
+                    MeasuredVerdict::Consistent
+                } else {
+                    MeasuredVerdict::Unexpected
+                }
+            }
+            // Unknown modkit code: can't assess chemistry, so treat as unexpected.
+            None => MeasuredVerdict::Unexpected,
+        };
+
+        measured.push(MeasuredModification {
+            position: pos.clone(),
+            mod_code: call.mod_code.clone(),
+            observed_base: base,
+            mod_frequency: call.mod_frequency,
+            coverage: call.coverage,
+            verdict,
+        });
+    }
+    // Stable, position-sorted order keeps results deterministic across HashMap iteration.
+    measured.sort_by(|a, b| a.position.0.cmp(&b.position.0));
+    measured
 }
 
 /// Map a tRNA sequence to Sprinzl positions.
