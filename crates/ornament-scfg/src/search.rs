@@ -484,19 +484,27 @@ fn scan_core<S: Semiring>(
     let kp = oesc.kp;
     let m = cm.m;
 
-    // Compact indexing for BEGL_S states (the only states needing the W+1 rolling deck).
-    let mut begl_idx = vec![usize::MAX; m];
-    let mut n_begl = 0;
-    for (v, slot) in begl_idx.iter_mut().enumerate() {
+    // BEGL_S states are the only ones needing the `W+1` rolling deck. The deck is `O(W²·n_begl)`
+    // at full width (a `W+1` j-buffer × `W+1` d-cells per state) and dominates memory for large
+    // structured RNAs. We clamp each state's d-extent to `[0, dmax[v]]` — its QDB d-band max (the
+    // lower edge stays 0 so the unconditional `d=0` base case below remains valid) — and lay the
+    // states out at packed per-state offsets `begl_off_of[v]`. Unbanded scans cap at `w` (no
+    // change). `dmax[v].min(w)` bounds every write/read into this state's region (loops clamp `d`
+    // to `dmax[v].min(dx)`, and `dx = j.min(w)`), so no access spills into a neighbour's cells.
+    let mut begl_off_of = vec![usize::MAX; m]; // packed row offset (cell index) of each BEGL_S state
+    let mut begl_row_len = 0usize;
+    #[allow(clippy::needless_range_loop)] // v indexes both stid and the offset table we're filling
+    for v in 0..m {
         if cm.stid[v] == stid::BEGL_S {
-            *slot = n_begl;
-            n_begl += 1;
+            begl_off_of[v] = begl_row_len;
+            let dcap = bands.map_or(w, |b| b.dmax[v].min(w)); // max d ever stored for this state
+            begl_row_len += dcap + 1;
         }
     }
 
     let width = w + 1;
     let mut alpha = vec![vec![IMPOSSIBLE; m * width]; 2];
-    let mut alpha_begl = vec![vec![IMPOSSIBLE; n_begl.max(1) * width]; width];
+    let mut alpha_begl = vec![vec![IMPOSSIBLE; begl_row_len.max(1)]; width];
     // Reused per-state accumulator for the vectorized child-transition fold (holds the running
     // ⊕ over children for each `d`, before the per-`d` emission is applied).
     let mut acc = vec![IMPOSSIBLE; width];
@@ -530,9 +538,9 @@ fn scan_core<S: Semiring>(
             for yoff in 0..cm.cnum[v] as usize {
                 s = S::or(s, add(alpha[0][(ych + yoff) * width], cm.tsc[v][yoff]));
             }
-            let bi = begl_idx[v];
+            let off = begl_off_of[v];
             for deck in &mut alpha_begl {
-                deck[bi * width] = s;
+                deck[off] = s; // d = 0
             }
         } else if cm.sttype[v] == st::E {
             alpha[0][v * width] = 0.0;
@@ -546,9 +554,9 @@ fn scan_core<S: Semiring>(
             alpha[0][v * width] = s;
             alpha[1][v * width] = s;
         } else if cm.sttype[v] == st::B {
-            let wbi = begl_idx[cm.cfirst[v] as usize];
+            let woff = begl_off_of[cm.cfirst[v] as usize];
             let ych = cm.cnum[v] as usize;
-            let s = add(alpha_begl[0][wbi * width], alpha[0][ych * width]);
+            let s = add(alpha_begl[0][woff], alpha[0][ych * width]);
             alpha[0][v * width] = s;
             alpha[1][v * width] = s;
         }
@@ -582,9 +590,8 @@ fn scan_core<S: Semiring>(
                 // outer-`k` makes the left child's cells contiguous in `d-k`, so each split is
                 // the same vectorized child-fold as the emitting states (`S::accumulate`), and
                 // the rolling-deck modulo is computed once per `k` instead of per `(d, k)`.
-                let wbi = begl_idx[cm.cfirst[v] as usize];
+                let base = begl_off_of[cm.cfirst[v] as usize];
                 let ych = cm.cnum[v] as usize;
-                let base = wbi * width;
                 let dlo = dmin_v.max(1);
                 let dhi = dmax_v;
                 if dhi < dlo {
@@ -710,7 +717,7 @@ fn scan_core<S: Semiring>(
                     _ => sc, // D, S (EMITNONE)
                 };
                 if is_begl {
-                    alpha_begl[j % width][begl_idx[v] * width + d] = val;
+                    alpha_begl[j % width][begl_off_of[v] + d] = val;
                 } else {
                     alpha[cur][v * width + d] = val;
                 }

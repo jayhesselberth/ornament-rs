@@ -149,6 +149,69 @@ pub fn scan_native_multi<P: AsRef<Path>, Q: AsRef<Path>>(
     fasta: Q,
     e_value: f64,
 ) -> Result<Vec<CMHit>> {
+    // Buffer every pair's hits, then sort best-first. Suited to interactive / small inputs.
+    let collected = std::sync::Mutex::new(Vec::new());
+    scan_multi_with(cm_path, fasta, e_value, |hits| {
+        if !hits.is_empty() {
+            collected.lock().unwrap().extend(hits);
+        }
+    })?;
+    let mut hits = collected.into_inner().unwrap();
+    // Best-first: E-value ascending (NaN/uncalibrated last), then score descending.
+    hits.sort_by(|a: &CMHit, b: &CMHit| {
+        let ea = if a.e_value.is_nan() {
+            f64::INFINITY
+        } else {
+            a.e_value
+        };
+        let eb = if b.e_value.is_nan() {
+            f64::INFINITY
+        } else {
+            b.e_value
+        };
+        ea.partial_cmp(&eb)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(b.score.total_cmp(&a.score))
+    });
+    Ok(hits)
+}
+
+/// Streaming variant of [`scan_native_multi`]: instead of buffering and sorting all hits, it hands
+/// each (model, record) scan's hits to `on_hits` as that scan completes (arrival order, unsorted).
+/// For long genome-scale runs over the whole Rfam this matters — results appear incrementally and
+/// survive a crash, and the process never holds the full hit set. Returns the total hit count.
+pub fn scan_native_multi_streaming<P, Q, F>(
+    cm_path: P,
+    fasta: Q,
+    e_value: f64,
+    on_hits: F,
+) -> Result<usize>
+where
+    P: AsRef<Path>,
+    Q: AsRef<Path>,
+    F: Fn(&[CMHit]) + Sync,
+{
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let count = AtomicUsize::new(0);
+    scan_multi_with(cm_path, fasta, e_value, |hits| {
+        if !hits.is_empty() {
+            count.fetch_add(hits.len(), Ordering::Relaxed);
+            on_hits(&hits);
+        }
+    })?;
+    Ok(count.load(Ordering::Relaxed))
+}
+
+/// Shared core: parse every model + memory-guard + per-model prep, then scan the feasible
+/// model × record product in parallel, handing each pair's hits to `sink` as it completes. `sink`
+/// is called once per scanned pair (possibly with an empty vec filtered by the callers) and must be
+/// thread-safe.
+fn scan_multi_with<P, Q, S>(cm_path: P, fasta: Q, e_value: f64, sink: S) -> Result<()>
+where
+    P: AsRef<Path>,
+    Q: AsRef<Path>,
+    S: Fn(Vec<CMHit>) + Sync,
+{
     let cm_path = cm_path.as_ref();
     let fasta = fasta.as_ref();
 
@@ -218,83 +281,62 @@ pub fn scan_native_multi<P: AsRef<Path>, Q: AsRef<Path>>(
         .flat_map(|mi| (0..records.len()).map(move |ri| (mi, ri)))
         .collect();
 
-    let per_pair: Vec<Vec<CMHit>> = pairs
-        .par_iter()
-        .map(|&(mi, ri)| -> Result<Vec<CMHit>> {
-            let p = &prepared[mi];
-            let rec = &records[ri];
-            let dsq =
-                p.cm.abc
-                    .digitize(&rec.seq)
-                    .map_err(|e| anyhow!("failed to digitize sequence {}: {e}", rec.name))?;
+    pairs.par_iter().try_for_each(|&(mi, ri)| -> Result<()> {
+        let p = &prepared[mi];
+        let rec = &records[ri];
+        let dsq =
+            p.cm.abc
+                .digitize(&rec.seq)
+                .map_err(|e| anyhow!("failed to digitize sequence {}: {e}", rec.name))?;
 
-            let (raw, _stats) = cm_pipeline_search(
-                &p.cm,
-                &dsq,
-                p.w_max,
-                REPORTING_BITS,
-                PipelineParams::default(),
-            )
-            .map_err(|e| anyhow!("pipeline failed for model {}: {e}", p.cm.name))?;
-            let rc = maybe_revcomp(&p.cm, &dsq, &raw, &rec.name)?;
+        let (raw, _stats) = cm_pipeline_search(
+            &p.cm,
+            &dsq,
+            p.w_max,
+            REPORTING_BITS,
+            PipelineParams::default(),
+        )
+        .map_err(|e| anyhow!("pipeline failed for model {}: {e}", p.cm.name))?;
+        let rc = maybe_revcomp(&p.cm, &dsq, &raw, &rec.name)?;
 
-            let mut hits = Vec::new();
-            for h in raw {
-                if let Some(ev) = h.evalue {
-                    if ev > e_value {
-                        continue;
-                    }
+        let mut hits = Vec::new();
+        for h in raw {
+            if let Some(ev) = h.evalue {
+                if ev > e_value {
+                    continue;
                 }
-                let strand = match h.strand {
-                    Strand::Plus => '+',
-                    Strand::Minus => '-',
-                };
-                let (mdl_from, mdl_to) = hit_model_span(
-                    &p.align_cm,
-                    &dsq,
-                    rc.as_deref(),
-                    &p.emap,
-                    h.i,
-                    h.j,
-                    h.strand,
-                );
-                hits.push(CMHit {
-                    target_name: rec.name.clone(),
-                    target_start: h.i,
-                    target_end: h.j,
-                    strand,
-                    query_name: p.cm.name.clone(),
-                    score: h.score as f64,
-                    e_value: h.evalue.unwrap_or(f64::NAN),
-                    gc_content: gc_fraction(&rec.seq, h.i, h.j),
-                    mdl_from,
-                    mdl_to,
-                    query_accession: p.cm.acc.clone(),
-                    description: (!rec.desc.is_empty()).then(|| rec.desc.clone()),
-                });
             }
-            Ok(hits)
-        })
-        .collect::<Result<Vec<_>>>()?;
-
-    let mut hits: Vec<CMHit> = per_pair.into_iter().flatten().collect();
-    // Best-first: E-value ascending (NaN/uncalibrated last), then score descending.
-    hits.sort_by(|a, b| {
-        let ea = if a.e_value.is_nan() {
-            f64::INFINITY
-        } else {
-            a.e_value
-        };
-        let eb = if b.e_value.is_nan() {
-            f64::INFINITY
-        } else {
-            b.e_value
-        };
-        ea.partial_cmp(&eb)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(b.score.total_cmp(&a.score))
-    });
-    Ok(hits)
+            let strand = match h.strand {
+                Strand::Plus => '+',
+                Strand::Minus => '-',
+            };
+            let (mdl_from, mdl_to) = hit_model_span(
+                &p.align_cm,
+                &dsq,
+                rc.as_deref(),
+                &p.emap,
+                h.i,
+                h.j,
+                h.strand,
+            );
+            hits.push(CMHit {
+                target_name: rec.name.clone(),
+                target_start: h.i,
+                target_end: h.j,
+                strand,
+                query_name: p.cm.name.clone(),
+                score: h.score as f64,
+                e_value: h.evalue.unwrap_or(f64::NAN),
+                gc_content: gc_fraction(&rec.seq, h.i, h.j),
+                mdl_from,
+                mdl_to,
+                query_accession: p.cm.acc.clone(),
+                description: (!rec.desc.is_empty()).then(|| rec.desc.clone()),
+            });
+        }
+        sink(hits);
+        Ok(())
+    })
 }
 
 /// Scan a FASTA and return, per model, a Stockholm-ready multiple alignment of that model's

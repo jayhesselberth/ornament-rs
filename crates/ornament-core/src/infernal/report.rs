@@ -20,6 +20,13 @@ pub fn write_tsv(hits: &[CMHit]) -> String {
     let mut out = String::with_capacity(TSV_HEADER.len() + hits.len() * 64);
     out.push_str(TSV_HEADER);
     out.push('\n');
+    write_tsv_rows(&mut out, hits);
+    out
+}
+
+/// Append the tab-separated data rows (no header) for `hits` to `out`. Used by [`write_tsv`] and by
+/// the streaming scan path, which writes the header once then appends each batch as it completes.
+pub fn write_tsv_rows(out: &mut String, hits: &[CMHit]) {
     for h in hits {
         // Uncalibrated models report a NaN E-value; show `-` and leave the hit unmarked.
         let inc = if h.e_value <= INC_THRESHOLD { '!' } else { '?' };
@@ -45,7 +52,6 @@ pub fn write_tsv(hits: &[CMHit]) -> String {
             h.description.as_deref().unwrap_or("-"),
         ));
     }
-    out
 }
 
 #[cfg(test)]
