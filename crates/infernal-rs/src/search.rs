@@ -282,23 +282,58 @@ pub fn inside_scan_glocal(cm: &Cm, dsq: &[Dsq], w_max: usize) -> CykScan {
 /// CYK search of BOTH strands, returning all hits scoring `>= cutoff_bits`, with overlapping
 /// windows resolved by the gamma semi-HMM (Infernal's default), sorted best-first (by
 /// E-value when calibrated, else by score). Honours the CM's configured glocal/local mode.
+/// Unbanded — the brute-force reference; for the faster banded form use [`cyk_search_banded`].
 pub fn cyk_search(cm: &Cm, dsq: &[Dsq], w_max: usize, cutoff_bits: f32) -> Vec<Hit> {
     let mode = if cm.is_local {
         SearchMode::LocalCyk
     } else {
         SearchMode::GlocalCyk
     };
-    search::<MaxPlus>(cm, dsq, w_max, cutoff_bits, mode)
+    search::<MaxPlus>(cm, dsq, w_max, cutoff_bits, mode, None)
 }
 
-/// Inside counterpart of [`cyk_search`] (sum-over-parses scoring).
+/// Query-dependent-banded [`cyk_search`]. Identical hits to the unbanded form (the bands keep
+/// every real hit's optimal parse in range) at a fraction of the DP cost. Compute `bands` once
+/// per model via [`crate::qdb::calc_qdb_bands`] and reuse across calls.
+pub fn cyk_search_banded(
+    cm: &Cm,
+    dsq: &[Dsq],
+    w_max: usize,
+    cutoff_bits: f32,
+    bands: &QdbBands,
+) -> Vec<Hit> {
+    let mode = if cm.is_local {
+        SearchMode::LocalCyk
+    } else {
+        SearchMode::GlocalCyk
+    };
+    search::<MaxPlus>(cm, dsq, w_max, cutoff_bits, mode, Some(bands))
+}
+
+/// Inside counterpart of [`cyk_search`] (sum-over-parses scoring). Unbanded.
 pub fn inside_search(cm: &Cm, dsq: &[Dsq], w_max: usize, cutoff_bits: f32) -> Vec<Hit> {
     let mode = if cm.is_local {
         SearchMode::LocalInside
     } else {
         SearchMode::GlocalInside
     };
-    search::<LogSum>(cm, dsq, w_max, cutoff_bits, mode)
+    search::<LogSum>(cm, dsq, w_max, cutoff_bits, mode, None)
+}
+
+/// Query-dependent-banded [`inside_search`].
+pub fn inside_search_banded(
+    cm: &Cm,
+    dsq: &[Dsq],
+    w_max: usize,
+    cutoff_bits: f32,
+    bands: &QdbBands,
+) -> Vec<Hit> {
+    let mode = if cm.is_local {
+        SearchMode::LocalInside
+    } else {
+        SearchMode::GlocalInside
+    };
+    search::<LogSum>(cm, dsq, w_max, cutoff_bits, mode, Some(bands))
 }
 
 /// Both-strand multi-hit driver shared by [`cyk_search`]/[`inside_search`].
@@ -312,6 +347,7 @@ fn search<S: Semiring>(
     w_max: usize,
     cutoff_bits: f32,
     mode: SearchMode,
+    bands: Option<&QdbBands>,
 ) -> Vec<Hit> {
     let l = dsq.len().saturating_sub(2);
     let searched = 2.0 * l as f64;
@@ -321,8 +357,8 @@ fn search<S: Semiring>(
     let mut rc = dsq.to_vec();
     cm.abc.revcomp(&mut rc).expect("revcomp digital sequence");
     let (fwd, rev) = rayon::join(
-        || scan_core::<S>(cm, dsq, w_max, Some(cutoff_bits), None).1,
-        || scan_core::<S>(cm, &rc, w_max, Some(cutoff_bits), None).1,
+        || scan_core::<S>(cm, dsq, w_max, Some(cutoff_bits), bands).1,
+        || scan_core::<S>(cm, &rc, w_max, Some(cutoff_bits), bands).1,
     );
 
     let mut hits: Vec<Hit> = Vec::with_capacity(fwd.len() + rev.len());
