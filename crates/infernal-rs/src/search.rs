@@ -510,16 +510,29 @@ fn scan_core<S: Semiring>(
             let is_begl = cm.stid[v] == stid::BEGL_S;
 
             if sttype == st::B {
+                // Bifurcation: sc[d] = ⊕_{k=0..d} left(j-k, d-k) ⊗ right(j, k). Reordering to
+                // outer-`k` makes the left child's cells contiguous in `d-k`, so each split is
+                // the same vectorized child-fold as the emitting states (`S::accumulate`), and
+                // the rolling-deck modulo is computed once per `k` instead of per `(d, k)`.
                 let wbi = begl_idx[cm.cfirst[v] as usize];
                 let ych = cm.cnum[v] as usize;
-                for d in 1..=dx {
-                    let mut sc = init_sc(v, d); // B sd=0; IMPOSSIBLE unless v can local-end
-                    for k in 0..=d {
-                        let left = alpha_begl[(j - k) % width][wbi * width + (d - k)];
-                        let rightsc = alpha[cur][ych * width + k];
-                        sc = S::or(sc, add(left, rightsc));
+                let base = wbi * width;
+                #[allow(clippy::needless_range_loop)] // d feeds init_sc and indexes acc
+                for d in 0..=dx {
+                    acc[d] = init_sc(v, d); // B sd=0; IMPOSSIBLE unless v can local-end. acc[0] unused.
+                }
+                for k in 0..=dx {
+                    let right_k = alpha[cur][ych * width + k];
+                    if right_k <= IMPOSSIBLE {
+                        continue; // left ⊗ IMPOSSIBLE contributes nothing to any d
                     }
-                    alpha[cur][v * width + d] = sc;
+                    let deck = (j - k) % width;
+                    let n = dx - k + 1; // d ranges k..=dx; left index (d-k) ranges 0..n
+                    S::accumulate(&mut acc[k..=dx], &alpha_begl[deck][base..base + n], right_k);
+                }
+                #[allow(clippy::needless_range_loop)] // d indexes acc and the alpha row offset
+                for d in 1..=dx {
+                    alpha[cur][v * width + d] = acc[d];
                 }
                 continue;
             }
