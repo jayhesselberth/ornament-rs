@@ -26,6 +26,19 @@ pub(crate) const HMM_MATCH: usize = 0;
 pub(crate) const HMM_INSERT: usize = 1;
 pub(crate) const HMM_DELETE: usize = 2;
 
+/// CP9 transition indices into `Cp9::t[k]` (`CT**`). Match block = `[0..4]` (+ `end[k]`),
+/// insert block = `[4..7]`, delete block = `[7..10]`.
+pub(crate) const CTMM: usize = 0; // M_k -> M_{k+1}
+pub(crate) const CTMI: usize = 1; // M_k -> I_k
+pub(crate) const CTMD: usize = 2; // M_k -> D_{k+1}
+pub(crate) const CTMEL: usize = 3; // M_k -> EL (local end; 0 in glocal)
+pub(crate) const CTIM: usize = 4; // I_k -> M_{k+1}
+pub(crate) const CTII: usize = 5; // I_k -> I_k
+pub(crate) const CTID: usize = 6; // I_k -> D_{k+1}
+pub(crate) const CTDM: usize = 7; // D_k -> M_{k+1}
+pub(crate) const CTDI: usize = 8; // D_k -> I_k
+pub(crate) const CTDD: usize = 9; // D_k -> D_{k+1}
+
 /// Number of states in a node of the given type (`TotalStatesInNode`). The node's states are
 /// `nodemap[nd] .. nodemap[nd] + states_in_node(ndtype[nd])` — which is *not* the same as
 /// `nodemap[nd+1]`, because a bifurcation interleaves the BEGL/BEGR subtrees between a node and
@@ -269,9 +282,9 @@ pub(crate) struct Cp9 {
     pub mat: Vec<Vec<f64>>,
     /// `[0..=m][0..k]` insert emissions (`ins[0]` = the leading ROOT_IL insert).
     pub ins: Vec<Vec<f64>>,
-    /// `[0..=m][0..9]` Plan-9 transitions (filled in 2b-ii).
-    pub t: Vec<[f64; 9]>,
-    /// `[1..=m]` B→Mk begin / Mk→E end distributions (filled in 2b-ii).
+    /// `[0..=m][0..10]` Plan-9 transitions, indexed by the `CT**` constants.
+    pub t: Vec<[f64; 10]>,
+    /// `[1..=m]` B→Mk begin / Mk→E end distributions (begin/last-node end in 2b-ii special).
     pub begin: Vec<f64>,
     pub end: Vec<f64>,
 }
@@ -347,10 +360,159 @@ pub(crate) fn build_cp9_emissions(cm: &Cm) -> Cp9 {
         k,
         mat,
         ins,
-        t: vec![[0.0; 9]; m + 1],
+        t: vec![[0.0; 10]; m + 1],
         begin: vec![0.0; m + 1],
         end: vec![0.0; m + 1],
     }
+}
+
+/// Summed probability of all CM paths from `start` to `end` (`start ≤ end`, i.e. *down* the CM)
+/// — a port of `cm_sum_subpaths_cp9`. It runs a localized occupancy recursion over the states in
+/// `[start, end]`: `sub[0]=1` at `start`, each later state accumulates `Σ sub[parent]·t[parent→·]`
+/// (parents before `start` are out of window and contribute 0), inserts fold their self-loop.
+///
+/// Two corrections keep this consistent with the way the 9 CP9 transitions partition CM paths:
+///  - when both ends are non-inserts, the mass that reaches `start` *via this node's own insert*
+///    is subtracted (it belongs to the M→I / D→I transitions, counted separately);
+///  - an interior insert state that maps to node `k` is skipped (counted in its own sub-call).
+///
+/// The two degenerate `start == end` cases: a self-insert returns its self-loop prob; a non-insert
+/// (only happens for the two halves of one MATP modelling adjacent columns) returns 1.
+fn sum_subpaths(cm: &Cm, map: &Cp9Map, start: usize, end: usize, k: usize, psi: &[f64]) -> f64 {
+    debug_assert!(start <= end);
+    let is_ins = |v: usize| cm.sttype[v] == st::IL || cm.sttype[v] == st::IR;
+
+    if start == end {
+        if !is_ins(start) {
+            return 1.0; // adjacent columns share a MATP node; caller weights by psi[start]
+        }
+        return cm.t[start][0] as f64; // self-insert probability
+    }
+
+    let mut sub = vec![0.0f64; end - start + 1];
+    sub[0] = 1.0; // we begin in `start`
+
+    // Subtract paths that arrive at `start` through this node's insert (counted by M→I / D→I).
+    if !is_ins(start) && !is_ins(end) {
+        let mut insert_to_start = 0.0;
+        for slot in 0..2 {
+            let iv = map.hns2cs[k][HMM_INSERT][slot];
+            if iv >= 0 && (iv as usize) < start {
+                let iv = iv as usize;
+                insert_to_start += psi[iv] * sum_subpaths(cm, map, iv, start, k, psi);
+            }
+        }
+        sub[0] -= insert_to_start / psi[start];
+    }
+
+    for v in (start + 1)..=end {
+        let isv = is_ins(v);
+        if cm.sttype[v] == st::S {
+            // A start state is entered structurally from a B (prob 1) — its only "parent" is that
+            // bifurcation, which carries no transition probabilities (cm.t[B] is empty), so the
+            // parent loop would contribute 0. Carry the prior value, matching `sub_psi[v-1]*1`.
+            sub[v - start] = sub[v - 1 - start];
+            continue;
+        }
+        // Skip an interior node-k insert: its contribution is counted in its own sub-call.
+        let skip = v != end && isv && (map.cs2hn[v][0] == k as i32 || map.cs2hn[v][1] == k as i32);
+        if skip {
+            continue;
+        }
+        let final_y = if isv { 1 } else { 0 };
+        for y in final_y..cm.pnum[v] {
+            let x = (cm.plast[v] - y) as usize;
+            if x >= start {
+                let off = v - cm.cfirst[x] as usize;
+                sub[v - start] += sub[x - start] * cm.t[x][off] as f64;
+            }
+        }
+        if v != end && isv {
+            let ts = cm.t[v][0] as f64; // self-loop, folded in closed form
+            sub[v - start] += sub[v - start] * (ts / (1.0 - ts));
+        }
+    }
+    sub[end - start]
+}
+
+/// Add the virtual count for one CP9 transition `a → b` (CM states) — a port of
+/// `hmm_add_single_trans_cp9`. The path always runs down the CM (low→high index), weighted by the
+/// occupancy of its upstream end.
+#[allow(clippy::too_many_arguments)]
+fn add_single_trans(
+    cm: &Cm,
+    map: &Cp9Map,
+    hmm: &mut Cp9,
+    a: i32,
+    b: i32,
+    k: usize,
+    idx: usize,
+    psi: &[f64],
+) {
+    if a < 0 || b < 0 {
+        return;
+    }
+    let (a, b) = (a as usize, b as usize);
+    let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+    hmm.t[k][idx] += psi[lo] * sum_subpaths(cm, map, lo, hi, k, psi);
+}
+
+/// The 9 interior CP9 transitions of node `k`, as `(a-state-type, b-state-type, b-node-offset)`.
+const TRANS_SPEC: [(usize, usize, usize, usize); 9] = [
+    (HMM_MATCH, HMM_MATCH, 1, CTMM),
+    (HMM_MATCH, HMM_INSERT, 0, CTMI),
+    (HMM_MATCH, HMM_DELETE, 1, CTMD),
+    (HMM_INSERT, HMM_MATCH, 1, CTIM),
+    (HMM_INSERT, HMM_INSERT, 0, CTII),
+    (HMM_INSERT, HMM_DELETE, 1, CTID),
+    (HMM_DELETE, HMM_MATCH, 1, CTDM),
+    (HMM_DELETE, HMM_INSERT, 0, CTDI),
+    (HMM_DELETE, HMM_DELETE, 1, CTDD),
+];
+
+/// Fill and normalize the 9 transitions of an interior node `k` (`1 ≤ k < M`) — a port of
+/// `cm2hmm_trans_probs_cp9`. Each transition's virtual count sums over the (≤2)×(≤2) CM-state
+/// pairs its endpoints map to; the three out-blocks (match incl. `end[k]`, insert, delete) are
+/// then renormalized to distributions. Node 0 and node M are handled by the special build.
+fn fill_interior_transitions(cm: &Cm, map: &Cp9Map, hmm: &mut Cp9, k: usize, psi: &[f64]) {
+    for &(a_ty, b_ty, b_off, idx) in TRANS_SPEC.iter() {
+        let ap = map.hns2cs[k][a_ty];
+        let bp = map.hns2cs[k + b_off][b_ty];
+        for &a in ap.iter() {
+            for &b in bp.iter() {
+                add_single_trans(cm, map, hmm, a, b, k, idx, psi);
+            }
+        }
+    }
+    // Renormalize the three out-of-state blocks.
+    let d = hmm.t[k][0..4].iter().sum::<f64>() + hmm.end[k];
+    if d > 0.0 {
+        for x in hmm.t[k][0..4].iter_mut() {
+            *x /= d;
+        }
+        hmm.end[k] /= d;
+    }
+    for block in [4usize, 7] {
+        let s: f64 = hmm.t[k][block..block + 3].iter().sum();
+        if s > 0.0 {
+            for x in hmm.t[k][block..block + 3].iter_mut() {
+                *x /= s;
+            }
+        }
+    }
+}
+
+/// Build the CP9 emissions and the **interior-node transitions** (`1 ≤ k < M`). Node 0 / node M
+/// special transitions and the begin/end distributions are the next milestone, so the boundary
+/// nodes' transitions are left zero here.
+pub(crate) fn build_cp9_interior(cm: &Cm) -> Cp9 {
+    let map = build_cp9_map(cm);
+    let psi = expected_occupancy(cm);
+    let mut hmm = build_cp9_emissions(cm);
+    for k in 1..hmm.m {
+        fill_interior_transitions(cm, &map, &mut hmm, k, &psi);
+    }
+    hmm
 }
 
 #[cfg(test)]
@@ -503,5 +665,51 @@ mod tests {
             }
         }
         assert!(checked > 0, "expected at least one MATL column to validate");
+    }
+
+    /// Interior-node transitions must form valid distributions: the match out-block (`[0..4]` +
+    /// `end[k]`), the insert out-block (`[4..7]`), and the delete out-block (`[7..10]`) each sum
+    /// to 1. Also sanity-check that a confident column prefers M→M.
+    #[test]
+    fn cp9_interior_transitions_normalize() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/tRNA.cm");
+        let mut cm = parse_cm_file(path).expect("parse tRNA.cm");
+        configure_scores(&mut cm);
+        let hmm = build_cp9_interior(&cm);
+
+        let mut mm_dominant = 0;
+        for k in 1..hmm.m {
+            let mblock: f64 = hmm.t[k][0..4].iter().sum::<f64>() + hmm.end[k];
+            assert!(
+                (mblock - 1.0).abs() < 1e-9,
+                "node {k} match block = {mblock}"
+            );
+            let iblock: f64 = hmm.t[k][4..7].iter().sum();
+            assert!(
+                (iblock - 1.0).abs() < 1e-9,
+                "node {k} insert block = {iblock}"
+            );
+            let dblock: f64 = hmm.t[k][7..10].iter().sum();
+            assert!(
+                (dblock - 1.0).abs() < 1e-9,
+                "node {k} delete block = {dblock}"
+            );
+            // Probabilities are in [0, 1].
+            for &x in hmm.t[k].iter() {
+                assert!(
+                    (0.0..=1.0).contains(&x),
+                    "node {k} transition {x} out of range"
+                );
+            }
+            if hmm.t[k][CTMM] > hmm.t[k][CTMI] && hmm.t[k][CTMM] > hmm.t[k][CTMD] {
+                mm_dominant += 1;
+            }
+        }
+        // A well-trained consensus model: most columns most-prefer staying in the match path.
+        assert!(
+            mm_dominant > hmm.m / 2,
+            "expected M->M dominant in most columns, got {mm_dominant}/{}",
+            hmm.m - 1
+        );
     }
 }
