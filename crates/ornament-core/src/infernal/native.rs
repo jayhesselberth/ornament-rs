@@ -503,11 +503,19 @@ fn maybe_revcomp(
     Ok(Some(v))
 }
 
+/// Cap on the dense-alignment footprint used to recover a hit's model span. `align_glocal`
+/// allocates an `m × (window+1)²` score matrix plus two equal-size shadow arrays (~12 B/cell), so
+/// a long hit on a large model is catastrophic — a 1.5 kb SSU-rRNA hit on a 4758-state model is
+/// ~40 GB. Above this cap we skip the precise traceback and report a coarse full-model span. (The
+/// proper fix is a *banded* alignment; this just keeps a convenience column from OOMing the scan.)
+const MAX_SPAN_ALIGN_BYTES: u64 = 256 * 1024 * 1024;
+
 /// Matched consensus-column span (`mdl from`, `mdl to`) of a hit, recovered from its glocal
 /// traceback. Plus hits align the original `dsq` over window `[i, j]`; minus hits (forward coords
 /// `i > j`) align the reverse-complement `rc` over the mirrored window `[L-i+1, L-j+1]`, where the
 /// model columns already come out in 5'->3' model orientation. Returns `(0, 0)` if the parse
-/// emitted no match columns (defensive — real hits always match at least one).
+/// emitted no match columns. For a window large enough to blow up the dense alignment (see
+/// [`MAX_SPAN_ALIGN_BYTES`]) it returns the coarse full-model span `(1, clen)` instead of aligning.
 fn hit_model_span(
     cm: &Cm,
     dsq: &[Dsq],
@@ -517,6 +525,17 @@ fn hit_model_span(
     j: usize,
     strand: Strand,
 ) -> (usize, usize) {
+    // Dense alignment is O(m·window²) memory; skip it for oversized hits, reporting the coarse
+    // full-model span. A strong hit this large (rRNA-scale) covers ~the whole model anyway.
+    let window = (i.abs_diff(j) + 1) as u64;
+    let est_bytes = (cm.m as u64)
+        .saturating_mul(window + 1)
+        .saturating_mul(window + 1)
+        * 12;
+    if est_bytes > MAX_SPAN_ALIGN_BYTES {
+        return (1, cm.clen);
+    }
+
     let (aln, _seq) = align_hit_window(cm, dsq, rc, emap, i, j, strand);
     aln.residues
         .iter()
