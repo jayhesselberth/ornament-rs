@@ -127,12 +127,31 @@ The covariance-model search engine is a **native Rust port** (no C FFI). Crates:
   - `integration/` - modkit BedMethyl parsing
   - `output/` - JSON/TSV formatters
 
-- **ornament-cli**: CLI binary with subcommands: `scan`, `analyze`, `compare`, `mods`.
-  `scan` takes `--engine native|cmsearch` (**default `native`**): `native` runs the
-  pure-Rust `ornament-scfg` CYK scanner in-process (`infernal::scan_native`, no external
-  binary); `cmsearch` shells out to the Infernal subprocess (`InfernalRunner`) as an
-  oracle/fallback. Both yield the same `CMHit` records, so the downstream Sprinzl +
-  modification analysis is identical.
+- **ornament-cli**: the `ornament` binary. Two command layers (split across
+  `src/commands/*.rs`):
+  - **Engine layer** (general CM homology search, mirrors the Infernal toolset):
+    - `search` — one model vs sequences (`cmsearch`; `infernal::scan_native`).
+    - `scan` — many models vs sequences (`cmscan`; `scan_native_multi[_streaming]`).
+      The workhorse: streams TSV as each model finishes (native + tsv + non-`.gz`).
+    - `align` — align given sequences to a model → Stockholm MSA (`cmalign`;
+      `infernal::align_sequences`, no search).
+    - `stat` — model statistics (`cmstat`; `infernal::cmstat` → `CmStat`).
+    - `search`/`scan` take `--engine native|cmsearch` (**default `native`**): `native`
+      runs the pure-Rust `ornament-scfg` engine in-process; `cmsearch` shells out to the
+      Infernal subprocess (`InfernalRunner`) as an oracle/fallback. Both yield `CMHit`s.
+    - Hit output: `-f tsv|json|stockholm`. TSV/JSON/Stockholm go to **stdout** (plain,
+      pipeable); status goes to **stderr**.
+  - **Application layer**: `trna analyze|compare|mods` — the tRNA-modification analysis
+    built on the engine. (`analyze`/`compare`/`mods` also exist as hidden, deprecated
+    top-level aliases that warn and dispatch to the `trna` namespace.)
+  - **Terminal UX** (styling adapted from sibling project `escapepod-rs`): `src/style.rs`
+    is the owo-colors theme gated on `use_color()` (`CLICOLOR_FORCE` > `NO_COLOR` >
+    `CLICOLOR=0` > `stderr().is_terminal()`); `src/progress.rs` wraps indicatif
+    spinners/bars (hidden below INFO). Status is emitted via `tracing` to stderr with a
+    terse formatter; global `-q`/`-v`/`-vv` map to error/info(default)/debug/trace
+    (`RUST_LOG` overrides). `stat`/`trna mods` render `tabled` rounded tables. Library
+    warnings in `ornament-core` (e.g. oversized-model skips in `infernal::native`) flow
+    through `tracing::warn!`.
 
 ### Key Concepts
 
