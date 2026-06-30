@@ -8,8 +8,14 @@
 //!      transitions + begin/end — validated by the psi-vs-phi occupancy check (`build_cp9`).  ✓
 //!   3. CP9 Forward / Backward + posteriors (per sequence), validated F==B + Σ posteriors==1.  ✓
 //!   4. posteriors → HMM position bands → CM i,j bands → per-j d-bands (`hdmin`/`hdmax`).  ✓
-//!   5. the doubly-ragged (j- and d-banded) CYK kernel that consumes them.  ✓ (alignment kernel;
-//!      scanning + multi-hit pipeline wiring is the remaining integration step)
+//!   5. the doubly-ragged (j- and d-banded) CYK kernel that consumes them.  ✓ (alignment +
+//!      scanning/multi-hit kernels). NOTE on pipeline wiring: the glocal CP9 Forward/Backward
+//!      forces the parse to span the whole window, so HMM banding is only valid on a window that
+//!      *tightly* brackets the hit (an envelope) — not the loose 2W survivor tiles the pipeline
+//!      currently CM-scans. Replacing the survivor QDB scan therefore needs an envelope-tightening
+//!      step first (p7 domain definition, or a local/scanning CP9). On tight windows the banded
+//!      scan is byte-identical to the unbanded one (validated). HMM banding's payoff is large
+//!      models (loose QDB); for tRNA, QDB is already tight.
 //!
 //! The CP9 build (1–2) depends only on the CM, so it runs once per model; 3–4 are per sequence.
 //!
@@ -22,6 +28,7 @@ use crate::config::IMPOSSIBLE;
 use crate::emit::Oesc;
 use crate::emitmap::EmitMap;
 use crate::model::{emits_left, emits_right, n_emit, nd, st, stid, Cm};
+use crate::search::{Gamma, LogSum, MaxPlus, Semiring};
 use ornament_alphabet::Dsq;
 
 /// `ln(p)`, mapping `p ≤ 0` to −∞ (the log-space sentinel).
@@ -1829,22 +1836,20 @@ fn cyk_add(a: f32, b: f32) -> f32 {
     }
 }
 
-/// HMM-banded glocal CYK alignment score (bits) of the window `dsq` (1-based, sentinels at `0` and
-/// `L+1`) under the i,j,d bands `b` (built in **alignment** mode for the same window). Returns the
-/// root score `alpha[ROOT_S][j=L][d=L]`, byte-identical to the unbanded [`crate::align::align_glocal`]
-/// when the bands contain the optimal parse. Returns `IMPOSSIBLE` if the full-span root cell is out
-/// of band (no in-band parse spans the window).
-pub(crate) fn cyk_banded_align(cm: &Cm, dsq: &[Dsq], b: &Cp9Bands) -> f32 {
-    let l = (dsq.len() - 2) as i32;
+/// Fill the ragged HMM-banded DP matrix `alpha[v][jp][dp]` (only in-band cells; `jp = j - jmin[v]`,
+/// `dp = d - hdmin[v][jp]`) over the window `dsq` under bands `b`, parameterized by the within-cell
+/// ⊕ ([`Semiring`]): [`MaxPlus`] gives CYK, [`LogSum`] gives Inside. Glocal (no local-end deck
+/// reinit). The recursion mirrors `cm_dpsearch.c::FastCYKScanHB`.
+fn fill_banded_alpha<S: Semiring>(cm: &Cm, dsq: &[Dsq], b: &Cp9Bands) -> Vec<Vec<Vec<f32>>> {
     let m = cm.m;
     let oesc = Oesc::build(cm);
     let kp = oesc.kp;
 
-    // Ragged DP matrix: alpha[v][jp][dp], only in-band cells. Unreachable states get no rows.
+    // Allocate only in-band cells. Unreachable states (jmin < 0) get no rows.
     let mut alpha: Vec<Vec<Vec<f32>>> = vec![Vec::new(); m];
     for v in 0..m {
         if b.jmin[v] < 0 {
-            continue; // unreachable state
+            continue;
         }
         let njp = (b.jmax[v] - b.jmin[v] + 1) as usize;
         let mut rows = Vec::with_capacity(njp);
@@ -1855,7 +1860,7 @@ pub(crate) fn cyk_banded_align(cm: &Cm, dsq: &[Dsq], b: &Cp9Bands) -> f32 {
         alpha[v] = rows;
     }
 
-    // In-band cell lookup: platonic alpha[y][j][d] -> ragged value, or None if out of band.
+    // Platonic alpha[y][j][d] -> ragged value, or None if (j, d) is out of band for y.
     let cell = |alpha: &[Vec<Vec<f32>>], y: usize, j: i32, d: i32| -> Option<f32> {
         if b.jmin[y] < 0 || j < b.jmin[y] || j > b.jmax[y] {
             return None;
@@ -1876,8 +1881,7 @@ pub(crate) fn cyk_banded_align(cm: &Cm, dsq: &[Dsq], b: &Cp9Bands) -> f32 {
 
         if sttype == st::E {
             for jp in 0..alpha[v].len() {
-                // E: d == 0 only (hdmin == hdmax == 0).
-                alpha[v][jp][0] = 0.0;
+                alpha[v][jp][0] = 0.0; // E: d == 0 only
             }
             continue;
         }
@@ -1895,7 +1899,7 @@ pub(crate) fn cyk_banded_align(cm: &Cm, dsq: &[Dsq], b: &Cp9Bands) -> f32 {
                 let hdminv = b.hdmin[v][jp_v];
                 for dp_v in 0..alpha[v][jp_v].len() {
                     let d = dp_v as i32 + hdminv;
-                    let mut best = IMPOSSIBLE;
+                    let mut acc = IMPOSSIBLE;
                     // k = length of the right (z) fragment; left (w) spans j-k, d-k.
                     for k in 0..=d {
                         let (Some(left), Some(right)) =
@@ -1903,15 +1907,15 @@ pub(crate) fn cyk_banded_align(cm: &Cm, dsq: &[Dsq], b: &Cp9Bands) -> f32 {
                         else {
                             continue;
                         };
-                        best = best.max(cyk_add(left, right));
+                        acc = S::or(acc, cyk_add(left, right));
                     }
-                    alpha[v][jp_v][dp_v] = best;
+                    alpha[v][jp_v][dp_v] = acc;
                 }
             }
             continue;
         }
 
-        // ML, MR, MP, IL, IR, D, S: max over children (+ self for inserts), then emission.
+        // ML, MR, MP, IL, IR, D, S: ⊕ over children (+ self for inserts), then emission.
         let sd = n_emit(sttype) as i32;
         let sdr = if emits_right(sttype) { 1 } else { 0 };
         let cfirst = cm.cfirst[v] as usize;
@@ -1926,11 +1930,11 @@ pub(crate) fn cyk_banded_align(cm: &Cm, dsq: &[Dsq], b: &Cp9Bands) -> f32 {
             // d ascending so insert self-transitions read the finalized d-1 cell.
             for dp_v in 0..alpha[v][jp_v].len() {
                 let d = dp_v as i32 + hdminv;
-                let mut best = IMPOSSIBLE;
+                let mut acc = IMPOSSIBLE;
                 for yoff in 0..cnum {
                     let y = cfirst + yoff;
                     if let Some(child) = cell(&alpha, y, j - sdr, d - sd) {
-                        best = best.max(cyk_add(child, tsc[yoff]));
+                        acc = S::or(acc, cyk_add(child, tsc[yoff]));
                     }
                 }
                 let i = j - d + 1; // window-local left position
@@ -1943,16 +1947,80 @@ pub(crate) fn cyk_banded_align(cm: &Cm, dsq: &[Dsq], b: &Cp9Bands) -> f32 {
                     _ => 0.0, // D, S
                 };
                 alpha[v][jp_v][dp_v] = if sttype == st::D || sttype == st::S {
-                    best
+                    acc
                 } else {
-                    cyk_add(best, emit)
+                    cyk_add(acc, emit)
                 };
             }
         }
     }
+    alpha
+}
 
+/// HMM-banded glocal CYK alignment score (bits) of the window `dsq` (1-based, sentinels at `0` and
+/// `L+1`) under the i,j,d bands `b` (built in **alignment** mode for the same window). Returns the
+/// root score `alpha[ROOT_S][j=L][d=L]`, byte-identical to the unbanded [`crate::align::align_glocal`]
+/// when the bands contain the optimal parse. Returns `IMPOSSIBLE` if the full-span root cell is out
+/// of band (no in-band parse spans the window).
+pub(crate) fn cyk_banded_align(cm: &Cm, dsq: &[Dsq], b: &Cp9Bands) -> f32 {
+    let l = (dsq.len() - 2) as i32;
+    let alpha = fill_banded_alpha::<MaxPlus>(cm, dsq, b);
     // Glocal alignment: root score is alpha[ROOT_S=0] at the full span (j = L, d = L).
-    cell(&alpha, 0, l, l).unwrap_or(IMPOSSIBLE)
+    if b.jmin[0] < 0 || l < b.jmin[0] || l > b.jmax[0] {
+        return IMPOSSIBLE;
+    }
+    let jp = (l - b.jmin[0]) as usize;
+    if l < b.hdmin[0][jp] || l > b.hdmax[0][jp] {
+        return IMPOSSIBLE;
+    }
+    alpha[0][jp][(l - b.hdmin[0][jp]) as usize]
+}
+
+/// HMM-banded glocal scanning CYK/Inside over the window `dsq` under **search**-mode bands `b`.
+/// Mirrors [`crate::search::scan_subseq`]: returns every above-`cutoff` non-overlapping hit
+/// `(score, i, j)` (window-local coords), resolved by the same gamma semi-HMM. `do_inside` selects
+/// Inside (sum over parses) vs CYK (best parse).
+pub(crate) fn cyk_banded_subseq(
+    cm: &Cm,
+    dsq: &[Dsq],
+    b: &Cp9Bands,
+    cutoff_bits: f32,
+    do_inside: bool,
+) -> Vec<(f32, usize, usize)> {
+    let l = dsq.len().saturating_sub(2);
+    if l == 0 || b.jmin[0] < 0 {
+        return Vec::new();
+    }
+    let alpha = if do_inside {
+        fill_banded_alpha::<LogSum>(cm, dsq, b)
+    } else {
+        fill_banded_alpha::<MaxPlus>(cm, dsq, b)
+    };
+
+    // Resolve overlapping hits via the gamma semi-HMM over ROOT_S (v=0) scores, exactly as the
+    // dense scanner does. ROOT_S at (j, d) holds the score of the best parse rooted at 0 emitting
+    // dsq[j-d+1..j]; a hit needs d >= 1.
+    let mut gamma = Gamma::new(l, cutoff_bits);
+    for j in 1..=l as i32 {
+        gamma.init_j(j as usize);
+        if j < b.jmin[0] || j > b.jmax[0] {
+            continue; // ROOT_S can't end a parse here
+        }
+        let jp = (j - b.jmin[0]) as usize;
+        let hdmin0 = b.hdmin[0][jp];
+        for (dp, &sc) in alpha[0][jp].iter().enumerate() {
+            let d = dp as i32 + hdmin0;
+            if d < 1 {
+                continue; // empty fragment is not a hit
+            }
+            gamma.consider((j - d + 1) as usize, j as usize, sc);
+        }
+    }
+    gamma
+        .traceback(l)
+        .into_iter()
+        .map(|h| (h.score, h.i, h.j))
+        .collect()
 }
 
 #[cfg(test)]
@@ -2508,5 +2576,58 @@ mod tests {
         wdsq.extend_from_slice(&dsq[hit.i..=hit.j]);
         wdsq.push(dsq[dsq.len() - 1]);
         check(&cm, &wdsq);
+    }
+
+    /// The HMM-banded scanning CYK must report the same hits as the unbanded scanner on a survivor
+    /// window: same coordinates, byte-identical scores. This is the per-window contract the pipeline
+    /// integration relies on.
+    #[test]
+    fn cyk_banded_scan_matches_unbanded_scan() {
+        use crate::search::scan_subseq;
+
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/tRNA.cm");
+        let mut cm = parse_cm_file(path).expect("parse tRNA.cm");
+        configure_scores(&mut cm);
+        let map = build_cp9_map(&cm);
+        let scores = Cp9Scores::from_cp9(&build_cp9(&cm));
+
+        // A window spanning the embedded tRNA plus some flank, like a real survivor.
+        let seq = ornament_alphabet::read_fasta(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/data/trna_embedded.fa"
+        ))
+        .expect("read embedded")[0]
+            .seq
+            .clone();
+        let full = cm.abc.digitize(&seq).expect("digitize");
+        let w = cm.w as usize;
+        let cutoff = 10.0;
+
+        // Tighten to the hit envelope (as Infernal's p7 envelope-definition does before the
+        // banded CM stage): the glocal CP9 Forward/Backward must span the window, so flanks would
+        // smear the posteriors. Locate the hit, window it out tightly.
+        let h = crate::search::cyk_search(&cm, &full, w, cutoff)
+            .into_iter()
+            .filter(|h| matches!(h.strand, crate::search::Strand::Plus))
+            .max_by(|a, c| a.score.partial_cmp(&c.score).unwrap())
+            .expect("a forward hit");
+        let mut dsq = vec![full[0]];
+        dsq.extend_from_slice(&full[h.i..=h.j]);
+        dsq.push(full[full.len() - 1]);
+
+        let unbanded = scan_subseq(&cm, &dsq, w, cutoff, false, None);
+        // Search-mode bands for the (tight) window, then the banded scan.
+        let bands = cp9_seq2bands(&cm, &map, &scores, &dsq, 1e-7, true);
+        let banded = cyk_banded_subseq(&cm, &dsq, &bands, cutoff, false);
+
+        assert_eq!(
+            banded.len(),
+            unbanded.len(),
+            "banded {banded:?} vs unbanded {unbanded:?}"
+        );
+        for ((bs, bi, bj), (us, ui, uj)) in banded.iter().zip(&unbanded) {
+            assert_eq!((bi, bj), (ui, uj), "hit coords differ");
+            assert_eq!(bs.to_bits(), us.to_bits(), "hit score differs {bs} vs {us}");
+        }
     }
 }

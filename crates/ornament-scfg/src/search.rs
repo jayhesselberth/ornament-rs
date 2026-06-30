@@ -68,17 +68,17 @@ pub struct Hit {
 
 /// A raw hit on the strand that was scanned, in that strand's local 1-based coordinates.
 #[derive(Debug, Clone, Copy)]
-struct RawHit {
-    score: f32,
-    i: usize,
-    j: usize,
+pub(crate) struct RawHit {
+    pub score: f32,
+    pub i: usize,
+    pub j: usize,
 }
 
 /// Gamma semi-HMM for optimal resolution of overlapping hits, ported from
 /// `CreateGammaHitMx` / `UpdateGammaHitMx` / `TBackGammaHitMx` (`src/cm_mx.c`). This is the
 /// non-greedy (default) Infernal path: it picks the maximum-total-score set of
 /// non-overlapping hits, then a traceback recovers each above-cutoff hit.
-struct Gamma {
+pub(crate) struct Gamma {
     /// `mx[j]` = best cumulative score of all chosen hits ending at or before `j`.
     mx: Vec<f32>,
     /// `gback[j]` = start `i` of the hit ending at `j` (0 = no hit ends here).
@@ -90,7 +90,7 @@ struct Gamma {
 }
 
 impl Gamma {
-    fn new(l: usize, cutoff: f32) -> Self {
+    pub(crate) fn new(l: usize, cutoff: f32) -> Self {
         Gamma {
             mx: vec![0.0; l + 1],
             gback: vec![0; l + 1],
@@ -99,9 +99,32 @@ impl Gamma {
         }
     }
 
+    /// Start position `j`'s gamma cell (`UpdateGammaHitMx`): default to "no hit ends at j",
+    /// carrying the best resolution ending before `j`.
+    #[inline]
+    pub(crate) fn init_j(&mut self, j: usize) {
+        self.mx[j] = self.mx[j - 1];
+        self.gback[j] = 0;
+        self.savesc[j] = IMPOSSIBLE;
+    }
+
+    /// Consider a hit `i..j` with score `sc`: chain it to the best resolution ending before its
+    /// start and keep it if it improves the cumulative total.
+    #[inline]
+    pub(crate) fn consider(&mut self, i: usize, j: usize, sc: f32) {
+        if sc > IMPOSSIBLE {
+            let cumulative = self.mx[i - 1] + sc;
+            if cumulative > self.mx[j] {
+                self.mx[j] = cumulative;
+                self.gback[j] = i;
+                self.savesc[j] = sc;
+            }
+        }
+    }
+
     /// Traceback recovering all above-cutoff non-overlapping hits (`TBackGammaHitMx`),
     /// returned in ascending coordinate order.
-    fn traceback(&self, l: usize) -> Vec<RawHit> {
+    pub(crate) fn traceback(&self, l: usize) -> Vec<RawHit> {
         let mut hits = Vec::new();
         let mut j = l;
         while j >= 1 {
@@ -702,9 +725,7 @@ fn scan_core<S: Semiring>(
         let mut bestsc_j = IMPOSSIBLE;
         // Gamma cell init (UpdateGammaHitMx): default to "no hit ends at j".
         if let Some(g) = gamma.as_mut() {
-            g.mx[j] = g.mx[j - 1];
-            g.gback[j] = 0;
-            g.savesc[j] = IMPOSSIBLE;
+            g.init_j(j);
         }
         for d in 1..=dx {
             let mut sc = IMPOSSIBLE;
@@ -729,15 +750,7 @@ fn scan_core<S: Semiring>(
             // Gamma update: a hit of length d ending at j, chained to the best resolution
             // ending before its start. Keep it if it improves the cumulative total.
             if let Some(g) = gamma.as_mut() {
-                if sc > IMPOSSIBLE {
-                    let i = j - d + 1;
-                    let cumulative = g.mx[i - 1] + sc;
-                    if cumulative > g.mx[j] {
-                        g.mx[j] = cumulative;
-                        g.gback[j] = i;
-                        g.savesc[j] = sc;
-                    }
-                }
+                g.consider(j - d + 1, j, sc);
             }
         }
         bestsc_per_j[j] = bestsc_j;
