@@ -8,7 +8,8 @@
 //!      transitions + begin/end — validated by the psi-vs-phi occupancy check (`build_cp9`).  ✓
 //!   3. CP9 Forward / Backward + posteriors (per sequence), validated F==B + Σ posteriors==1.  ✓
 //!   4. posteriors → HMM position bands → CM i,j bands → per-j d-bands (`hdmin`/`hdmax`).  ✓
-//!   5. the doubly-ragged (j- and d-banded) CYK kernel that consumes them.  ← next
+//!   5. the doubly-ragged (j- and d-banded) CYK kernel that consumes them.  ✓ (alignment kernel;
+//!      scanning + multi-hit pipeline wiring is the remaining integration step)
 //!
 //! The CP9 build (1–2) depends only on the CM, so it runs once per model; 3–4 are per sequence.
 //!
@@ -17,8 +18,10 @@
 //! the alphabet read clearer as range loops (the index feeds `emit_prob` and indexes the array).
 #![allow(dead_code, clippy::needless_range_loop)]
 
+use crate::config::IMPOSSIBLE;
+use crate::emit::Oesc;
 use crate::emitmap::EmitMap;
-use crate::model::{emits_left, n_emit, nd, st, stid, Cm};
+use crate::model::{emits_left, emits_right, n_emit, nd, st, stid, Cm};
 use ornament_alphabet::Dsq;
 
 /// `ln(p)`, mapping `p ≤ 0` to −∞ (the log-space sentinel).
@@ -1806,6 +1809,152 @@ pub(crate) fn cp9_seq2bands(
     cp9_hmm2ij_bands(cm, map, s, &mut hmmbands, 1, l, doing_search)
 }
 
+// ---------------------------------------------------------------------------
+// Milestone 5: doubly-ragged (j- and d-banded) CYK.
+//
+// A port of the HMM-banded CYK recursion from `cm_dpsearch.c::FastCYKScanHB`,
+// in alignment mode (glocal, full-span ROOT->END over the window). The DP matrix
+// `alpha[v][jp][dp]` allocates only in-band cells (`jp = j - jmin[v]`,
+// `dp = d - hdmin[v][jp]`) — far smaller than the dense [v][j][d] grid. Given
+// bands that contain the optimal parse (the milestone-4b no-drop guarantee), the
+// root score is identical to the unbanded CYK.
+// ---------------------------------------------------------------------------
+
+#[inline]
+fn cyk_add(a: f32, b: f32) -> f32 {
+    if a <= IMPOSSIBLE || b <= IMPOSSIBLE {
+        IMPOSSIBLE
+    } else {
+        a + b
+    }
+}
+
+/// HMM-banded glocal CYK alignment score (bits) of the window `dsq` (1-based, sentinels at `0` and
+/// `L+1`) under the i,j,d bands `b` (built in **alignment** mode for the same window). Returns the
+/// root score `alpha[ROOT_S][j=L][d=L]`, byte-identical to the unbanded [`crate::align::align_glocal`]
+/// when the bands contain the optimal parse. Returns `IMPOSSIBLE` if the full-span root cell is out
+/// of band (no in-band parse spans the window).
+pub(crate) fn cyk_banded_align(cm: &Cm, dsq: &[Dsq], b: &Cp9Bands) -> f32 {
+    let l = (dsq.len() - 2) as i32;
+    let m = cm.m;
+    let oesc = Oesc::build(cm);
+    let kp = oesc.kp;
+
+    // Ragged DP matrix: alpha[v][jp][dp], only in-band cells. Unreachable states get no rows.
+    let mut alpha: Vec<Vec<Vec<f32>>> = vec![Vec::new(); m];
+    for v in 0..m {
+        if b.jmin[v] < 0 {
+            continue; // unreachable state
+        }
+        let njp = (b.jmax[v] - b.jmin[v] + 1) as usize;
+        let mut rows = Vec::with_capacity(njp);
+        for jp in 0..njp {
+            let w = (b.hdmax[v][jp] - b.hdmin[v][jp] + 1).max(0) as usize;
+            rows.push(vec![IMPOSSIBLE; w]);
+        }
+        alpha[v] = rows;
+    }
+
+    // In-band cell lookup: platonic alpha[y][j][d] -> ragged value, or None if out of band.
+    let cell = |alpha: &[Vec<Vec<f32>>], y: usize, j: i32, d: i32| -> Option<f32> {
+        if b.jmin[y] < 0 || j < b.jmin[y] || j > b.jmax[y] {
+            return None;
+        }
+        let jp = (j - b.jmin[y]) as usize;
+        if d < b.hdmin[y][jp] || d > b.hdmax[y][jp] {
+            return None;
+        }
+        Some(alpha[y][jp][(d - b.hdmin[y][jp]) as usize])
+    };
+
+    for v in (0..m).rev() {
+        if b.jmin[v] < 0 {
+            continue;
+        }
+        let sttype = cm.sttype[v];
+        let jminv = b.jmin[v];
+
+        if sttype == st::E {
+            for jp in 0..alpha[v].len() {
+                // E: d == 0 only (hdmin == hdmax == 0).
+                alpha[v][jp][0] = 0.0;
+            }
+            continue;
+        }
+        if sttype == st::B {
+            let w = cm.cfirst[v] as usize; // left  (BEGL_S)
+            let z = cm.cnum[v] as usize; // right (BEGR_S)
+            if b.jmin[w] < 0 || b.jmin[z] < 0 {
+                continue;
+            }
+            for jp_v in 0..alpha[v].len() {
+                let j = jp_v as i32 + jminv;
+                if j < b.jmin[z] || j > b.jmax[z] {
+                    continue;
+                }
+                let hdminv = b.hdmin[v][jp_v];
+                for dp_v in 0..alpha[v][jp_v].len() {
+                    let d = dp_v as i32 + hdminv;
+                    let mut best = IMPOSSIBLE;
+                    // k = length of the right (z) fragment; left (w) spans j-k, d-k.
+                    for k in 0..=d {
+                        let (Some(left), Some(right)) =
+                            (cell(&alpha, w, j - k, d - k), cell(&alpha, z, j, k))
+                        else {
+                            continue;
+                        };
+                        best = best.max(cyk_add(left, right));
+                    }
+                    alpha[v][jp_v][dp_v] = best;
+                }
+            }
+            continue;
+        }
+
+        // ML, MR, MP, IL, IR, D, S: max over children (+ self for inserts), then emission.
+        let sd = n_emit(sttype) as i32;
+        let sdr = if emits_right(sttype) { 1 } else { 0 };
+        let cfirst = cm.cfirst[v] as usize;
+        let cnum = cm.cnum[v] as usize;
+        let tsc = &cm.tsc[v];
+        let single = oesc.single[v].as_deref();
+        let pairtab = oesc.pair[v].as_deref();
+
+        for jp_v in 0..alpha[v].len() {
+            let j = jp_v as i32 + jminv;
+            let hdminv = b.hdmin[v][jp_v];
+            // d ascending so insert self-transitions read the finalized d-1 cell.
+            for dp_v in 0..alpha[v][jp_v].len() {
+                let d = dp_v as i32 + hdminv;
+                let mut best = IMPOSSIBLE;
+                for yoff in 0..cnum {
+                    let y = cfirst + yoff;
+                    if let Some(child) = cell(&alpha, y, j - sdr, d - sd) {
+                        best = best.max(cyk_add(child, tsc[yoff]));
+                    }
+                }
+                let i = j - d + 1; // window-local left position
+                let emit = match sttype {
+                    st::ML | st::IL => single.unwrap()[dsq[i as usize] as usize],
+                    st::MR | st::IR => single.unwrap()[dsq[j as usize] as usize],
+                    st::MP => {
+                        pairtab.unwrap()[dsq[i as usize] as usize * kp + dsq[j as usize] as usize]
+                    }
+                    _ => 0.0, // D, S
+                };
+                alpha[v][jp_v][dp_v] = if sttype == st::D || sttype == st::S {
+                    best
+                } else {
+                    cyk_add(best, emit)
+                };
+            }
+        }
+    }
+
+    // Glocal alignment: root score is alpha[ROOT_S=0] at the full span (j = L, d = L).
+    cell(&alpha, 0, l, l).unwrap_or(IMPOSSIBLE)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2301,5 +2450,63 @@ mod tests {
                 bands.hdmax[v][jp]
             );
         }
+    }
+
+    /// Milestone 5: the doubly-ragged HMM-banded CYK must produce a score **byte-identical** to the
+    /// unbanded CYK on both the consensus and a real tRNA — the bands (which contain the optimal
+    /// parse, per 4b) prune the matrix without changing the optimum.
+    #[test]
+    fn cyk_banded_matches_unbanded() {
+        use crate::align::align_glocal;
+        use crate::search::cyk_search;
+
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/tRNA.cm");
+        let mut cm = parse_cm_file(path).expect("parse tRNA.cm");
+        configure_scores(&mut cm);
+        let map = build_cp9_map(&cm);
+        let scores = Cp9Scores::from_cp9(&build_cp9(&cm));
+        let emap = EmitMap::build(&cm);
+
+        // Build a window sub-dsq (1-based, own sentinels) and compare banded vs unbanded CYK on it.
+        let check = |cm: &Cm, wdsq: &[Dsq]| {
+            let l = wdsq.len() - 2;
+            let unbanded = align_glocal(cm, wdsq, 1, l, &emap).score;
+            let bands = cp9_seq2bands(cm, &map, &scores, wdsq, 1e-7, false);
+            let banded = cyk_banded_align(cm, wdsq, &bands);
+            assert_eq!(
+                banded.to_bits(),
+                unbanded.to_bits(),
+                "banded CYK {banded} != unbanded {unbanded}"
+            );
+        };
+
+        // 1. The model consensus (the whole sequence is the window).
+        let cons = ornament_alphabet::read_fasta(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/data/trna_cons.fa"
+        ))
+        .expect("read cons")[0]
+            .seq
+            .clone();
+        check(&cm, &cm.abc.digitize(&cons).expect("digitize"));
+
+        // 2. A real embedded tRNA: locate it with the unbanded scanner, then window it out.
+        let seq = ornament_alphabet::read_fasta(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/data/trna_embedded.fa"
+        ))
+        .expect("read embedded")[0]
+            .seq
+            .clone();
+        let dsq = cm.abc.digitize(&seq).expect("digitize");
+        let hit = cyk_search(&cm, &dsq, cm.w as usize, 10.0)
+            .into_iter()
+            .filter(|h| matches!(h.strand, crate::search::Strand::Plus))
+            .max_by(|a, c| a.score.partial_cmp(&c.score).unwrap())
+            .expect("a forward-strand tRNA hit");
+        let mut wdsq = vec![dsq[0]];
+        wdsq.extend_from_slice(&dsq[hit.i..=hit.j]);
+        wdsq.push(dsq[dsq.len() - 1]);
+        check(&cm, &wdsq);
     }
 }
