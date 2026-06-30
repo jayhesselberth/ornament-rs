@@ -12,7 +12,10 @@ use std::hint::black_box;
 
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use easel_rs::Alphabet;
-use hmmer_rs::{forward_bits, msv_bits, parse_p7_hmm, viterbi_bits, P7Hmm};
+use hmmer_rs::profile::bg_freqs;
+use hmmer_rs::{
+    forward_bits, forward_nats, msv_bits, parse_p7_hmm, viterbi_bits, P7Hmm, P7Profile,
+};
 
 /// Deterministic pseudo-random RNA text of length `n` (xorshift; no external RNG).
 fn pseudo_rna(n: usize, seed: u64) -> String {
@@ -56,6 +59,21 @@ fn bench_filters(c: &mut Criterion) {
         b.iter(|| forward_bits(black_box(&hmm), black_box(&abc), black_box(&dsq)))
     });
     g.finish();
+
+    // DP-only comparison (profile pre-built, as in the windowing pipeline): the log-space
+    // Forward vs the striped-SSE odds-space Forward, isolating the SIMD kernel speedup.
+    let prof = P7Profile::config_local(&hmm, &abc, &bg_freqs(hmm.k), l);
+    let mut gd = c.benchmark_group("p7_forward_dp");
+    gd.throughput(Throughput::Elements(l as u64));
+    gd.bench_function("log_space", |b| {
+        b.iter(|| forward_nats(black_box(&prof), black_box(&dsq)))
+    });
+    #[cfg(target_arch = "x86_64")]
+    {
+        let sp = hmmer_rs::StripedProfile::new(&prof);
+        gd.bench_function("striped_sse", |b| b.iter(|| sp.score_nats(black_box(&dsq))));
+    }
+    gd.finish();
 }
 
 criterion_group!(benches, bench_filters);

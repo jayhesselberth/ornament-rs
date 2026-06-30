@@ -18,6 +18,7 @@
 //! not bounded by the other two and is calibrated on its own Gumbel scale.
 
 pub mod fwd;
+pub mod fwd_simd;
 pub mod hmm;
 pub mod logsum;
 pub mod msv;
@@ -26,6 +27,9 @@ pub mod pvalue;
 pub mod vit;
 
 pub use fwd::{forward_bits, forward_nats, viterbi_nats};
+pub use fwd_simd::forward_odds_nats;
+#[cfg(target_arch = "x86_64")]
+pub use fwd_simd::{forward_striped_nats, StripedProfile};
 pub use hmm::{parse_p7_hmm, EvParam, P7Hmm};
 pub use msv::{msv_bits, msv_nats};
 pub use profile::P7Profile;
