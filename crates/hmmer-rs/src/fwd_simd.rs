@@ -170,6 +170,7 @@ const VF: usize = 4;
 /// (cheap, no `exp`). This is what lets the windowing pipeline reuse one striped profile across
 /// every tile instead of rebuilding it per window.
 #[cfg(target_arch = "x86_64")]
+#[derive(Clone)]
 pub struct StripedProfile {
     q: usize,
     /// Match-emission odds per residue: `rfv[x]` is `Q` vectors.

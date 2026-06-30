@@ -24,8 +24,8 @@
 //! from the CM core exactly as in [`crate::search::cyk_search`].
 
 use easel_rs::Dsq;
-use hmmer_rs::profile::{bg_freqs, null_one, P7Profile};
-use hmmer_rs::{forward_nats, forward_pvalue, parse_p7_hmm, P7Hmm};
+use hmmer_rs::profile::{bg_freqs, P7Profile};
+use hmmer_rs::{forward_pvalue, parse_p7_hmm, P7Hmm};
 use rayon::prelude::*;
 
 use crate::evalues::{evalue, SearchMode};
@@ -102,12 +102,14 @@ pub fn cm_pipeline_search(
         return Ok((Vec::new(), stats));
     }
 
-    // Configure the p7 Forward filter once; the per-tile filter clones it to reconfigure the
-    // length model (so the tile sweep can run in parallel), and the immutable base is shared
-    // read-only across both strands.
+    // Configure the p7 Forward filter once. On x86_64 this builds the striped-SSE odds-space
+    // profile (the per-tile sweep clones it cheaply and resets only the length model); the
+    // length-independent base is shared read-only across both strands.
     let hmm = parse_filter_hmm(cm)?;
     let bg = bg_freqs(hmm.k);
     let prof = P7Profile::config_local(&hmm, cm.abc.as_ref(), &bg, l);
+    let nj = prof.nj;
+    let filt = fwdfilter::build(&prof);
     let w = w_max.min(l).max(1);
     let searched = 2.0 * l as f64;
     let do_inside = params.do_inside;
@@ -123,7 +125,7 @@ pub fn cm_pipeline_search(
     // strands run concurrently via `rayon::join`. Output is order-independent: hits are sorted
     // below, so the result is identical regardless of thread count.
     let plus = || {
-        let (surv, nw) = strand_survivors(&prof, &hmm, dsq, w, params.f3);
+        let (surv, nw) = strand_survivors(&filt, nj, &hmm, dsq, w, params.f3);
         let hits: Vec<Hit> = surv
             .par_iter()
             .flat_map_iter(|&(s, e)| {
@@ -142,7 +144,7 @@ pub fn cm_pipeline_search(
         (surv, nw, hits)
     };
     let minus = || {
-        let (surv, nw) = strand_survivors(&prof, &hmm, &rc, w, params.f3);
+        let (surv, nw) = strand_survivors(&filt, nj, &hmm, &rc, w, params.f3);
         let hits: Vec<Hit> = surv
             .par_iter()
             .flat_map_iter(|&(s, e)| {
@@ -211,7 +213,8 @@ fn parse_filter_hmm(cm: &Cm) -> Result<P7Hmm, InfernalError> {
 /// Tiling is length `2W`, step `W` (overlap `W`) so every length-`≤W` hit is contained in
 /// at least one tile. Survivors are padded by `W` and merged into maximal disjoint regions.
 fn strand_survivors(
-    prof: &P7Profile,
+    filt: &fwdfilter::Profile,
+    nj: f32,
     hmm: &P7Hmm,
     dsq: &[Dsq],
     w: usize,
@@ -233,14 +236,14 @@ fn strand_survivors(
         start += step;
     }
 
-    // Score each tile's Forward filter independently. Each task clones the profile so it can
-    // reconfigure the length model without contention; the order-preserving collect keeps the
-    // subsequent merge (which assumes non-decreasing `start`) deterministic.
+    // Score each tile's Forward filter independently. Each task clones the (length-independent)
+    // filter profile and resets only its length model, so the tiles run in parallel without
+    // contention; the order-preserving collect keeps the subsequent merge (which assumes
+    // non-decreasing `start`) deterministic.
     let kept: Vec<Option<(usize, usize)>> = tiles
         .par_iter()
         .map(|&(s, e)| {
-            let mut p = prof.clone();
-            if forward_pvalue(hmm, window_forward_bits(&mut p, dsq, s, e)) <= f3 {
+            if forward_pvalue(hmm, fwdfilter::window_bits(filt, nj, dsq, s, e)) <= f3 {
                 let ps = s.saturating_sub(w).max(1);
                 let pe = (e + w).min(l);
                 Some((ps, pe))
@@ -257,13 +260,62 @@ fn strand_survivors(
     (survivors, tiles.len())
 }
 
-/// Forward **bit** score of `dsq[start..=end]` against the length-reconfigured profile,
-/// matching [`hmmer_rs::forward_bits`] but reusing the prebuilt profile.
-fn window_forward_bits(prof: &mut P7Profile, dsq: &[Dsq], start: usize, end: usize) -> f32 {
-    let len = end - start + 1;
-    let sub = subseq(dsq, start, end);
-    prof.reconfig_length(len);
-    (forward_nats(prof, &sub) - null_one(len)) / std::f32::consts::LN_2
+/// The p7 Forward filter, abstracted over its implementation: the striped-SSE odds-space
+/// kernel on x86_64, the scalar log-space DP elsewhere. `build` makes the length-independent
+/// profile once; `window_bits` scores `dsq[start..=end]` (cloning the profile and resetting
+/// only its length model so tiles can run in parallel) and returns the Forward **bit** score,
+/// matching [`hmmer_rs::forward_bits`].
+#[cfg(target_arch = "x86_64")]
+mod fwdfilter {
+    use super::{subseq, Dsq, P7Profile};
+    use hmmer_rs::profile::null_one;
+
+    pub(super) type Profile = hmmer_rs::StripedProfile;
+
+    pub(super) fn build(prof: &P7Profile) -> Profile {
+        hmmer_rs::StripedProfile::new(prof)
+    }
+
+    pub(super) fn window_bits(
+        base: &Profile,
+        nj: f32,
+        dsq: &[Dsq],
+        start: usize,
+        end: usize,
+    ) -> f32 {
+        let len = end - start + 1;
+        let sub = subseq(dsq, start, end);
+        let mut sp = base.clone();
+        sp.set_length(len, nj);
+        (sp.score_nats(&sub) - null_one(len)) / std::f32::consts::LN_2
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+mod fwdfilter {
+    use super::{subseq, Dsq, P7Profile};
+    use hmmer_rs::forward_nats;
+    use hmmer_rs::profile::null_one;
+
+    pub(super) type Profile = P7Profile;
+
+    pub(super) fn build(prof: &P7Profile) -> Profile {
+        prof.clone()
+    }
+
+    pub(super) fn window_bits(
+        base: &Profile,
+        _nj: f32,
+        dsq: &[Dsq],
+        start: usize,
+        end: usize,
+    ) -> f32 {
+        let len = end - start + 1;
+        let sub = subseq(dsq, start, end);
+        let mut p = base.clone();
+        p.reconfig_length(len);
+        (forward_nats(&p, &sub) - null_one(len)) / std::f32::consts::LN_2
+    }
 }
 
 /// Build a standalone digital sub-sequence for `dsq[start..=end]` with fresh sentinels at 0
