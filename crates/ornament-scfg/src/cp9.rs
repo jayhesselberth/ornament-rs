@@ -843,14 +843,14 @@ pub(crate) fn cp9_backward(s: &Cp9Scores, dsq: &[Dsq]) -> (Cp9Mx, f64) {
         mmx[i][0] = b;
     }
 
-    // Row 0 (B before the first residue): the total. Deletes here emit nothing.
-    let mut d0 = vec![ninf; m + 1];
-    d0[m] = imx[1][m] + s.tsc[m][CTDI];
+    // Row 0 (B before the first residue): the total. Deletes here emit nothing; stored into the
+    // matrix (dmx[0][k], mmx[0][0]) so the band computation can use the position-0 boundary.
+    dmx[0][m] = imx[1][m] + s.tsc[m][CTDI];
     for k in (1..m).rev() {
-        d0[k] = logsum3(
+        dmx[0][k] = logsum3(
             mmx[1][k + 1] + s.tsc[k][CTDM],
             imx[1][k] + s.tsc[k][CTDI],
-            d0[k + 1] + s.tsc[k][CTDD],
+            dmx[0][k + 1] + s.tsc[k][CTDD],
         );
     }
     let mut total = ninf;
@@ -858,7 +858,8 @@ pub(crate) fn cp9_backward(s: &Cp9Scores, dsq: &[Dsq]) -> (Cp9Mx, f64) {
         total = logsum(total, mmx[1][k] + s.bsc[k]);
     }
     total = logsum(total, imx[1][0] + s.tsc[0][CTMI]);
-    total = logsum(total, d0[1] + s.tsc[0][CTMD]);
+    total = logsum(total, dmx[0][1] + s.tsc[0][CTMD]);
+    mmx[0][0] = total; // B is occupied at position 0 in every parse
     (Cp9Mx { mmx, imx, dmx }, total)
 }
 
@@ -890,6 +891,129 @@ pub(crate) fn cp9_posterior(
         }
     }
     Cp9Mx { mmx, imx, dmx }
+}
+
+/// HMM **position bands** — for each CP9 node `k`, the band `[pn_min, pn_max]` of sequence
+/// positions its match / insert / delete state can occupy (a port of `cp9_FB2HMMBands`). A state
+/// with no posterior mass leaves both at `-1`.
+pub(crate) struct HmmBands {
+    pub m: usize,
+    pub pn_min_m: Vec<i32>,
+    pub pn_max_m: Vec<i32>,
+    pub pn_min_i: Vec<i32>,
+    pub pn_max_i: Vec<i32>,
+    pub pn_min_d: Vec<i32>,
+    pub pn_max_d: Vec<i32>,
+}
+
+/// Log posterior that node `k`'s match state occupies position `ip` (`0` = before the sequence,
+/// where only the non-emitting B state lives).
+fn post_m(
+    s: &Cp9Scores,
+    dsq: &[Dsq],
+    f: &Cp9Mx,
+    b: &Cp9Mx,
+    total: f64,
+    ip: usize,
+    k: usize,
+) -> f64 {
+    if ip == 0 {
+        return if k == 0 { 0.0 } else { f64::NEG_INFINITY };
+    }
+    if k == 0 {
+        return f64::NEG_INFINITY;
+    }
+    f.mmx[ip][k] + b.mmx[ip][k] - s.msc[k][dsq[ip] as usize] - total
+}
+
+fn post_i(
+    s: &Cp9Scores,
+    dsq: &[Dsq],
+    f: &Cp9Mx,
+    b: &Cp9Mx,
+    total: f64,
+    ip: usize,
+    k: usize,
+) -> f64 {
+    if ip == 0 {
+        return f64::NEG_INFINITY; // inserts always emit
+    }
+    f.imx[ip][k] + b.imx[ip][k] - s.isc[k][dsq[ip] as usize] - total
+}
+
+fn post_d(
+    _s: &Cp9Scores,
+    _dsq: &[Dsq],
+    f: &Cp9Mx,
+    b: &Cp9Mx,
+    total: f64,
+    ip: usize,
+    k: usize,
+) -> f64 {
+    f.dmx[ip][k] + b.dmx[ip][k] - total // deletes don't emit; row 0 is the all-delete prefix
+}
+
+/// Scan a state's per-position posterior for the band edges: `pn_min` = leftmost position whose
+/// left-cumulative posterior mass exceeds the excluded-tail threshold, `pn_max` = rightmost from
+/// the right. `-1` if the state never accumulates enough mass (effectively unused).
+fn band_edges(l: usize, thresh: f64, post: impl Fn(usize) -> f64) -> (i32, i32) {
+    let ninf = f64::NEG_INFINITY;
+    let mut pn_min = -1;
+    let mut mass = ninf;
+    for ip in 0..=l {
+        mass = logsum(mass, post(ip));
+        if mass > thresh {
+            pn_min = ip as i32;
+            break;
+        }
+    }
+    let mut pn_max = -1;
+    mass = ninf;
+    for ip in (0..=l).rev() {
+        mass = logsum(mass, post(ip));
+        if mass > thresh {
+            pn_max = ip as i32;
+            break;
+        }
+    }
+    (pn_min, pn_max)
+}
+
+/// Posterior → HMM position bands (`cp9_FB2HMMBands`). `tau` is the per-side tail probability
+/// excluded from each band (Infernal's `cm->tau`, default ~1e-7 → very wide, safe bands): the
+/// band covers all but `tau` of each state's posterior mass.
+pub(crate) fn cp9_fb2hmmbands(
+    s: &Cp9Scores,
+    dsq: &[Dsq],
+    fmx: &Cp9Mx,
+    bmx: &Cp9Mx,
+    total: f64,
+    tau: f64,
+) -> HmmBands {
+    let m = s.m;
+    let l = dsq.len() - 2;
+    let thresh = (tau / 2.0).ln(); // excluded mass on each side = (1 − (1−tau))/2 = tau/2
+    let mut bands = HmmBands {
+        m,
+        pn_min_m: vec![-1; m + 1],
+        pn_max_m: vec![-1; m + 1],
+        pn_min_i: vec![-1; m + 1],
+        pn_max_i: vec![-1; m + 1],
+        pn_min_d: vec![-1; m + 1],
+        pn_max_d: vec![-1; m + 1],
+    };
+    for k in 0..=m {
+        let (mn, mx) = band_edges(l, thresh, |ip| post_m(s, dsq, fmx, bmx, total, ip, k));
+        bands.pn_min_m[k] = mn;
+        bands.pn_max_m[k] = mx;
+        let (mn, mx) = band_edges(l, thresh, |ip| post_i(s, dsq, fmx, bmx, total, ip, k));
+        bands.pn_min_i[k] = mn;
+        bands.pn_max_i[k] = mx;
+        let (mn, mx) = band_edges(l, thresh, |ip| post_d(s, dsq, fmx, bmx, total, ip, k));
+        bands.pn_min_d[k] = mn;
+        bands.pn_max_d[k] = mx;
+    }
+    bands
 }
 
 #[cfg(test)]
@@ -1208,6 +1332,45 @@ mod tests {
             assert!(
                 (p - 1.0).abs() < 1e-4,
                 "position {i}: posterior mass {p} != 1"
+            );
+        }
+    }
+
+    /// HMM position bands on the model consensus: since the consensus aligns 1:1 to the model
+    /// (length == M), node `k`'s match state emits position `k`, so the band `[pn_min_m, pn_max_m]`
+    /// must contain `k`. Bands are also well-formed (`min ≤ max`).
+    #[test]
+    fn cp9_hmm_bands_contain_consensus_diagonal() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/tRNA.cm");
+        let mut cm = parse_cm_file(path).expect("parse tRNA.cm");
+        configure_scores(&mut cm);
+        let scores = Cp9Scores::from_cp9(&build_cp9(&cm));
+
+        let cons = ornament_alphabet::read_fasta(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/data/trna_cons.fa"
+        ))
+        .expect("read cons")[0]
+            .seq
+            .clone();
+        let dsq = cm.abc.digitize(&cons).expect("digitize");
+        let l = dsq.len() - 2;
+        assert_eq!(
+            l, scores.m,
+            "consensus length should equal the model length M"
+        );
+
+        let (fmx, fsc) = cp9_forward(&scores, &dsq);
+        let (bmx, _) = cp9_backward(&scores, &dsq);
+        let bands = cp9_fb2hmmbands(&scores, &dsq, &fmx, &bmx, fsc, 1e-7);
+
+        for k in 1..=scores.m {
+            let (mn, mx) = (bands.pn_min_m[k], bands.pn_max_m[k]);
+            assert!(mn >= 0 && mx >= 0, "node {k} match band unset");
+            assert!(mn <= mx, "node {k} match band inverted {mn}..{mx}");
+            assert!(
+                mn <= k as i32 && k as i32 <= mx,
+                "node {k} match band {mn}..{mx} excludes diagonal position {k}"
             );
         }
     }
