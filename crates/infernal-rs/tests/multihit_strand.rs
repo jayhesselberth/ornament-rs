@@ -9,7 +9,9 @@
 //! significant hits on the correct strands, coordinates, scores, and E-values.
 
 use easel_rs::{read_fasta, Alphabet};
-use infernal_rs::{configure_local, cyk_search, parse_cm_file, Strand};
+use infernal_rs::{
+    calc_qdb_bands, configure_local, cyk_search, cyk_search_banded, parse_cm_file, QdbBands, Strand,
+};
 
 #[derive(Debug)]
 struct Oracle {
@@ -115,4 +117,32 @@ fn multihit_both_strands_match_oracle() {
             "sorted by E-value"
         );
     }
+}
+
+/// The query-dependent-banded brute search must return exactly what the unbanded brute search
+/// returns — the bands keep every real hit's optimal parse in range. This is the non-pipeline
+/// counterpart of `pipeline::pipeline_matches_bruteforce` (which proves it for the windowing
+/// path), and it guards `cyk_search_banded` (used by `ornament-core`'s native scan).
+#[test]
+fn banded_brute_matches_unbanded() {
+    let cm_path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/tRNA.cm");
+    let mut cm = parse_cm_file(cm_path).expect("parse tRNA.cm");
+    configure_local(&mut cm);
+
+    let abc = Alphabet::rna();
+    let fa = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/trna_multi.fa");
+    let dsq = abc
+        .digitize(&read_fasta(fa).expect("read fasta")[0].seq)
+        .expect("digitize");
+
+    let w = cm.w as usize;
+    let bands = calc_qdb_bands(&cm, QdbBands::DEFAULT_BETA);
+    let unbanded = cyk_search(&cm, &dsq, w, 20.0);
+    let banded = cyk_search_banded(&cm, &dsq, w, 20.0, &bands);
+
+    assert!(!unbanded.is_empty(), "expected hits to compare");
+    assert_eq!(
+        banded, unbanded,
+        "banded brute search differs from unbanded"
+    );
 }

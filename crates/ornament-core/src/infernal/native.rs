@@ -11,7 +11,9 @@ use anyhow::{anyhow, Result};
 use rayon::prelude::*;
 use std::path::Path;
 
-use infernal_rs::{configure_local, cyk_search, parse_cm_file, Strand};
+use infernal_rs::{
+    calc_qdb_bands, configure_local, cyk_search_banded, parse_cm_file, QdbBands, Strand,
+};
 
 use super::CMHit;
 
@@ -43,6 +45,10 @@ pub fn scan_native<P: AsRef<Path>, Q: AsRef<Path>>(
     let w_max = cm.w as usize;
     let query_name = cm.name.clone();
 
+    // Query-dependent bands: computed once for the model and shared read-only across every
+    // record scan. They give identical hits to the unbanded scan at a fraction of the cost.
+    let bands = calc_qdb_bands(&cm, QdbBands::DEFAULT_BETA);
+
     // Records are independent scans — search them in parallel. The per-record collect is
     // order-preserving, so the flattened result is identical regardless of thread count.
     let per_record: Vec<Vec<CMHit>> = records
@@ -54,7 +60,7 @@ pub fn scan_native<P: AsRef<Path>, Q: AsRef<Path>>(
                 .map_err(|e| anyhow!("failed to digitize sequence {}: {e}", rec.name))?;
 
             let mut rec_hits = Vec::new();
-            for h in cyk_search(&cm, &dsq, w_max, REPORTING_BITS) {
+            for h in cyk_search_banded(&cm, &dsq, w_max, REPORTING_BITS, &bands) {
                 // Filter on E-value when the model is calibrated (mirrors `cmsearch -E`).
                 if let Some(ev) = h.evalue {
                     if ev > e_value {

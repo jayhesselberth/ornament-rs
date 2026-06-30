@@ -26,9 +26,10 @@ pub use emitmap::EmitMap;
 pub use evalues::{evalue, score_to_evalue, SearchMode};
 pub use model::{Cm, ExpInfo};
 pub use pipeline::{cm_pipeline_inside, cm_pipeline_search, PipelineParams, PipelineStats};
+pub use qdb::{calc_qdb_bands, QdbBands};
 pub use search::{
-    cyk_scan, cyk_scan_glocal, cyk_search, inside_scan, inside_scan_glocal, inside_search, CykHit,
-    CykScan, Hit, Strand,
+    cyk_scan, cyk_scan_glocal, cyk_search, cyk_search_banded, inside_scan, inside_scan_glocal,
+    inside_search, inside_search_banded, CykHit, CykScan, Hit, Strand,
 };
 
 use thiserror::Error;
