@@ -4,10 +4,9 @@
 //! `hmmband.c`, built up in milestones:
 //!
 //!   1. **expected state occupancy** (`psi`) — the foundation of the CM→CP9 parameter mapping.  ✓
-//!   2. the CP9 HMM construction: (a) the **CM↔CP9 map** (which CM states map to each CP9 node's
-//!      match/insert/delete) ← here, then (b) the occupancy-weighted emission + transition
-//!      parameters, validated psi-vs-phi.
-//!   3. CP9 Forward / Backward + posteriors.
+//!   2. the CP9 HMM construction — CM↔CP9 map, occupancy-weighted emissions, subpath-summation
+//!      transitions + begin/end — validated by the psi-vs-phi occupancy check (`build_cp9`).  ✓
+//!   3. CP9 Forward / Backward + posteriors.  ← next
 //!   4. posteriors → HMM position bands → CM i,j bands → per-j d-bands (`hdmin`/`hdmax`).
 //!   5. the doubly-ragged (j- and d-banded) CYK kernel that consumes them.
 //!
@@ -502,17 +501,135 @@ fn fill_interior_transitions(cm: &Cm, map: &Cp9Map, hmm: &mut Cp9, k: usize, psi
     }
 }
 
-/// Build the CP9 emissions and the **interior-node transitions** (`1 ≤ k < M`). Node 0 / node M
-/// special transitions and the begin/end distributions are the next milestone, so the boundary
-/// nodes' transitions are left zero here.
-pub(crate) fn build_cp9_interior(cm: &Cm) -> Cp9 {
+/// Normalize a 3-transition out-block (`insert` at offset 4, `delete` at offset 7) to sum to 1.
+fn normalize_block(t: &mut [f64; 10], off: usize) {
+    let s: f64 = t[off..off + 3].iter().sum();
+    if s > 0.0 {
+        for x in t[off..off + 3].iter_mut() {
+            *x /= s;
+        }
+    }
+}
+
+/// Fill the **special** boundary transitions — a port of `cm2hmm_special_trans_cp9`. Node 0 is
+/// the begin node (B = ROOT_S, N = ROOT_IL): its M→M virtual count becomes `begin[1]` and the
+/// rest are the leading N transitions. Node M is the end node: its M/I/D → E counts become the
+/// `end[M]` / insert / delete out-transitions. There is no D_0, and several node-M transitions
+/// (M→D, I→D, D→D) are illegal and left at 0. Each boundary node's out-blocks are then normalized.
+fn fill_special_transitions(cm: &Cm, map: &Cp9Map, hmm: &mut Cp9, psi: &[f64]) {
+    let m = hmm.m;
+
+    // ---- Node 0: transitions into node 1 (B and N are ROOT_S / ROOT_IL). ----
+    for &(a_ty, b_ty, b_off, idx) in TRANS_SPEC[0..6].iter() {
+        let ap = map.hns2cs[0][a_ty];
+        let bp = map.hns2cs[b_off][b_ty];
+        for &a in ap.iter() {
+            for &b in bp.iter() {
+                add_single_trans(cm, map, hmm, a, b, 0, idx, psi);
+            }
+        }
+    }
+    // B→M1 is the begin distribution, not a t[0][CTMM].
+    hmm.begin[1] = hmm.t[0][CTMM];
+    hmm.t[0][CTMM] = 0.0;
+    // Normalize node 0: all begins + B→N + B→D1 sum to 1; then the N (insert) out-block.
+    let d = hmm.begin[1..=m].iter().sum::<f64>() + hmm.t[0][CTMI] + hmm.t[0][CTMD];
+    if d > 0.0 {
+        for x in hmm.begin[1..=m].iter_mut() {
+            *x /= d;
+        }
+        hmm.t[0][CTMI] /= d;
+        hmm.t[0][CTMD] /= d;
+    }
+    normalize_block(&mut hmm.t[0], 4);
+
+    // ---- Node M: transitions out to the end (E = last CM state). ----
+    let e = (cm.m - 1) as i32; // END_E
+                               // (a-state, b: None = →E, Some = node-M state, idx)
+    let m_pairs = [
+        (HMM_MATCH, None, CTMM),
+        (HMM_MATCH, Some(HMM_INSERT), CTMI),
+        (HMM_INSERT, None, CTIM),
+        (HMM_INSERT, Some(HMM_INSERT), CTII),
+        (HMM_DELETE, None, CTDM),
+        (HMM_DELETE, Some(HMM_INSERT), CTDI),
+    ];
+    for (a_ty, b_opt, idx) in m_pairs {
+        let ap = map.hns2cs[m][a_ty];
+        for &a in ap.iter() {
+            match b_opt {
+                None => add_single_trans(cm, map, hmm, a, e, m, idx, psi),
+                Some(b_ty) => {
+                    for &b in map.hns2cs[m][b_ty].iter() {
+                        add_single_trans(cm, map, hmm, a, b, m, idx, psi);
+                    }
+                }
+            }
+        }
+    }
+    // M→E is the end probability, not t[M][CTMM].
+    hmm.end[m] = hmm.t[m][CTMM];
+    hmm.t[m][CTMM] = 0.0;
+    // Normalize node M's three out-blocks (match incl. end[M], insert, delete).
+    let d = hmm.t[m][0..4].iter().sum::<f64>() + hmm.end[m];
+    if d > 0.0 {
+        for x in hmm.t[m][0..4].iter_mut() {
+            *x /= d;
+        }
+        hmm.end[m] /= d;
+    }
+    normalize_block(&mut hmm.t[m], 4);
+    normalize_block(&mut hmm.t[m], 7);
+}
+
+/// Build the complete CP9 HMM from a CM (emissions + all transitions + begin/end) — the
+/// per-model parameterization (`build_cp9_hmm`). Runs once per model, not per sequence.
+pub(crate) fn build_cp9(cm: &Cm) -> Cp9 {
     let map = build_cp9_map(cm);
     let psi = expected_occupancy(cm);
     let mut hmm = build_cp9_emissions(cm);
     for k in 1..hmm.m {
         fill_interior_transitions(cm, &map, &mut hmm, k, &psi);
     }
+    fill_special_transitions(cm, &map, &mut hmm, &psi);
     hmm
+}
+
+/// The CP9's **own** expected occupancy `phi[k][match|insert|delete]` — a port of `fill_phi_cp9`
+/// (start position `spos = 1`). A forward recursion through the built CP9: node 0's match (the
+/// begin state B) is entered once; each later state accumulates occupancy from the previous
+/// node's states via the CP9 transitions (plus `begin[k]`), and inserts fold their self-loop.
+/// If the build is correct this reproduces the CM occupancy `psi` summed over the mapped states.
+pub(crate) fn fill_phi(hmm: &Cp9) -> Vec<[f64; 3]> {
+    let m = hmm.m;
+    let mut phi = vec![[0.0f64; 3]; m + 1];
+    let t = &hmm.t;
+
+    phi[0][HMM_MATCH] = 1.0; // B (M_0) is entered in every parse
+    phi[0][HMM_INSERT] = phi[0][HMM_MATCH] * t[0][CTMI];
+    phi[0][HMM_INSERT] += phi[0][HMM_INSERT] * (t[0][CTII] / (1.0 - t[0][CTII]));
+    phi[0][HMM_DELETE] = 0.0;
+
+    for k in 1..=m {
+        phi[k][HMM_MATCH] = phi[k - 1][HMM_MATCH] * t[k - 1][CTMM]
+            + phi[k - 1][HMM_DELETE] * t[k - 1][CTDM]
+            + phi[k - 1][HMM_INSERT] * t[k - 1][CTIM]
+            + hmm.begin[k];
+        // Deletes before inserts (an insert can follow this node's delete).
+        phi[k][HMM_DELETE] = phi[k - 1][HMM_MATCH] * t[k - 1][CTMD]
+            + phi[k - 1][HMM_INSERT] * t[k - 1][CTID]
+            + phi[k - 1][HMM_DELETE] * t[k - 1][CTDD];
+        phi[k][HMM_INSERT] = phi[k][HMM_MATCH] * t[k][CTMI] + phi[k][HMM_DELETE] * t[k][CTDI];
+        phi[k][HMM_INSERT] += phi[k][HMM_INSERT] * (t[k][CTII] / (1.0 - t[k][CTII]));
+    }
+    phi
+}
+
+/// True if some base pair is modelled across two *adjacent* consensus columns (one MATP node
+/// owning columns `k` and `k+1`) — a port of `check_cm_adj_bp`. The CP9 can't cleanly mirror that
+/// node's single insert, so Infernal relaxes the psi-vs-phi check for such models.
+pub(crate) fn has_adjacent_basepair(map: &Cp9Map) -> bool {
+    (2..=map.hmm_m).any(|k| map.pos2nd[k] == map.pos2nd[k - 1])
 }
 
 #[cfg(test)]
@@ -675,7 +792,7 @@ mod tests {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/tRNA.cm");
         let mut cm = parse_cm_file(path).expect("parse tRNA.cm");
         configure_scores(&mut cm);
-        let hmm = build_cp9_interior(&cm);
+        let hmm = build_cp9(&cm);
 
         let mut mm_dominant = 0;
         for k in 1..hmm.m {
@@ -711,5 +828,54 @@ mod tests {
             "expected M->M dominant in most columns, got {mm_dominant}/{}",
             hmm.m - 1
         );
+    }
+
+    /// The CP9 build's correctness gate (`check_psi_vs_phi_cp9`): the CP9's own expected
+    /// occupancy `phi[k][state]` must reproduce the CM occupancy `psi` summed over the CM states
+    /// mapping to that CP9 node-state, within Infernal's 1e-4 threshold. This is the strong check
+    /// that the subpath-summation transitions (and the emissions/map/begin/end) are all correct.
+    #[test]
+    fn cp9_psi_matches_phi() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/tRNA.cm");
+        let mut cm = parse_cm_file(path).expect("parse tRNA.cm");
+        configure_scores(&mut cm);
+
+        let map = build_cp9_map(&cm);
+        let psi = expected_occupancy(&cm);
+        let hmm = build_cp9(&cm);
+        let phi = fill_phi(&hmm);
+
+        // tRNA base pairs span loops, so no base pair is on adjacent columns → strict check.
+        assert!(
+            !has_adjacent_basepair(&map),
+            "tRNA has no adjacent-column pairs"
+        );
+
+        let threshold = 1e-4;
+        let mut violations = 0;
+        for k in 0..=map.hmm_m {
+            for (state, name) in [(HMM_MATCH, 'M'), (HMM_INSERT, 'I'), (HMM_DELETE, 'D')] {
+                // Node 0 has no delete state in either model.
+                let summed_psi: f64 = if k == 0 && state == HMM_DELETE {
+                    0.0
+                } else {
+                    (0..2)
+                        .filter_map(|s| {
+                            let ap = map.hns2cs[k][state][s];
+                            (ap >= 0).then(|| psi[ap as usize])
+                        })
+                        .sum()
+                };
+                let diff = (phi[k][state] - summed_psi).abs();
+                if diff > threshold {
+                    violations += 1;
+                    eprintln!(
+                        "{name} k={k}: phi={:.6} psi={:.6} diff={:.2e}",
+                        phi[k][state], summed_psi, diff
+                    );
+                }
+            }
+        }
+        assert_eq!(violations, 0, "{violations} psi-vs-phi violations (>1e-4)");
     }
 }
