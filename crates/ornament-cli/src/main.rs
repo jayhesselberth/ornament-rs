@@ -55,7 +55,8 @@ enum Commands {
         #[arg(short, long)]
         output: Option<String>,
 
-        /// Output format (tsv, json)
+        /// Output format (tsv, json, stockholm). `stockholm` writes a per-model
+        /// alignment of the hits (native engine only).
         #[arg(short, long, default_value = "tsv")]
         format: String,
 
@@ -125,7 +126,9 @@ fn main() -> Result<()> {
             format,
             engine,
         } => {
-            use ornament_core::infernal::{scan_native_multi, write_tsv, InfernalRunner};
+            use ornament_core::infernal::{
+                scan_native_aligned, scan_native_multi, write_stockholm, write_tsv, InfernalRunner,
+            };
 
             // E-value reporting threshold (mirrors `cmsearch -E`).
             const E_VALUE: f64 = 1e-5;
@@ -142,35 +145,58 @@ fn main() -> Result<()> {
                 return Err(anyhow!("CM file not found: {}", cm_path));
             }
 
-            let hits = match engine {
-                Engine::Native => {
-                    eprintln!(
-                        "Scanning {} using {} (native engine, all models)...",
-                        input, cm_path
-                    );
-                    // Runs every model in the .cm file (one, or the whole Rfam collection),
-                    // parallelized across the model × record product.
-                    scan_native_multi(&cm_path, &input, E_VALUE)?
+            let output_str = if format == "stockholm" {
+                // Stockholm output keeps each hit's full alignment, so it uses a distinct
+                // native scan path. The cmsearch subprocess yields no native alignment.
+                if !matches!(engine, Engine::Native) {
+                    return Err(anyhow!(
+                        "--format stockholm requires --engine native \
+                         (the cmsearch subprocess does not produce native alignments)"
+                    ));
                 }
-                Engine::Cmsearch => {
-                    eprintln!(
-                        "Scanning {} for tRNAs using {} (cmsearch subprocess)...",
-                        input, cm_path
-                    );
-                    let runner = InfernalRunner::new()
-                        .with_cm(&cm_path)
-                        .with_e_value(E_VALUE);
-                    runner.cmsearch(&input)?
+                eprintln!(
+                    "Scanning {} using {} (native engine, Stockholm alignment)...",
+                    input, cm_path
+                );
+                let msas = scan_native_aligned(&cm_path, &input, E_VALUE)?;
+                let n_hits: usize = msas.iter().map(|m| m.rows.len()).sum();
+                eprintln!("Found {} hits across {} model(s)", n_hits, msas.len());
+                write_stockholm(&msas)
+            } else {
+                let hits = match engine {
+                    Engine::Native => {
+                        eprintln!(
+                            "Scanning {} using {} (native engine, all models)...",
+                            input, cm_path
+                        );
+                        // Runs every model in the .cm file (one, or the whole Rfam collection),
+                        // parallelized across the model × record product.
+                        scan_native_multi(&cm_path, &input, E_VALUE)?
+                    }
+                    Engine::Cmsearch => {
+                        eprintln!(
+                            "Scanning {} for tRNAs using {} (cmsearch subprocess)...",
+                            input, cm_path
+                        );
+                        let runner = InfernalRunner::new()
+                            .with_cm(&cm_path)
+                            .with_e_value(E_VALUE);
+                        runner.cmsearch(&input)?
+                    }
+                };
+
+                eprintln!("Found {} hits", hits.len());
+
+                match format.as_str() {
+                    "json" => serde_json::to_string_pretty(&hits)?,
+                    "tsv" => write_tsv(&hits),
+                    _ => {
+                        return Err(anyhow!(
+                            "Unknown format: {}. Use 'tsv', 'json', or 'stockholm'",
+                            format
+                        ))
+                    }
                 }
-            };
-
-            eprintln!("Found {} hits", hits.len());
-
-            // Format output
-            let output_str = match format.as_str() {
-                "json" => serde_json::to_string_pretty(&hits)?,
-                "tsv" => write_tsv(&hits),
-                _ => return Err(anyhow!("Unknown format: {}. Use 'json' or 'tsv'", format)),
             };
 
             // Write output

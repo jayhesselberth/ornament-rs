@@ -7,8 +7,10 @@ pub mod native;
 pub mod parser;
 pub mod report;
 pub mod runner;
+pub mod stockholm;
 
-pub use native::{scan_native, scan_native_multi};
+pub use native::{scan_native, scan_native_aligned, scan_native_multi};
 pub use parser::{CMAlignment, CMHit};
 pub use report::{write_tsv, TSV_HEADER};
 pub use runner::InfernalRunner;
+pub use stockholm::{write_stockholm, AlignedRow, ModelMsa, ResCell};

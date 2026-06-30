@@ -21,6 +21,13 @@ pub struct AlignedResidue {
     pub consensus: Option<usize>,
     /// True for a paired (MP) emission, useful for reconstructing SS_cons.
     pub paired: bool,
+    /// For an insert residue (`consensus == None`), the consensus column this insert
+    /// follows in the multiple alignment: IL after `lpos[nd]`, IR after `rpos[nd]-1`
+    /// (Infernal's `Parsetrees2Alignment` insert-column convention). `None` for matches.
+    pub insert_after: Option<usize>,
+    /// True for an IR (right) insert, which is right-flushed *after* the IL inserts that
+    /// share the same gap (`insert_after`). `false` for IL inserts and match residues.
+    pub insert_right: bool,
 }
 
 /// Result of aligning a hit window.
@@ -176,25 +183,26 @@ fn align_glocal_impl(
         match sttype {
             st::ML | st::IL => {
                 let p = j - d + 1; // local left position
+                let is_match = sttype == st::ML;
                 residues.push(AlignedResidue {
                     seq_pos: i0 + p - 1,
-                    consensus: if sttype == st::ML {
-                        Some(emap.lpos[nd] as usize)
-                    } else {
-                        None
-                    },
+                    consensus: is_match.then(|| emap.lpos[nd] as usize),
                     paired: false,
+                    // IL inserts follow the node's left consensus column.
+                    insert_after: (!is_match).then(|| emap.lpos[nd] as usize),
+                    insert_right: false,
                 });
             }
             st::MR | st::IR => {
+                let is_match = sttype == st::MR;
                 residues.push(AlignedResidue {
                     seq_pos: i0 + j - 1,
-                    consensus: if sttype == st::MR {
-                        Some(emap.rpos[nd] as usize)
-                    } else {
-                        None
-                    },
+                    consensus: is_match.then(|| emap.rpos[nd] as usize),
                     paired: false,
+                    // IR inserts precede the node's right column, i.e. follow `rpos-1`,
+                    // and are right-flushed within the gap (Parsetrees2Alignment).
+                    insert_after: (!is_match).then(|| (emap.rpos[nd] - 1) as usize),
+                    insert_right: !is_match,
                 });
             }
             st::MP => {
@@ -203,11 +211,15 @@ fn align_glocal_impl(
                     seq_pos: i0 + p - 1,
                     consensus: Some(emap.lpos[nd] as usize),
                     paired: true,
+                    insert_after: None,
+                    insert_right: false,
                 });
                 residues.push(AlignedResidue {
                     seq_pos: i0 + j - 1,
                     consensus: Some(emap.rpos[nd] as usize),
                     paired: true,
+                    insert_after: None,
+                    insert_right: false,
                 });
             }
             _ => {}

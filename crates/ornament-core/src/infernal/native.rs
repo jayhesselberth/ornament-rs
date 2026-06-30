@@ -12,12 +12,14 @@ use rayon::prelude::*;
 use std::path::Path;
 
 use ornament_alphabet::Dsq;
+use ornament_scfg::model::nd;
 use ornament_scfg::{
     align_glocal, calc_qdb_bands, cm_pipeline_search, configure_local, configure_scores,
-    cyk_search_banded, parse_cm_file, parse_cm_records_file, Cm, EmitMap, PipelineParams, QdbBands,
-    Strand,
+    cyk_search_banded, parse_cm_file, parse_cm_records_file, Alignment, Cm, EmitMap,
+    PipelineParams, QdbBands, Strand,
 };
 
+use super::stockholm::{AlignedRow, ModelMsa, ResCell};
 use super::CMHit;
 
 /// Bit-score floor handed to the scanner's overlap-resolution pass. Hits below this
@@ -295,6 +297,151 @@ pub fn scan_native_multi<P: AsRef<Path>, Q: AsRef<Path>>(
     Ok(hits)
 }
 
+/// Scan a FASTA and return, per model, a Stockholm-ready multiple alignment of that model's
+/// hits — the native equivalent of `cmsearch -A`. Like [`scan_native_multi`] it runs every
+/// model in the `.cm` over every record (p7-filtered pipeline, same E-value/memory handling),
+/// but keeps each surviving hit's full glocal parse instead of just its model span. Models with
+/// no surviving hits are omitted, so the result is one [`ModelMsa`] (one Stockholm block) per
+/// model that matched. Rows within a model are ordered best-first (E-value asc, then score).
+pub fn scan_native_aligned<P: AsRef<Path>, Q: AsRef<Path>>(
+    cm_path: P,
+    fasta: Q,
+    e_value: f64,
+) -> Result<Vec<ModelMsa>> {
+    let cm_path = cm_path.as_ref();
+    let fasta = fasta.as_ref();
+
+    let models = parse_cm_records_file(cm_path)
+        .map_err(|e| anyhow!("failed to parse CM file {}: {e}", cm_path.display()))?;
+    let records = ornament_alphabet::read_fasta(fasta)
+        .map_err(|e| anyhow!("failed to read FASTA {}: {e}", fasta.display()))?;
+
+    // Memory guard: skip models whose scanning DP would exceed the budget (see scan_native_multi).
+    let feasible: Vec<bool> = models
+        .iter()
+        .map(|cm| {
+            let ok = estimated_scan_bytes(cm, cm.w as usize) <= MAX_SCAN_BYTES;
+            if !ok {
+                eprintln!(
+                    "warning: skipping model {} (W={}, ~{:.1} GiB DP > budget); too large for the scanning matrix",
+                    cm.name,
+                    cm.w,
+                    estimated_scan_bytes(cm, cm.w as usize) as f64 / (1u64 << 30) as f64,
+                );
+            }
+            ok
+        })
+        .collect();
+
+    struct Prepared {
+        cm: Cm,
+        align_cm: Cm,
+        w_max: usize,
+        emap: EmitMap,
+        rf: Vec<char>,
+        ss_cons: Vec<char>,
+    }
+    let prepared: Vec<Prepared> = models
+        .into_par_iter()
+        .map(|mut cm| {
+            let mut align_cm = cm.clone();
+            configure_scores(&mut align_cm);
+            configure_local(&mut cm);
+            let w_max = cm.w as usize;
+            let emap = EmitMap::build(&cm);
+            let (rf, ss_cons) = consensus_annotation(&cm, &emap);
+            Prepared {
+                cm,
+                align_cm,
+                w_max,
+                emap,
+                rf,
+                ss_cons,
+            }
+        })
+        .collect();
+
+    let pairs: Vec<(usize, usize)> = (0..prepared.len())
+        .filter(|&mi| feasible[mi])
+        .flat_map(|mi| (0..records.len()).map(move |ri| (mi, ri)))
+        .collect();
+
+    // Each entry: (model index, rows with their (E-value, -score) sort keys).
+    type Keyed = (f64, f64, AlignedRow);
+    let per_pair: Vec<(usize, Vec<Keyed>)> = pairs
+        .par_iter()
+        .map(|&(mi, ri)| -> Result<(usize, Vec<Keyed>)> {
+            let p = &prepared[mi];
+            let rec = &records[ri];
+            let dsq =
+                p.cm.abc
+                    .digitize(&rec.seq)
+                    .map_err(|e| anyhow!("failed to digitize sequence {}: {e}", rec.name))?;
+
+            let (raw, _stats) = cm_pipeline_search(
+                &p.cm,
+                &dsq,
+                p.w_max,
+                REPORTING_BITS,
+                PipelineParams::default(),
+            )
+            .map_err(|e| anyhow!("pipeline failed for model {}: {e}", p.cm.name))?;
+            let rc = maybe_revcomp(&p.cm, &dsq, &raw, &rec.name)?;
+
+            let mut rows = Vec::new();
+            for h in raw {
+                if let Some(ev) = h.evalue {
+                    if ev > e_value {
+                        continue;
+                    }
+                }
+                let (aln, seq) = align_hit_window(
+                    &p.align_cm,
+                    &dsq,
+                    rc.as_deref(),
+                    &p.emap,
+                    h.i,
+                    h.j,
+                    h.strand,
+                );
+                let label = format!("{}/{}-{}", rec.name, h.i, h.j);
+                let row = aligned_row(&p.align_cm, &aln, seq, label);
+                let evkey = h.evalue.unwrap_or(f64::INFINITY);
+                rows.push((evkey, -(h.score as f64), row));
+            }
+            Ok((mi, rows))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    // Group rows back under their model.
+    let mut by_model: Vec<Vec<Keyed>> = (0..prepared.len()).map(|_| Vec::new()).collect();
+    for (mi, rows) in per_pair {
+        by_model[mi].extend(rows);
+    }
+
+    let mut out = Vec::new();
+    for (mi, mut rows) in by_model.into_iter().enumerate() {
+        if rows.is_empty() {
+            continue;
+        }
+        // Best-first: E-value ascending (uncalibrated last), then score descending.
+        rows.sort_by(|a, b| {
+            a.0.partial_cmp(&b.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.1.total_cmp(&b.1))
+        });
+        let p = &prepared[mi];
+        out.push(ModelMsa {
+            model_name: p.cm.name.clone(),
+            clen: p.cm.clen,
+            rf: p.rf.clone(),
+            ss_cons: p.ss_cons.clone(),
+            rows: rows.into_iter().map(|(_, _, r)| r).collect(),
+        });
+    }
+    Ok(out)
+}
+
 /// Reverse-complement the (sentinel-padded) digital sequence once, but only if `raw` contains a
 /// minus-strand hit that will need it for its model-span alignment. Returns `None` when no minus
 /// hit is present (the common case) so plus-only records skip the allocation.
@@ -328,14 +475,7 @@ fn hit_model_span(
     j: usize,
     strand: Strand,
 ) -> (usize, usize) {
-    let l = dsq.len() - 2; // sequence length L (dsq has sentinels at index 0 and L+1)
-    let aln = match strand {
-        Strand::Plus => align_glocal(cm, dsq, i, j, emap),
-        Strand::Minus => {
-            let rc = rc.expect("minus-strand hit requires a reverse-complemented sequence");
-            align_glocal(cm, rc, l - i + 1, l - j + 1, emap)
-        }
-    };
+    let (aln, _seq) = align_hit_window(cm, dsq, rc, emap, i, j, strand);
     aln.residues
         .iter()
         .filter_map(|r| r.consensus)
@@ -344,6 +484,235 @@ fn hit_model_span(
             None => Some((c, c)),
         })
         .unwrap_or((0, 0))
+}
+
+/// Glocally align a hit window, returning the parse and the digital sequence it was aligned
+/// over. Plus hits align `dsq` over `[i, j]`; minus hits (forward coords `i > j`) align the
+/// reverse-complement `rc` over the mirrored window, so the model columns come out in 5'->3'
+/// model orientation either way. Shared by [`hit_model_span`] and the Stockholm output.
+fn align_hit_window<'a>(
+    cm: &Cm,
+    dsq: &'a [Dsq],
+    rc: Option<&'a [Dsq]>,
+    emap: &EmitMap,
+    i: usize,
+    j: usize,
+    strand: Strand,
+) -> (Alignment, &'a [Dsq]) {
+    let l = dsq.len() - 2; // sequence length L (dsq has sentinels at index 0 and L+1)
+    match strand {
+        Strand::Plus => (align_glocal(cm, dsq, i, j, emap), dsq),
+        Strand::Minus => {
+            let rc = rc.expect("minus-strand hit requires a reverse-complemented sequence");
+            (align_glocal(cm, rc, l - i + 1, l - j + 1, emap), rc)
+        }
+    }
+}
+
+/// Build a Stockholm alignment row from a hit's glocal parse: each residue decoded to a base
+/// character (uppercase for a match emission, lowercase for an insert) and tagged with its
+/// consensus column or insert gap. `seq` is the digital sequence the parse was aligned over.
+fn aligned_row(cm: &Cm, aln: &Alignment, seq: &[Dsq], label: String) -> AlignedRow {
+    let residues = aln
+        .residues
+        .iter()
+        .map(|r| {
+            let raw = cm
+                .abc
+                .textize(&[seq[r.seq_pos]])
+                .chars()
+                .next()
+                .unwrap_or('?');
+            let (ch, consensus) = match r.consensus {
+                Some(c) => (raw.to_ascii_uppercase(), Some(c)),
+                None => (raw.to_ascii_lowercase(), None),
+            };
+            ResCell {
+                consensus,
+                insert_after: r.insert_after.unwrap_or(0),
+                insert_right: r.insert_right,
+                ch,
+            }
+        })
+        .collect();
+    AlignedRow { label, residues }
+}
+
+/// Per-consensus-column `#=GC RF` and `#=GC SS_cons` lines for a model (length `clen` each).
+///
+/// RF prefers the model's reference line, then its consensus string, then the consensus
+/// residues assembled from the per-node annotation (`lcons`/`rcons` placed by the emit map —
+/// case preserved, since `.cm` uses upper/lowercase to flag conservation), then a placeholder.
+/// SS_cons is full WUSS (a port of Infernal's `CreateCMConsensus`): each MATP pair's bracket
+/// family is set by its multifurcation order (`<>`/`()`/`[]`/`{}`) and unpaired MATL/MATR
+/// columns are classified by their faces into `:` external, `_` hairpin, `-` bulge/interior,
+/// or `,` multiloop.
+fn consensus_annotation(cm: &Cm, emap: &EmitMap) -> (Vec<char>, Vec<char>) {
+    let clen = cm.clen;
+    let set = |v: &mut [char], col: i32, c: char| {
+        let col = col as usize;
+        if (1..=clen).contains(&col) {
+            v[col - 1] = c;
+        }
+    };
+
+    let rf: Vec<char> = if let Some(s) = cm.rf.as_ref().or(cm.consensus.as_ref()) {
+        let mut v: Vec<char> = s.chars().collect();
+        v.resize(clen, 'x');
+        v
+    } else {
+        let mut v = vec!['x'; clen];
+        for node in 0..cm.nodes {
+            let ann = &cm.node_annot[node];
+            match cm.ndtype[node] {
+                nd::MATP => {
+                    if let Some(c) = ann.lcons {
+                        set(&mut v, emap.lpos[node], c);
+                    }
+                    if let Some(c) = ann.rcons {
+                        set(&mut v, emap.rpos[node], c);
+                    }
+                }
+                nd::MATL => {
+                    if let Some(c) = ann.lcons {
+                        set(&mut v, emap.lpos[node], c);
+                    }
+                }
+                nd::MATR => {
+                    if let Some(c) = ann.rcons {
+                        set(&mut v, emap.rpos[node], c);
+                    }
+                }
+                _ => {}
+            }
+        }
+        v
+    };
+
+    let height = multifurcation_order(cm);
+    let (inface, outface) = face_charts(cm);
+    let mut ss = vec![':'; clen];
+    for node in 0..cm.nodes {
+        match cm.ndtype[node] {
+            nd::MATP => {
+                let (l, r) = match height[node] {
+                    0 => ('<', '>'),
+                    1 => ('(', ')'),
+                    2 => ('[', ']'),
+                    _ => ('{', '}'),
+                };
+                set(&mut ss, emap.lpos[node], l);
+                set(&mut ss, emap.rpos[node], r);
+            }
+            nd::MATL => set(
+                &mut ss,
+                emap.lpos[node],
+                face_char(inface[node], outface[node]),
+            ),
+            nd::MATR => set(
+                &mut ss,
+                emap.rpos[node],
+                face_char(inface[node], outface[node]),
+            ),
+            _ => {}
+        }
+    }
+    (rf, ss)
+}
+
+/// WUSS character for an unpaired (MATL/MATR) consensus column from its face counts
+/// (Infernal `createFaceCharts`): external single-strand, hairpin loop, bulge/interior, or
+/// multiloop.
+fn face_char(inface: i32, outface: i32) -> char {
+    if outface == 0 {
+        ':' // external single-strand
+    } else if inface == 0 && outface == 1 {
+        '_' // hairpin loop
+    } else if inface == 1 && outface == 1 {
+        '-' // bulge / interior loop
+    } else {
+        ',' // multiloop
+    }
+}
+
+/// Multifurcation order ("height") of the subtree at each node — a port of Infernal's
+/// `createMultifurcationOrderChart`. Terminal stems are 0; a stem above a multifurcation into
+/// terminal stems is 1; and so on. Selects the bracket family for each consensus pair.
+fn multifurcation_order(cm: &Cm) -> Vec<i32> {
+    let n = cm.nodes;
+    let mut height = vec![0i32; n];
+    let mut seg_has_pairs = vec![false; n];
+    for node in (0..n).rev() {
+        let v = cm.nodemap[node];
+        seg_has_pairs[node] = match cm.ndtype[node] {
+            nd::MATP => true,
+            nd::END | nd::BIF => false,
+            _ => seg_has_pairs[node + 1],
+        };
+        height[node] = match cm.ndtype[node] {
+            nd::END => 0,
+            nd::BIF => {
+                let left = cm.ndidx[cm.cfirst[v] as usize];
+                let right = cm.ndidx[cm.cnum[v] as usize];
+                (height[left] + seg_has_pairs[left] as i32)
+                    .max(height[right] + seg_has_pairs[right] as i32)
+            }
+            _ => height[node + 1],
+        };
+    }
+    height
+}
+
+/// `inface`/`outface` face counts for every node — a port of Infernal's `createFaceCharts`.
+/// `inface` counts faces in descendant subtrees (exclusive of the current pair); `outface`
+/// counts faces above the node. Together they classify each unpaired column's loop context.
+fn face_charts(cm: &Cm) -> (Vec<i32>, Vec<i32>) {
+    let n = cm.nodes;
+    let mut inface = vec![0i32; n];
+    let mut outface = vec![0i32; n];
+
+    for node in (0..n).rev() {
+        let v = cm.nodemap[node];
+        inface[node] = match cm.ndtype[node] {
+            nd::END => 0,
+            nd::BIF => {
+                let left = cm.ndidx[cm.cfirst[v] as usize];
+                let right = cm.ndidx[cm.cnum[v] as usize];
+                inface[left] + inface[right]
+            }
+            _ if cm.ndtype[node + 1] == nd::MATP => 1,
+            _ => inface[node + 1],
+        };
+    }
+
+    for node in 0..n {
+        let v = cm.nodemap[node];
+        outface[node] = match cm.ndtype[node] {
+            nd::ROOT => 0,
+            nd::BEGL => {
+                let parent = cm.ndidx[cm.plast[v] as usize];
+                let y = cm.nodemap[parent];
+                let right = cm.ndidx[cm.cnum[y] as usize];
+                outface[parent] + inface[right]
+            }
+            nd::BEGR => {
+                let parent = cm.ndidx[cm.plast[v] as usize];
+                let y = cm.nodemap[parent];
+                let left = cm.ndidx[cm.cfirst[y] as usize];
+                outface[parent] + inface[left]
+            }
+            _ => {
+                let parent = node - 1;
+                if cm.ndtype[parent] == nd::MATP {
+                    1
+                } else {
+                    outface[parent]
+                }
+            }
+        };
+    }
+
+    (inface, outface)
 }
 
 /// GC fraction over the inclusive 1-based span `[min(i,j), max(i,j)]` of `seq`.
