@@ -7,6 +7,12 @@ use clap::{Parser, Subcommand, ValueEnum};
 use std::io::Write;
 use std::path::Path;
 
+/// Whether the scan output target is a gzip file (`.gz`), which can't be streamed (it needs a
+/// final gzip footer written on close).
+fn output_is_gz(output: Option<&str>) -> bool {
+    output.is_some_and(|p| p.ends_with(".gz"))
+}
+
 /// Write `content` to `path`, gzip-compressing transparently when the path ends in `.gz`
 /// (matching the scanner's transparent gzip *input* handling).
 fn write_output(path: &str, content: &str) -> Result<()> {
@@ -127,7 +133,8 @@ fn main() -> Result<()> {
             engine,
         } => {
             use ornament_core::infernal::{
-                scan_native_aligned, scan_native_multi, write_stockholm, write_tsv, InfernalRunner,
+                scan_native_aligned, scan_native_multi, scan_native_multi_streaming,
+                write_stockholm, write_tsv, write_tsv_rows, InfernalRunner, TSV_HEADER,
             };
 
             // E-value reporting threshold (mirrors `cmsearch -E`).
@@ -143,6 +150,35 @@ fn main() -> Result<()> {
             // Verify CM file exists
             if !Path::new(&cm_path).exists() {
                 return Err(anyhow!("CM file not found: {}", cm_path));
+            }
+
+            // Streaming fast path: native engine + TSV to stdout or a plain file. Hits are written
+            // as each model finishes, so a long genome-vs-Rfam run shows progress, survives a
+            // crash, and never holds the full hit set in memory. (`.gz` output needs a final gzip
+            // footer, so it falls through to the buffered path below, which finalizes correctly.)
+            let can_stream =
+                engine == Engine::Native && format == "tsv" && !output_is_gz(output.as_deref());
+            if can_stream {
+                eprintln!(
+                    "Scanning {} using {} (native engine, all models, streaming)...",
+                    input, cm_path
+                );
+                let mut w: Box<dyn Write + Send> = match output.as_deref() {
+                    Some(p) => Box::new(std::io::BufWriter::new(std::fs::File::create(p)?)),
+                    None => Box::new(std::io::BufWriter::new(std::io::stdout())),
+                };
+                writeln!(w, "{TSV_HEADER}")?;
+                let w = std::sync::Mutex::new(w);
+                let n = scan_native_multi_streaming(&cm_path, &input, E_VALUE, |hits| {
+                    let mut s = String::new();
+                    write_tsv_rows(&mut s, hits);
+                    let mut g = w.lock().unwrap();
+                    let _ = g.write_all(s.as_bytes());
+                    let _ = g.flush(); // flush per batch so partial results survive a crash
+                })?;
+                w.into_inner().unwrap().flush()?;
+                eprintln!("Found {n} hits");
+                return Ok(());
             }
 
             let output_str = if format == "stockholm" {
