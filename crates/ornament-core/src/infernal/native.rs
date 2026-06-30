@@ -14,7 +14,7 @@ use std::path::Path;
 use ornament_alphabet::Dsq;
 use ornament_scfg::model::nd;
 use ornament_scfg::{
-    align_glocal, calc_qdb_bands, cm_pipeline_search, configure_local, configure_scores,
+    align_glocal_banded, calc_qdb_bands, cm_pipeline_search, configure_local, configure_scores,
     cyk_search_banded, parse_cm_file, parse_cm_records_file, Alignment, Cm, EmitMap,
     PipelineParams, QdbBands, Strand,
 };
@@ -84,8 +84,11 @@ pub fn scan_native<P: AsRef<Path>, Q: AsRef<Path>>(
     let emap = EmitMap::build(&cm);
 
     // Query-dependent bands: computed once for the model and shared read-only across every
-    // record scan. They give identical hits to the unbanded scan at a fraction of the cost.
+    // record scan. They give identical hits to the unbanded scan at a fraction of the cost. The
+    // local-mode `bands` drive the scan; the glocal `align_bands` (from `align_cm`) bound the
+    // per-hit model-span alignment — they must match the glocal model the parse runs over.
     let bands = calc_qdb_bands(&cm, QdbBands::DEFAULT_BETA);
+    let align_bands = calc_qdb_bands(&align_cm, QdbBands::DEFAULT_BETA);
 
     // Records are independent scans — search them in parallel. The per-record collect is
     // order-preserving, so the flattened result is identical regardless of thread count.
@@ -113,8 +116,16 @@ pub fn scan_native<P: AsRef<Path>, Q: AsRef<Path>>(
                     Strand::Plus => '+',
                     Strand::Minus => '-',
                 };
-                let (mdl_from, mdl_to) =
-                    hit_model_span(&align_cm, &dsq, rc.as_deref(), &emap, h.i, h.j, h.strand);
+                let (mdl_from, mdl_to) = hit_model_span(
+                    &align_cm,
+                    &dsq,
+                    rc.as_deref(),
+                    &emap,
+                    &align_bands,
+                    h.i,
+                    h.j,
+                    h.strand,
+                );
                 rec_hits.push(CMHit {
                     target_name: rec.name.clone(),
                     target_start: h.i,
@@ -246,12 +257,14 @@ where
         );
     }
 
-    // Per-model setup: a glocal-configured copy for per-hit model-span alignment + the emit map.
-    // QDB bands aren't needed here — the p7 pipeline computes its own internally.
+    // Per-model setup: a glocal-configured copy + emit map + QDB bands for the per-hit model-span
+    // alignment. (The p7 pipeline computes its own scan bands internally; `align_bands` are the
+    // glocal bands that bound the alignment over `align_cm`.)
     struct Prepared {
         cm: Cm,
         /// Glocal-configured copy used only for per-hit alignment (see `scan_native`).
         align_cm: Cm,
+        align_bands: QdbBands,
         w_max: usize,
         emap: EmitMap,
     }
@@ -261,11 +274,13 @@ where
             let mut align_cm = cm.clone();
             configure_scores(&mut align_cm);
             configure_local(&mut cm); // cmsearch/cmscan default (local mode)
+            let align_bands = calc_qdb_bands(&align_cm, QdbBands::DEFAULT_BETA);
             let w_max = cm.w as usize;
             let emap = EmitMap::build(&cm);
             Prepared {
                 cm,
                 align_cm,
+                align_bands,
                 w_max,
                 emap,
             }
@@ -315,6 +330,7 @@ where
                 &dsq,
                 rc.as_deref(),
                 &p.emap,
+                &p.align_bands,
                 h.i,
                 h.j,
                 h.strand,
@@ -378,6 +394,7 @@ pub fn scan_native_aligned<P: AsRef<Path>, Q: AsRef<Path>>(
     struct Prepared {
         cm: Cm,
         align_cm: Cm,
+        align_bands: QdbBands,
         w_max: usize,
         emap: EmitMap,
         rf: Vec<char>,
@@ -389,12 +406,14 @@ pub fn scan_native_aligned<P: AsRef<Path>, Q: AsRef<Path>>(
             let mut align_cm = cm.clone();
             configure_scores(&mut align_cm);
             configure_local(&mut cm);
+            let align_bands = calc_qdb_bands(&align_cm, QdbBands::DEFAULT_BETA);
             let w_max = cm.w as usize;
             let emap = EmitMap::build(&cm);
             let (rf, ss_cons) = consensus_annotation(&cm, &emap);
             Prepared {
                 cm,
                 align_cm,
+                align_bands,
                 w_max,
                 emap,
                 rf,
@@ -442,6 +461,7 @@ pub fn scan_native_aligned<P: AsRef<Path>, Q: AsRef<Path>>(
                     &dsq,
                     rc.as_deref(),
                     &p.emap,
+                    &p.align_bands,
                     h.i,
                     h.j,
                     h.strand,
@@ -503,40 +523,41 @@ fn maybe_revcomp(
     Ok(Some(v))
 }
 
-/// Cap on the dense-alignment footprint used to recover a hit's model span. `align_glocal`
-/// allocates an `m × (window+1)²` score matrix plus two equal-size shadow arrays (~12 B/cell), so
-/// a long hit on a large model is catastrophic — a 1.5 kb SSU-rRNA hit on a 4758-state model is
-/// ~40 GB. Above this cap we skip the precise traceback and report a coarse full-model span. (The
-/// proper fix is a *banded* alignment; this just keeps a convenience column from OOMing the scan.)
-const MAX_SPAN_ALIGN_BYTES: u64 = 256 * 1024 * 1024;
+/// Matched consensus-column span (`mdl from`, `mdl to`) of a hit, recovered from its glocal
+/// traceback. Plus hits align the original `dsq` over window `[i, j]`; minus hits (forward coords
+/// `i > j`) align the reverse-complement `rc` over the mirrored window `[L-i+1, L-j+1]`, where the
+/// Cap on the (QDB-banded) model-span alignment footprint. The banded matrix is
+/// `(window+1)·Σ_v band(v)·12 B`; a full-length rRNA hit is still a few GB, and many such hits
+/// align concurrently in a genome scan. Above the cap we report the coarse full-model span instead
+/// — for a strong full-length rRNA-scale hit that is `1..clen` anyway, which the alignment confirms.
+const MAX_SPAN_ALIGN_BYTES: u64 = 512 * 1024 * 1024;
 
 /// Matched consensus-column span (`mdl from`, `mdl to`) of a hit, recovered from its glocal
 /// traceback. Plus hits align the original `dsq` over window `[i, j]`; minus hits (forward coords
 /// `i > j`) align the reverse-complement `rc` over the mirrored window `[L-i+1, L-j+1]`, where the
 /// model columns already come out in 5'->3' model orientation. Returns `(0, 0)` if the parse
-/// emitted no match columns. For a window large enough to blow up the dense alignment (see
-/// [`MAX_SPAN_ALIGN_BYTES`]) it returns the coarse full-model span `(1, clen)` instead of aligning.
+/// emitted no match columns. The alignment is QDB-banded (`O(m·window·band)`); for a hit whose
+/// banded matrix would still exceed [`MAX_SPAN_ALIGN_BYTES`] it reports the coarse `(1, clen)` span.
+#[allow(clippy::too_many_arguments)]
 fn hit_model_span(
     cm: &Cm,
     dsq: &[Dsq],
     rc: Option<&[Dsq]>,
     emap: &EmitMap,
+    bands: &QdbBands,
     i: usize,
     j: usize,
     strand: Strand,
 ) -> (usize, usize) {
-    // Dense alignment is O(m·window²) memory; skip it for oversized hits, reporting the coarse
-    // full-model span. A strong hit this large (rRNA-scale) covers ~the whole model anyway.
-    let window = (i.abs_diff(j) + 1) as u64;
-    let est_bytes = (cm.m as u64)
-        .saturating_mul(window + 1)
-        .saturating_mul(window + 1)
-        * 12;
-    if est_bytes > MAX_SPAN_ALIGN_BYTES {
+    let window = i.abs_diff(j) as u64 + 1;
+    let band_cells: u64 = (0..cm.m)
+        .map(|v| (bands.dmax[v].saturating_sub(bands.dmin[v]) + 1) as u64)
+        .sum();
+    if (window + 1).saturating_mul(band_cells).saturating_mul(12) > MAX_SPAN_ALIGN_BYTES {
         return (1, cm.clen);
     }
 
-    let (aln, _seq) = align_hit_window(cm, dsq, rc, emap, i, j, strand);
+    let (aln, _seq) = align_hit_window(cm, dsq, rc, emap, bands, i, j, strand);
     aln.residues
         .iter()
         .filter_map(|r| r.consensus)
@@ -547,25 +568,31 @@ fn hit_model_span(
         .unwrap_or((0, 0))
 }
 
-/// Glocally align a hit window, returning the parse and the digital sequence it was aligned
-/// over. Plus hits align `dsq` over `[i, j]`; minus hits (forward coords `i > j`) align the
+/// QDB-banded glocal alignment of a hit window, returning the parse and the digital sequence it was
+/// aligned over. Plus hits align `dsq` over `[i, j]`; minus hits (forward coords `i > j`) align the
 /// reverse-complement `rc` over the mirrored window, so the model columns come out in 5'->3'
-/// model orientation either way. Shared by [`hit_model_span`] and the Stockholm output.
+/// model orientation either way. Shared by [`hit_model_span`] and the Stockholm output. The bands
+/// bound memory to `O(m·window·band)` (vs the dense `O(m·window²)`) while giving an identical parse.
+#[allow(clippy::too_many_arguments)]
 fn align_hit_window<'a>(
     cm: &Cm,
     dsq: &'a [Dsq],
     rc: Option<&'a [Dsq]>,
     emap: &EmitMap,
+    bands: &QdbBands,
     i: usize,
     j: usize,
     strand: Strand,
 ) -> (Alignment, &'a [Dsq]) {
     let l = dsq.len() - 2; // sequence length L (dsq has sentinels at index 0 and L+1)
     match strand {
-        Strand::Plus => (align_glocal(cm, dsq, i, j, emap), dsq),
+        Strand::Plus => (align_glocal_banded(cm, dsq, i, j, emap, bands), dsq),
         Strand::Minus => {
             let rc = rc.expect("minus-strand hit requires a reverse-complemented sequence");
-            (align_glocal(cm, rc, l - i + 1, l - j + 1, emap), rc)
+            (
+                align_glocal_banded(cm, rc, l - i + 1, l - j + 1, emap, bands),
+                rc,
+            )
         }
     }
 }
