@@ -5,8 +5,10 @@
 
 pub mod native;
 pub mod parser;
+pub mod report;
 pub mod runner;
 
 pub use native::{scan_native, scan_native_multi};
 pub use parser::{CMAlignment, CMHit};
+pub use report::{write_tsv, TSV_HEADER};
 pub use runner::InfernalRunner;

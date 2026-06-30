@@ -4,7 +4,22 @@
 
 use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand, ValueEnum};
+use std::io::Write;
 use std::path::Path;
+
+/// Write `content` to `path`, gzip-compressing transparently when the path ends in `.gz`
+/// (matching the scanner's transparent gzip *input* handling).
+fn write_output(path: &str, content: &str) -> Result<()> {
+    if path.ends_with(".gz") {
+        let file = std::fs::File::create(path)?;
+        let mut enc = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+        enc.write_all(content.as_bytes())?;
+        enc.finish()?;
+    } else {
+        std::fs::write(path, content)?;
+    }
+    Ok(())
+}
 
 #[derive(Parser)]
 #[command(name = "ornament")]
@@ -40,8 +55,8 @@ enum Commands {
         #[arg(short, long)]
         output: Option<String>,
 
-        /// Output format (json, tsv)
-        #[arg(short, long, default_value = "json")]
+        /// Output format (tsv, json)
+        #[arg(short, long, default_value = "tsv")]
         format: String,
 
         /// Search engine: native (pure Rust, default) or cmsearch (subprocess)
@@ -110,7 +125,7 @@ fn main() -> Result<()> {
             format,
             engine,
         } => {
-            use ornament_core::infernal::{scan_native_multi, InfernalRunner};
+            use ornament_core::infernal::{scan_native_multi, write_tsv, InfernalRunner};
 
             // E-value reporting threshold (mirrors `cmsearch -E`).
             const E_VALUE: f64 = 1e-5;
@@ -154,30 +169,13 @@ fn main() -> Result<()> {
             // Format output
             let output_str = match format.as_str() {
                 "json" => serde_json::to_string_pretty(&hits)?,
-                "tsv" => {
-                    let mut lines = vec![
-                        "target_name\tquery_name\tstart\tend\tstrand\tscore\te_value".to_string(),
-                    ];
-                    for hit in &hits {
-                        lines.push(format!(
-                            "{}\t{}\t{}\t{}\t{}\t{:.1}\t{:.2e}",
-                            hit.target_name,
-                            hit.query_name,
-                            hit.target_start,
-                            hit.target_end,
-                            hit.strand,
-                            hit.score,
-                            hit.e_value
-                        ));
-                    }
-                    lines.join("\n")
-                }
+                "tsv" => write_tsv(&hits),
                 _ => return Err(anyhow!("Unknown format: {}. Use 'json' or 'tsv'", format)),
             };
 
             // Write output
             if let Some(output_path) = output {
-                std::fs::write(&output_path, &output_str)?;
+                write_output(&output_path, &output_str)?;
                 eprintln!("Results written to {}", output_path);
             } else {
                 println!("{}", output_str);
@@ -274,7 +272,7 @@ fn main() -> Result<()> {
 
             // Write output
             if let Some(output_path) = output {
-                std::fs::write(&output_path, &output_str)?;
+                write_output(&output_path, &output_str)?;
                 eprintln!("Results written to {}", output_path);
             } else {
                 println!("{}", output_str);
@@ -374,7 +372,7 @@ fn main() -> Result<()> {
             let output_str = serde_json::to_string_pretty(&output_data)?;
 
             if let Some(output_path) = output {
-                std::fs::write(&output_path, &output_str)?;
+                write_output(&output_path, &output_str)?;
                 eprintln!("Results written to {}", output_path);
             } else {
                 println!("{}", output_str);

@@ -15,3 +15,4 @@ ornament-core = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
 serde_json = { workspace = true }
+flate2 = { workspace = true }
