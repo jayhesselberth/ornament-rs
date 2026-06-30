@@ -12,7 +12,8 @@ use rayon::prelude::*;
 use std::path::Path;
 
 use ornament_scfg::{
-    calc_qdb_bands, configure_local, cyk_search_banded, parse_cm_file, QdbBands, Strand,
+    calc_qdb_bands, configure_local, cyk_search_banded, parse_cm_file, parse_cm_records_file, Cm,
+    QdbBands, Strand,
 };
 
 use super::CMHit;
@@ -87,6 +88,107 @@ pub fn scan_native<P: AsRef<Path>, Q: AsRef<Path>>(
         .collect::<Result<Vec<_>>>()?;
 
     Ok(per_record.into_iter().flatten().collect())
+}
+
+/// Scan a FASTA with **every** model in a (possibly multi-model) `.cm` file — the cmscan-style
+/// "run the whole collection on a sequence" path. Work is parallelized across the full
+/// `models × records` product, so a file of thousands of Rfam models keeps all cores busy even on
+/// a single sequence (the across-model parallelism the per-model pipeline can't provide on its own).
+///
+/// `e_value` filters calibrated models' hits exactly as [`scan_native`]; each hit is tagged with
+/// its model name (`CMHit::query_name`). Results are sorted best-first (E-value asc, then score).
+pub fn scan_native_multi<P: AsRef<Path>, Q: AsRef<Path>>(
+    cm_path: P,
+    fasta: Q,
+    e_value: f64,
+) -> Result<Vec<CMHit>> {
+    let cm_path = cm_path.as_ref();
+    let fasta = fasta.as_ref();
+
+    let mut models = parse_cm_records_file(cm_path)
+        .map_err(|e| anyhow!("failed to parse CM file {}: {e}", cm_path.display()))?;
+    for cm in &mut models {
+        configure_local(cm); // cmsearch/cmscan default (local mode)
+    }
+    let records = ornament_alphabet::read_fasta(fasta)
+        .map_err(|e| anyhow!("failed to read FASTA {}: {e}", fasta.display()))?;
+
+    // Per-model setup (QDB bands + max window), computed once per model in parallel.
+    struct Prepared {
+        cm: Cm,
+        bands: QdbBands,
+        w_max: usize,
+    }
+    let prepared: Vec<Prepared> = models
+        .into_par_iter()
+        .map(|cm| {
+            let bands = calc_qdb_bands(&cm, QdbBands::DEFAULT_BETA);
+            let w_max = cm.w as usize;
+            Prepared { cm, bands, w_max }
+        })
+        .collect();
+
+    // Parallelize across the full model × record product: every (model, record) scan is
+    // independent, so the whole collection saturates the thread pool regardless of how many
+    // models or sequences there are. Order-preserving collect → thread-count-independent output.
+    let pairs: Vec<(usize, usize)> = (0..prepared.len())
+        .flat_map(|mi| (0..records.len()).map(move |ri| (mi, ri)))
+        .collect();
+
+    let per_pair: Vec<Vec<CMHit>> = pairs
+        .par_iter()
+        .map(|&(mi, ri)| -> Result<Vec<CMHit>> {
+            let p = &prepared[mi];
+            let rec = &records[ri];
+            let dsq =
+                p.cm.abc
+                    .digitize(&rec.seq)
+                    .map_err(|e| anyhow!("failed to digitize sequence {}: {e}", rec.name))?;
+
+            let mut hits = Vec::new();
+            for h in cyk_search_banded(&p.cm, &dsq, p.w_max, REPORTING_BITS, &p.bands) {
+                if let Some(ev) = h.evalue {
+                    if ev > e_value {
+                        continue;
+                    }
+                }
+                let strand = match h.strand {
+                    Strand::Plus => '+',
+                    Strand::Minus => '-',
+                };
+                hits.push(CMHit {
+                    target_name: rec.name.clone(),
+                    target_start: h.i,
+                    target_end: h.j,
+                    strand,
+                    query_name: p.cm.name.clone(),
+                    score: h.score as f64,
+                    e_value: h.evalue.unwrap_or(f64::NAN),
+                    gc_content: gc_fraction(&rec.seq, h.i, h.j),
+                });
+            }
+            Ok(hits)
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut hits: Vec<CMHit> = per_pair.into_iter().flatten().collect();
+    // Best-first: E-value ascending (NaN/uncalibrated last), then score descending.
+    hits.sort_by(|a, b| {
+        let ea = if a.e_value.is_nan() {
+            f64::INFINITY
+        } else {
+            a.e_value
+        };
+        let eb = if b.e_value.is_nan() {
+            f64::INFINITY
+        } else {
+            b.e_value
+        };
+        ea.partial_cmp(&eb)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(b.score.total_cmp(&a.score))
+    });
+    Ok(hits)
 }
 
 /// GC fraction over the inclusive 1-based span `[min(i,j), max(i,j)]` of `seq`.

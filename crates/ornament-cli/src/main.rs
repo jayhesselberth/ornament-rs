@@ -110,7 +110,7 @@ fn main() -> Result<()> {
             format,
             engine,
         } => {
-            use ornament_core::infernal::{scan_native, InfernalRunner};
+            use ornament_core::infernal::{scan_native_multi, InfernalRunner};
 
             // E-value reporting threshold (mirrors `cmsearch -E`).
             const E_VALUE: f64 = 1e-5;
@@ -130,10 +130,12 @@ fn main() -> Result<()> {
             let hits = match engine {
                 Engine::Native => {
                     eprintln!(
-                        "Scanning {} for tRNAs using {} (native engine)...",
+                        "Scanning {} using {} (native engine, all models)...",
                         input, cm_path
                     );
-                    scan_native(&cm_path, &input, E_VALUE)?
+                    // Runs every model in the .cm file (one, or the whole Rfam collection),
+                    // parallelized across the model × record product.
+                    scan_native_multi(&cm_path, &input, E_VALUE)?
                 }
                 Engine::Cmsearch => {
                     eprintln!(
@@ -153,12 +155,14 @@ fn main() -> Result<()> {
             let output_str = match format.as_str() {
                 "json" => serde_json::to_string_pretty(&hits)?,
                 "tsv" => {
-                    let mut lines =
-                        vec!["target_name\tstart\tend\tstrand\tscore\te_value".to_string()];
+                    let mut lines = vec![
+                        "target_name\tquery_name\tstart\tend\tstrand\tscore\te_value".to_string(),
+                    ];
                     for hit in &hits {
                         lines.push(format!(
-                            "{}\t{}\t{}\t{}\t{:.1}\t{:.2e}",
+                            "{}\t{}\t{}\t{}\t{}\t{:.1}\t{:.2e}",
                             hit.target_name,
+                            hit.query_name,
                             hit.target_start,
                             hit.target_end,
                             hit.strand,

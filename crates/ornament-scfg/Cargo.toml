@@ -16,6 +16,7 @@ ornament-alphabet = { workspace = true }
 ornament-hmm = { workspace = true }
 thiserror = { workspace = true }
 rayon = { workspace = true }
+flate2 = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }

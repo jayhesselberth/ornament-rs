@@ -41,6 +41,9 @@ tempfile = "3"
 bio = "1"
 noodles-fasta = "0.62"
 
+# Compression (transparent .gz reading; pure-Rust miniz_oxide backend, no C toolchain)
+flate2 = "1"
+
 # Parallelism
 rayon = "1"
 
