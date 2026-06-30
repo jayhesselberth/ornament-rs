@@ -52,6 +52,33 @@ fn add(a: f32, b: f32) -> f32 {
 /// Align the hit window `dsq[i0..=j0]` (1-based, inclusive) to the model in glocal mode.
 /// Returns the CYK score and the per-residue consensus mapping.
 pub fn align_glocal(cm: &Cm, dsq: &[Dsq], i0: usize, j0: usize, emap: &EmitMap) -> Alignment {
+    align_glocal_impl(cm, dsq, i0, j0, emap, None)
+}
+
+/// The CYK-optimal glocal parse as a list of `(v, i, j, d)` for every visited CM state (`i`, `j`
+/// **window-local**, i.e. `1..=L`; `d = j - i + 1`). Used to validate that HMM bands contain the
+/// true parse (the no-drop guarantee).
+#[cfg(test)]
+pub(crate) fn align_glocal_parse(
+    cm: &Cm,
+    dsq: &[Dsq],
+    i0: usize,
+    j0: usize,
+    emap: &EmitMap,
+) -> Vec<(usize, usize, usize, usize)> {
+    let mut parse = Vec::new();
+    align_glocal_impl(cm, dsq, i0, j0, emap, Some(&mut parse));
+    parse
+}
+
+fn align_glocal_impl(
+    cm: &Cm,
+    dsq: &[Dsq],
+    i0: usize,
+    j0: usize,
+    emap: &EmitMap,
+    mut parse: Option<&mut Vec<(usize, usize, usize, usize)>>,
+) -> Alignment {
     assert!(
         i0 >= 1 && j0 >= i0 && j0 + 1 < dsq.len(),
         "window out of range"
@@ -142,6 +169,10 @@ pub fn align_glocal(cm: &Cm, dsq: &[Dsq], i0: usize, j0: usize, emap: &EmitMap) 
     while let Some((v, j, d)) = stack.pop() {
         let sttype = cm.sttype[v];
         let nd = cm.ndidx[v];
+        if let Some(p) = parse.as_deref_mut() {
+            // window-local i = j - d + 1 (i > j when d == 0, e.g. E states).
+            p.push((v, j + 1 - d, j, d));
+        }
         match sttype {
             st::ML | st::IL => {
                 let p = j - d + 1; // local left position
