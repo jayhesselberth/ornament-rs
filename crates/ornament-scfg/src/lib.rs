@@ -20,7 +20,7 @@ pub mod pipeline;
 pub mod qdb;
 pub mod search;
 
-pub use align::{align_glocal, AlignedResidue, Alignment};
+pub use align::{align_glocal, align_glocal_banded, AlignedResidue, Alignment};
 pub use cmfile::{parse_cm_file, parse_cm_records, parse_cm_records_file, parse_cm_str};
 pub use config::{configure_local, configure_scores};
 pub use emitmap::EmitMap;
