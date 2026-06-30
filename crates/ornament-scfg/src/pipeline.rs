@@ -25,7 +25,9 @@
 
 use ornament_alphabet::Dsq;
 use ornament_hmm::profile::{bg_freqs, P7Profile};
-use ornament_hmm::{forward_pvalue, parse_p7_hmm, P7Hmm};
+use ornament_hmm::{
+    forward_pvalue, msv_bits, msv_pvalue, parse_p7_hmm, viterbi_bits, viterbi_pvalue, P7Hmm,
+};
 use rayon::prelude::*;
 
 use crate::evalues::{evalue, SearchMode};
@@ -201,6 +203,108 @@ pub fn cm_pipeline_inside(
 ) -> Result<(Vec<Hit>, PipelineStats), InfernalError> {
     params.do_inside = true;
     cm_pipeline_search(cm, dsq, w_max, cutoff_bits, params)
+}
+
+/// HMMER's default p7 filter cascade thresholds (P-value), for the prune-rate measurement.
+const MSV_F1: f64 = 0.02; // MSV pass threshold (`--F1`)
+const VIT_F2: f64 = 1e-3; // Viterbi pass threshold (`--F2`)
+
+/// Per-stage tile pass counts for the p7 filter cascade (both strands summed). A measurement
+/// used to size the value of an MSV → Viterbi → Forward cascade: at HMMER's default
+/// thresholds, how many of the pipeline's tiles would each filter let through? It does **not**
+/// change search output — it is pure instrumentation over the same tiling
+/// [`cm_pipeline_search`] uses.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FilterPruneStats {
+    /// Total tiles scored (both strands).
+    pub n_tiles: usize,
+    /// Tiles passing MSV (`P_MSV ≤ 0.02`).
+    pub n_msv_pass: usize,
+    /// Tiles passing Viterbi (`P_Vit ≤ 1e-3`).
+    pub n_vit_pass: usize,
+    /// Tiles passing Forward (`P_Fwd ≤ params.f3`) — identical to the live pipeline's survivor
+    /// tiles (pre-merge), since it reuses the same Forward decision.
+    pub n_fwd_pass: usize,
+}
+
+/// Measure the per-stage prune rates of an MSV → Viterbi → Forward cascade over the pipeline's
+/// tiling, to decide whether a cheaper-first cascade is worth building. The Forward column uses
+/// the exact same striped-Forward decision as [`cm_pipeline_search`] (so `n_fwd_pass` is its
+/// survivor-tile count); MSV/Viterbi use the scalar filters at HMMER's default thresholds.
+///
+/// This is a diagnostic, not part of search — it returns counts only and leaves output unchanged.
+pub fn measure_filter_prune_rates(
+    cm: &Cm,
+    dsq: &[Dsq],
+    w_max: usize,
+    params: PipelineParams,
+) -> Result<FilterPruneStats, InfernalError> {
+    let l = dsq.len().saturating_sub(2);
+    let mut stats = FilterPruneStats::default();
+    if l == 0 {
+        return Ok(stats);
+    }
+
+    let hmm = parse_filter_hmm(cm)?;
+    let bg = bg_freqs(hmm.k);
+    let prof = P7Profile::config_local(&hmm, cm.abc.as_ref(), &bg, l);
+    let nj = prof.nj;
+    let filt = fwdfilter::build(&prof);
+    let abc = cm.abc.as_ref();
+    let w = w_max.min(l).max(1);
+
+    let mut rc = dsq.to_vec();
+    cm.abc.revcomp(&mut rc)?;
+
+    for seq in [dsq, rc.as_slice()] {
+        let (nt, nm, nv, nf) = measure_strand(seq, w, &hmm, abc, &filt, nj, params.f3);
+        stats.n_tiles += nt;
+        stats.n_msv_pass += nm;
+        stats.n_vit_pass += nv;
+        stats.n_fwd_pass += nf;
+    }
+    Ok(stats)
+}
+
+/// Tile-by-tile MSV/Viterbi/Forward pass counts for one strand (returns
+/// `(n_tiles, n_msv, n_vit, n_fwd)`). Tiling matches [`strand_survivors`] exactly.
+#[allow(clippy::too_many_arguments)]
+fn measure_strand(
+    seq: &[Dsq],
+    w: usize,
+    hmm: &P7Hmm,
+    abc: &ornament_alphabet::Alphabet,
+    filt: &fwdfilter::Profile,
+    nj: f32,
+    f3: f64,
+) -> (usize, usize, usize, usize) {
+    let l = seq.len().saturating_sub(2);
+    let tile = (2 * w).max(1);
+    let step = w.max(1);
+    let mut tiles: Vec<(usize, usize)> = Vec::new();
+    let mut start = 1usize;
+    loop {
+        let end = (start + tile - 1).min(l);
+        tiles.push((start, end));
+        if end >= l {
+            break;
+        }
+        start += step;
+    }
+
+    tiles
+        .par_iter()
+        .map(|&(s, e)| {
+            let sub = subseq(seq, s, e);
+            let msv = msv_pvalue(hmm, msv_bits(hmm, abc, &sub)) <= MSV_F1;
+            let vit = viterbi_pvalue(hmm, viterbi_bits(hmm, abc, &sub)) <= VIT_F2;
+            let fwd = forward_pvalue(hmm, fwdfilter::window_bits(filt, nj, seq, s, e)) <= f3;
+            (1usize, msv as usize, vit as usize, fwd as usize)
+        })
+        .reduce(
+            || (0, 0, 0, 0),
+            |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2, a.3 + b.3),
+        )
 }
 
 /// Parse the CM's embedded HMMER3/f filter HMM (`fp7`), erroring if it is absent.

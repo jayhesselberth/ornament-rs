@@ -10,7 +10,8 @@
 
 use ornament_alphabet::{read_fasta, Alphabet, Dsq};
 use ornament_scfg::{
-    cm_pipeline_search, configure_local, cyk_search, parse_cm_file, Hit, PipelineParams, Strand,
+    cm_pipeline_search, configure_local, cyk_search, measure_filter_prune_rates, parse_cm_file,
+    Hit, PipelineParams, Strand,
 };
 
 fn load_cm() -> ornament_scfg::Cm {
@@ -214,4 +215,42 @@ fn pipeline_scales_on_long_sparse_sequence() {
         "filter should prune most residues, got {:.1}%",
         100.0 * stats.cm_fraction()
     );
+}
+
+/// `measure_filter_prune_rates` is pure instrumentation: it tiles the strands exactly as the
+/// live pipeline does and counts per-filter passes. Anchor it to the real pipeline — same tile
+/// count, and its Forward-pass count (pre-merge survivors) is `>=` the merged survivor regions.
+#[test]
+fn measure_filter_prune_rates_matches_pipeline_tiling() {
+    let cm = load_cm();
+    let abc = Alphabet::rna();
+    let fa = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/trna_multi.fa");
+    let dsq = abc
+        .digitize(&read_fasta(fa).expect("read fasta")[0].seq)
+        .expect("digitize");
+    let w = cm.w as usize;
+    let p = PipelineParams::default();
+
+    let (_, stats) = cm_pipeline_search(&cm, &dsq, w, 20.0, p).expect("pipeline");
+    let m = measure_filter_prune_rates(&cm, &dsq, w, p).expect("measure");
+
+    // Same tiling as the live pipeline.
+    assert_eq!(
+        m.n_tiles, stats.n_windows,
+        "tile count must match the pipeline"
+    );
+    // Every stage passes no more than all tiles.
+    assert!(m.n_msv_pass <= m.n_tiles);
+    assert!(m.n_vit_pass <= m.n_tiles);
+    assert!(m.n_fwd_pass <= m.n_tiles);
+    // The Forward column is the pipeline's own survivor decision (pre-merge); merging into
+    // maximal regions can only reduce the count.
+    assert!(
+        m.n_fwd_pass >= stats.n_survivors,
+        "forward passes {} < merged survivors {}",
+        m.n_fwd_pass,
+        stats.n_survivors
+    );
+    // The three strong tRNAs must clear every filter.
+    assert!(m.n_fwd_pass >= 1 && m.n_msv_pass >= 1 && m.n_vit_pass >= 1);
 }
