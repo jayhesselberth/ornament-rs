@@ -11,6 +11,7 @@
 pub mod align;
 pub mod cmfile;
 pub mod config;
+pub mod cp9;
 pub mod emit;
 pub mod emitmap;
 pub mod evalues;
