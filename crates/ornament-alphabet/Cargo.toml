@@ -1,0 +1,13 @@
+[package]
+name = "ornament-alphabet"
+description = "Modification-aware digital alphabet and digital sequences for Ornament's covariance-model search. FASTA I/O via noodles; modified bases as first-class symbols."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+noodles-fasta = { workspace = true }
+
+[dev-dependencies]

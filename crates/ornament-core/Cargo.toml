@@ -7,12 +7,9 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
-# Optional: the legacy C FFI path. Off by default so the build needs no ext/ or C
-# toolchain; the native crates below replace it. Enable with --features ffi.
-infernal-sys = { workspace = true, optional = true }
-# Native Rust port of the Infernal/Easel internals.
-easel-rs = { workspace = true }
-infernal-rs = { workspace = true }
+# Native Rust covariance-model search engine.
+ornament-alphabet = { workspace = true }
+ornament-scfg = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
@@ -22,10 +19,5 @@ rayon = { workspace = true }
 lazy_static = { workspace = true }
 regex = { workspace = true }
 bio = { workspace = true }
-
-[features]
-default = []
-# Build the legacy FFI wrappers (requires infernal-sys / ext/ C sources).
-ffi = ["dep:infernal-sys"]
 
 [dev-dependencies]

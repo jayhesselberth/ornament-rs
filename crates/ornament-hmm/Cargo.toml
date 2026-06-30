@@ -1,0 +1,24 @@
+[package]
+name = "ornament-hmm"
+description = "Profile-HMM (HMMER p7) MSV/Viterbi/Forward filters used as Ornament's covariance-model acceleration filter."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lib]
+# Only the explicit criterion benches below should run under `cargo bench`; disable the
+# default libtest bench harness (which doesn't accept criterion's CLI args).
+bench = false
+
+[dependencies]
+ornament-alphabet = { workspace = true }
+ornament-stats = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "p7_filters"
+harness = false

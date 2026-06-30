@@ -7,7 +7,7 @@ Ornament identifies tRNAs in genomic sequences using Infernal covariance models,
 ## Features
 
 - **tRNA scanning** with a native, pure-Rust covariance-model engine
-  (`infernal-rs`) — no external `cmsearch` binary or C toolchain required
+  (`ornament-scfg`) — no external `cmsearch` binary or C toolchain required
 - **Modification database** with 12+ tRNA modifications from MODOMICS
 - **Sprinzl position mapping** (standard tRNA numbering 1-76)
 - **Compatibility analysis** to detect modification-incompatible variants
@@ -74,7 +74,7 @@ The `--engine` flag selects the search backend:
 
 | `--engine`  | Backend                                   | Requirements           |
 |-------------|-------------------------------------------|------------------------|
-| `native`    | pure-Rust `infernal-rs` CYK scanner (**default**) | none           |
+| `native`    | pure-Rust `ornament-scfg` CYK scanner (**default**) | none         |
 | `cmsearch`  | external `cmsearch` subprocess            | Infernal on `PATH`     |
 
 ### Analyze modification compatibility
@@ -99,12 +99,10 @@ ornament/
 ├── ext/                       # Infernal C source — porting reference only (gitignored)
 │   └── infernal/              # Infernal with hmmer/ and easel/
 ├── crates/
-│   ├── easel-rs/              # Native Rust port of the Easel subset
-│   ├── hmmer-rs/             # Native Rust port of the HMMER p7 filters
-│   ├── infernal-rs/          # Native Rust CM engine (default scan backend)
-│   ├── infernal-sys/          # Legacy FFI bindings (optional, --features ffi)
-│   │   ├── build.rs           # Compiles C libraries, generates bindings
-│   │   └── src/lib.rs
+│   ├── ornament-alphabet/    # Modification-aware digital alphabet + FASTA I/O (noodles)
+│   ├── ornament-stats/       # Gumbel/exponential E-value statistics
+│   ├── ornament-hmm/         # Profile-HMM (p7) acceleration filters
+│   ├── ornament-scfg/        # Covariance-model (SCFG) engine (default scan backend)
 │   ├── ornament-core/         # Core library
 │   │   └── src/
 │   │       ├── modification/  # Modification types and database
@@ -138,7 +136,7 @@ The database includes common eukaryotic tRNA modifications:
 
 ## How It Works
 
-1. **Scan**: Use the native `infernal-rs` covariance-model engine (or, with
+1. **Scan**: Use the native `ornament-scfg` covariance-model engine (or, with
    `--engine cmsearch`, the external `cmsearch` subprocess) to find tRNAs in input sequences
 2. **Map**: Align hits to Sprinzl tRNA positions (1-76)
 3. **Analyze**: Check each position for modification compatibility

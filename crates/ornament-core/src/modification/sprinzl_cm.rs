@@ -2,7 +2,7 @@
 //!
 //! This replaces the old broken 1:1 fallback in `analysis::compatibility`. A tRNA sequence
 //! is aligned to a Sprinzl-numbered reference CM (built from clover ground truth; see
-//! `scripts/build-sprinzl-cm.py`) with the native `infernal-rs` glocal aligner, and each
+//! `scripts/build-sprinzl-cm.py`) with the native `ornament-scfg` glocal aligner, and each
 //! matched residue is mapped to its consensus column → Sprinzl label.
 //!
 //! The reference model and its column→label table are embedded so annotation needs no
@@ -11,8 +11,8 @@
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
-use easel_rs::Alphabet;
-use infernal_rs::{align_glocal, configure_scores, parse_cm_str, Cm, EmitMap};
+use ornament_alphabet::Alphabet;
+use ornament_scfg::{align_glocal, configure_scores, parse_cm_str, Cm, EmitMap};
 
 use super::types::SprinzlPosition;
 

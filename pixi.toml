@@ -25,10 +25,9 @@ test = "mold -run cargo nextest run"
 test-doc = "mold -run cargo test --doc"
 check = "mold -run cargo check"
 fmt = "cargo fmt --all"
-# --exclude infernal-sys: the legacy C-FFI crate needs ext/ + a C toolchain.
-clippy = "mold -run cargo clippy --workspace --exclude infernal-sys --all-targets"
+clippy = "mold -run cargo clippy --workspace --all-targets"
 # criterion microbenchmarks (release/LTO codegen); see crates/*/benches.
-bench = "mold -run cargo bench --workspace --exclude infernal-sys"
+bench = "mold -run cargo bench --workspace"
 
 [environments]
 dev = { features = ["dev"], solve-group = "default" }

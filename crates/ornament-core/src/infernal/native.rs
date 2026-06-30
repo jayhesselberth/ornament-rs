@@ -1,4 +1,4 @@
-//! Native CM search path (pure-Rust `infernal-rs` engine).
+//! Native CM search path (pure-Rust `ornament-scfg` engine).
 //!
 //! This is the default `scan` engine: a drop-in replacement for the `cmsearch`
 //! subprocess that needs no external binary or C toolchain. It parses a `.cm`,
@@ -11,7 +11,7 @@ use anyhow::{anyhow, Result};
 use rayon::prelude::*;
 use std::path::Path;
 
-use infernal_rs::{
+use ornament_scfg::{
     calc_qdb_bands, configure_local, cyk_search_banded, parse_cm_file, QdbBands, Strand,
 };
 
@@ -22,7 +22,7 @@ use super::CMHit;
 /// the spurious low-scoring hits, mirroring the differential-test reporting floor.
 const REPORTING_BITS: f32 = 20.0;
 
-/// Scan a FASTA file for CM hits using the native `infernal-rs` engine.
+/// Scan a FASTA file for CM hits using the native `ornament-scfg` engine.
 ///
 /// `e_value` is the maximum E-value reported (mirrors `cmsearch -E`); hits from
 /// calibrated models above it are filtered out. Uncalibrated models (no E-value)
@@ -39,7 +39,7 @@ pub fn scan_native<P: AsRef<Path>, Q: AsRef<Path>>(
         .map_err(|e| anyhow!("failed to parse CM {}: {e}", cm_path.display()))?;
     configure_local(&mut cm); // cmsearch default (local mode)
 
-    let records = easel_rs::read_fasta(fasta)
+    let records = ornament_alphabet::read_fasta(fasta)
         .map_err(|e| anyhow!("failed to read FASTA {}: {e}", fasta.display()))?;
 
     let w_max = cm.w as usize;

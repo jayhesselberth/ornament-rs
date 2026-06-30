@@ -7,10 +7,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 This repository contains two layers:
 
 1. **A native Rust reimplementation of Infernal** — a general-purpose covariance-model
-   (profile-SCFG) homology search engine, *not* tRNA-specific. The `easel-rs` + `hmmer-rs`
-   + `infernal-rs` crate stack reads standard `.cm` models and runs CYK/Inside search,
-   alignment, and E-value calculation natively, replacing the C library + FFI (and the
-   external `cmsearch`/`cmalign` binaries). It works with any Infernal covariance model
+   (profile-SCFG) homology search engine, *not* tRNA-specific. The `ornament-alphabet`
+   + `ornament-stats` + `ornament-hmm` + `ornament-scfg` crate stack reads standard `.cm`
+   models and runs CYK/Inside search, alignment, and E-value calculation natively,
+   replacing the C library + FFI (and the external `cmsearch`/`cmalign` binaries).
+   It works with any Infernal covariance model
    (any Rfam family), validated for parity against the upstream `cmsearch` oracle. It is
    additionally **extended beyond Infernal** with a modification-aware alphabet (modified
    bases as first-class symbols) for RNA-modification analysis and discovery.
@@ -22,9 +23,9 @@ This repository contains two layers:
 
 ## Build Commands
 
-The default build is pure Rust — it does **not** require `ext/` or a C toolchain.
-The native port (`easel-rs`/`hmmer-rs`/`infernal-rs`) replaces the FFI; the legacy
-`infernal-sys` FFI is optional behind `--features ffi` on `ornament-core`.
+The build is pure Rust — it does **not** require `ext/` or a C toolchain. The native
+engine (`ornament-alphabet`/`ornament-stats`/`ornament-hmm`/`ornament-scfg`) is the
+only search backend; `ext/` is kept solely as a porting reference.
 
 ```bash
 # Build (no ext/ needed)
@@ -35,7 +36,7 @@ cargo nextest run --workspace
 cargo test --doc            # nextest does not run doctests
 
 # Run a specific crate's tests
-cargo nextest run -p easel-rs
+cargo nextest run -p ornament-scfg
 
 # Run the CLI
 ./target/debug/ornament mods --position 34
@@ -53,7 +54,7 @@ pixi run -e dev build            # mold -run cargo build
 pixi run -e dev test             # mold -run cargo nextest run
 pixi run -e dev check            # mold -run cargo check
 pixi run -e dev fmt              # cargo fmt --all
-pixi run -e dev clippy           # clippy --workspace --exclude infernal-sys --all-targets
+pixi run -e dev clippy           # clippy --workspace --all-targets
 pixi run -e dev bench            # criterion microbenchmarks (release codegen)
 ```
 
@@ -69,23 +70,21 @@ srun -p rna -c 24 pixi run -e dev bench
 ### Benchmarks
 
 Criterion microbenchmarks establish the scalar baseline for the SIMD/rayon work and act as
-a regression guard. They live in `crates/{hmmer-rs,infernal-rs}/benches/`:
-- `hmmer-rs --bench p7_filters` — MSV / Viterbi / Forward filter DP throughput.
-- `infernal-rs --bench cm_search` — `cm_dp` (scanning CYK/Inside + alignment DP) and
+a regression guard. They live in `crates/{ornament-hmm,ornament-scfg}/benches/`:
+- `ornament-hmm --bench p7_filters` — MSV / Viterbi / Forward filter DP throughput.
+- `ornament-scfg --bench cm_search` — `cm_dp` (scanning CYK/Inside + alignment DP) and
   `cm_search` (both-strand multi-hit search vs. the p7-filtered pipeline).
 
 ```bash
-srun -p rna -c 24 cargo bench -p infernal-rs --bench cm_search
-srun -p rna -c 24 cargo bench -p hmmer-rs --bench p7_filters -- forward   # filter by name
+srun -p rna -c 24 cargo bench -p ornament-scfg --bench cm_search
+srun -p rna -c 24 cargo bench -p ornament-hmm --bench p7_filters -- forward   # filter by name
 ```
 
 The `[profile.bench]` inherits `release` (fat LTO, 1 codegen unit) so benchmarks measure
 shipping codegen. Compare a SIMD/rayon branch against the `main` baseline with criterion's
 saved baselines (`cargo bench -- --save-baseline main` / `--baseline main`).
 
-Only build `--release` when actually needed (release LTO is slow). The workspace
-`default-members` excludes the legacy `infernal-sys` C-FFI crate, so bare `cargo`/`nextest`
-commands skip it (build it explicitly with `-p infernal-sys` or `ornament-core`'s `ffi` feature).
+Only build `--release` when actually needed (release LTO is slow).
 
 `.cargo/config.toml` pins `target-cpu=x86-64-v3` (AVX2/FMA baseline, portable
 across the cluster). AVX-512 hot kernels use runtime `is_x86_feature_detected!`
@@ -104,24 +103,22 @@ dispatch rather than a global baseline bump. See `.config/nextest.toml` for the
 
 ### Workspace Structure
 
-The project is migrating off the Infernal C FFI to a **native Rust port** of the
-covariance-model search internals. Crates:
+The covariance-model search engine is a **native Rust port** (no C FFI). Crates:
 
-- **easel-rs** *(native)*: Rust port of the Easel subset — digital `Alphabet`
-  (extended with first-class modified-base symbols), FASTA `Sequence` I/O,
-  reverse-complement, and Gumbel/exponential survival stats for E-values.
+- **ornament-alphabet** *(native)*: digital `Alphabet` (extended with first-class
+  modified-base symbols), digital `Sequence`, reverse-complement, and FASTA I/O
+  (delegated to the [`noodles`](https://github.com/zaeleus/noodles) library).
 
-- **hmmer-rs** *(native, scaffolding)*: Rust port of the HMMER p7 profile +
-  MSV/Viterbi/Forward filters used as the CM acceleration filter (Phase 5).
+- **ornament-stats** *(native)*: Gumbel / exponential survival functions for
+  E-values (`esl_gumbel_surv` / `esl_exp_surv` ports).
 
-- **infernal-rs** *(native, in progress)*: Rust port of the CM model, `.cm` parser,
+- **ornament-hmm** *(native)*: profile-HMM (HMMER p7) MSV/Viterbi/Forward filters
+  used as the CM acceleration filter.
+
+- **ornament-scfg** *(native)*: the CM (profile-SCFG) model, `.cm` parser,
   `cm_Configure`, emit-map, CYK/Inside scanning DP, alignment/traceback, tophits,
   and E-values. Emission arrays are sized from the alphabet's `K` so the model is
   alphabet-size-generic (modified-base discovery in Phase 8).
-
-- **infernal-sys** *(legacy, optional)*: FFI bindings to the Infernal/HMMER/Easel C
-  libraries. Compiled only with `--features ffi` on `ornament-core`; the `build.rs`
-  compiles C from `ext/infernal/` via bindgen. The native crates replace this.
 
 - **ornament-core**: Core library with modules for:
   - `modification/` - Types (`RnaBase`, `Modification`, `SprinzlPosition`), database of 12+ modifications with position expectations
@@ -132,7 +129,7 @@ covariance-model search internals. Crates:
 
 - **ornament-cli**: CLI binary with subcommands: `scan`, `analyze`, `compare`, `mods`.
   `scan` takes `--engine native|cmsearch` (**default `native`**): `native` runs the
-  pure-Rust `infernal-rs` CYK scanner in-process (`infernal::scan_native`, no external
+  pure-Rust `ornament-scfg` CYK scanner in-process (`infernal::scan_native`, no external
   binary); `cmsearch` shells out to the Infernal subprocess (`InfernalRunner`) as an
   oracle/fallback. Both yield the same `CMHit` records, so the downstream Sprinzl +
   modification analysis is identical.
@@ -143,7 +140,7 @@ covariance-model search internals. Crates:
 
 - **Modification compatibility**: Each modification has a `parent_base` (what it's derived from) and `incompatible_bases` (bases that preclude the modification). If a tRNA has an incompatible base at a position expecting a modification, it's flagged as "odd".
 
-- **Modification-aware alphabet**: `easel-rs`'s `Alphabet` extends the canonical
+- **Modification-aware alphabet**: `ornament-alphabet`'s `Alphabet` extends the canonical
   4-symbol RNA alphabet with registered modified bases (Ψ, D, I, m¹A, …). Each
   modified symbol's degeneracy vector points at its parent canonical base, so
   homology scoring is numerically identical to the stock alphabet while the
@@ -160,5 +157,4 @@ The `ext/` directory (gitignored) holds the Infernal C source used as a **refere
 for the port — it is no longer linked into the default build:
 - `ext/infernal/` - Infernal source (with `hmmer/` and `easel/` subdirectories)
 
-Run `./scripts/setup-deps.sh --clean` to re-clone. Only needed for porting work or
-the optional `--features ffi` legacy path.
+Run `./scripts/setup-deps.sh --clean` to re-clone. Only needed for porting work.

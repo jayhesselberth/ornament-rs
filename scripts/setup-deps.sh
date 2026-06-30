@@ -1,10 +1,9 @@
 #!/bin/bash
 # Clone the Infernal/HMMER/Easel 1.1.5 C sources into ext/.
 #
-# PORTING REFERENCE ONLY: ext/ is *not* a build dependency. The default build is
-# pure Rust (easel-rs/hmmer-rs/infernal-rs) and needs neither ext/ nor a C
-# toolchain. These sources exist only as a reference for the native port and for
-# the optional legacy C-FFI path (ornament-core --features ffi / -p infernal-sys).
+# PORTING REFERENCE ONLY: ext/ is *not* a build dependency. The build is pure Rust
+# (ornament-alphabet/ornament-hmm/ornament-scfg) and needs neither ext/ nor a C
+# toolchain. These sources exist only as a reference for the native port.
 
 set -e
 

@@ -1,0 +1,25 @@
+[package]
+name = "ornament-scfg"
+description = "Covariance-model (profile-SCFG) search engine: .cm parser, CYK/Inside DP, alignment, tophits, and E-values."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lib]
+# Only the explicit criterion bench below runs under `cargo bench`; disable the default
+# libtest bench harness (which doesn't accept criterion's CLI args).
+bench = false
+
+[dependencies]
+ornament-alphabet = { workspace = true }
+ornament-hmm = { workspace = true }
+thiserror = { workspace = true }
+rayon = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "cm_search"
+harness = false

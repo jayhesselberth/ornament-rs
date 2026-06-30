@@ -1,20 +1,10 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/infernal-sys",
-    "crates/easel-rs",
-    "crates/hmmer-rs",
-    "crates/infernal-rs",
-    "crates/ornament-core",
-    "crates/ornament-cli",
-]
-# The legacy C-FFI crate is excluded from default builds (it needs ext/ + a C toolchain).
-# Bare `cargo build`/`nextest` skip it; build it explicitly with `-p infernal-sys` or the
-# `ornament-core` `ffi` feature.
-default-members = [
-    "crates/easel-rs",
-    "crates/hmmer-rs",
-    "crates/infernal-rs",
+    "crates/ornament-alphabet",
+    "crates/ornament-stats",
+    "crates/ornament-hmm",
+    "crates/ornament-scfg",
     "crates/ornament-core",
     "crates/ornament-cli",
 ]
@@ -49,6 +39,7 @@ tempfile = "3"
 
 # Bioinformatics
 bio = "1"
+noodles-fasta = "0.62"
 
 # Parallelism
 rayon = "1"
@@ -57,10 +48,10 @@ rayon = "1"
 criterion = { version = "0.8", features = ["html_reports"] }
 
 # Internal crates
-infernal-sys = { path = "crates/infernal-sys" }
-easel-rs = { path = "crates/easel-rs" }
-hmmer-rs = { path = "crates/hmmer-rs" }
-infernal-rs = { path = "crates/infernal-rs" }
+ornament-alphabet = { path = "crates/ornament-alphabet" }
+ornament-stats = { path = "crates/ornament-stats" }
+ornament-hmm = { path = "crates/ornament-hmm" }
+ornament-scfg = { path = "crates/ornament-scfg" }
 ornament-core = { path = "crates/ornament-core" }
 
 # Fast dev builds, but with optimized third-party crates so the numeric DP and

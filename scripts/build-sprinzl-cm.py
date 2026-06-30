@@ -82,6 +82,6 @@ if __name__ == "__main__":
         "sacCer_global_coords.tsv.gz"
     )
     out = sys.argv[2] if len(sys.argv) > 2 else os.path.join(
-        os.path.dirname(__file__), "..", "crates", "infernal-rs", "tests", "data"
+        os.path.dirname(__file__), "..", "crates", "ornament-scfg", "tests", "data"
     )
     main(coords, out)

@@ -70,7 +70,7 @@ fn hit_to_trna(full: &str, h: &CMHit) -> TRNAHit {
 }
 
 fn read_forward_seq(fasta: &PathBuf) -> String {
-    easel_rs::read_fasta(fasta).expect("read fasta")[0]
+    ornament_alphabet::read_fasta(fasta).expect("read fasta")[0]
         .seq
         .clone()
 }
