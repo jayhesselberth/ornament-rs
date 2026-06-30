@@ -13,9 +13,10 @@
 //!
 //! The CP9 build (1–2) depends only on the CM, so it runs once per model; 3–4 are per sequence.
 //!
-//! Milestone 1 (this file) is foundation scaffolding for the later stages; its items are
-//! exercised by tests now and consumed by the CP9 construction next, hence `allow(dead_code)`.
-#![allow(dead_code)]
+//! These items are foundation scaffolding for the later stages — exercised by tests now and
+//! consumed by the CP9 construction next, hence `allow(dead_code)`. Residue-indexed loops over
+//! the alphabet read clearer as range loops (the index feeds `emit_prob` and indexes the array).
+#![allow(dead_code, clippy::needless_range_loop)]
 
 use crate::emitmap::EmitMap;
 use crate::model::{nd, st, Cm};
@@ -194,11 +195,13 @@ pub(crate) fn build_cp9_map(cm: &Cm) -> Cp9Map {
                 map_helper(cm, &mut map, k, HMM_MATCH, nm(n)); // MATP_MP
                 map_helper(cm, &mut map, k, HMM_MATCH, nm(n) + 2); // MATP_MR
                 attach_right_insert(cm, &mut map, k, &mut map_helper);
-                // The MATP_IR also belongs to the previous column's CP9 insert if that column is
-                // a non-MATL left half (otherwise its contribution would be lost).
+                // The MATP_IR inserts between columns k-1 and k. Whenever k-1 is a left-half
+                // column (MATL or MATP-left), the IR attaches to that previous CP9 node's insert
+                // — including the MATL case, where the column's own (detached) MATL_IL can't model
+                // this insertion, so the MATP_IR is what fills the node's insert.
                 let pk1 = map.pos2nd[k - 1] as usize;
-                if map.nd2lpos[pk1] == (k as i32 - 1) && cm.ndtype[pk1] != nd::MATL {
-                    assert_eq!(cm.ndtype[pk1], nd::MATP, "cp9map: unexpected k-1 node");
+                if map.nd2lpos[pk1] == (k as i32 - 1) {
+                    debug_assert!(cm.ndtype[pk1] == nd::MATL || cm.ndtype[pk1] == nd::MATP);
                     map_helper(cm, &mut map, k - 1, HMM_INSERT, nm(n) + 5); // MATP_IR
                 }
                 map_helper(cm, &mut map, k, HMM_DELETE, nm(n) + 1); // MATP_ML
@@ -255,11 +258,107 @@ fn attach_right_insert(
     }
 }
 
+/// A CM Plan 9 HMM (`CP9_t`), in probability form. `m` nodes (one per consensus column); node 0
+/// carries only the leading insert. Match/insert emissions are over the `k`-symbol alphabet; the
+/// nine Plan-9 transitions per node and the begin/end distributions are filled by the transition
+/// build (milestone 2b-ii) and are left at zero here.
+pub(crate) struct Cp9 {
+    pub m: usize,
+    pub k: usize,
+    /// `[0..=m][0..k]` match emissions (`mat[0]` unused).
+    pub mat: Vec<Vec<f64>>,
+    /// `[0..=m][0..k]` insert emissions (`ins[0]` = the leading ROOT_IL insert).
+    pub ins: Vec<Vec<f64>>,
+    /// `[0..=m][0..9]` Plan-9 transitions (filled in 2b-ii).
+    pub t: Vec<[f64; 9]>,
+    /// `[1..=m]` B→Mk begin / Mk→E end distributions (filled in 2b-ii).
+    pub begin: Vec<f64>,
+    pub end: Vec<f64>,
+}
+
+/// Emission probability of residue `i` from CM state `x` as seen by CP9 node `k` — a port of
+/// `cm2hmm_emit_prob`. Singlet emitters pass through `cm.e`; a pair emitter (MATP_MP) is
+/// **marginalized** onto the column the node models: the left column sums over the right base
+/// (`e[x][i*K .. (i+1)*K]`), the right column strides over the left base (`e[x][i], e[x][i+K], …`).
+fn emit_prob(cm: &Cm, map: &Cp9Map, x: usize, i: usize, k: usize) -> f64 {
+    if cm.stid[x] != crate::model::stid::MATP_MP {
+        return cm.e[x][i] as f64;
+    }
+    let kk = cm.k();
+    let is_left = map.nd2lpos[map.pos2nd[k] as usize] == k as i32;
+    if is_left {
+        (i * kk..(i + 1) * kk).map(|j| cm.e[x][j] as f64).sum()
+    } else {
+        (i..kk * kk).step_by(kk).map(|j| cm.e[x][j] as f64).sum()
+    }
+}
+
+/// Build the CP9 **emissions** (milestone 2b-i): each CP9 match/insert emission is the
+/// occupancy-weighted average of the CM emissions that map to it (`Σ psi[ap]·emit_prob(ap,·)`),
+/// then renormalized to a distribution (the `CPlan9Renormalize` step for emissions). The leading
+/// insert (node 0) is special-cased to ROOT_IL (CM state 1), per `build_cp9_hmm`. Transitions are
+/// left at zero for the next milestone.
+pub(crate) fn build_cp9_emissions(cm: &Cm) -> Cp9 {
+    let map = build_cp9_map(cm);
+    let psi = expected_occupancy(cm);
+    let k = cm.k();
+    let m = map.hmm_m;
+
+    let mut mat = vec![vec![0.0f64; k]; m + 1];
+    let mut ins = vec![vec![0.0f64; k]; m + 1];
+
+    // Node 0's insert maps to ROOT_IL = CM state 1.
+    for i in 0..k {
+        ins[0][i] = cm.e[1][i] as f64;
+    }
+    for node in 1..=m {
+        for slot in 0..2 {
+            let ap = map.hns2cs[node][HMM_MATCH][slot];
+            if ap >= 0 {
+                for i in 0..k {
+                    mat[node][i] += psi[ap as usize] * emit_prob(cm, &map, ap as usize, i, node);
+                }
+            }
+            let ai = map.hns2cs[node][HMM_INSERT][slot];
+            if ai >= 0 {
+                for i in 0..k {
+                    ins[node][i] += psi[ai as usize] * emit_prob(cm, &map, ai as usize, i, node);
+                }
+            }
+        }
+    }
+
+    // Renormalize each emission vector to a probability distribution.
+    let renorm = |v: &mut [f64]| {
+        let s: f64 = v.iter().sum();
+        if s > 0.0 {
+            v.iter_mut().for_each(|x| *x /= s);
+        }
+    };
+    for node in 0..=m {
+        renorm(&mut ins[node]);
+        if node >= 1 {
+            renorm(&mut mat[node]);
+        }
+    }
+
+    Cp9 {
+        m,
+        k,
+        mat,
+        ins,
+        t: vec![[0.0; 9]; m + 1],
+        begin: vec![0.0; m + 1],
+        end: vec![0.0; m + 1],
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::cmfile::parse_cm_file;
     use crate::config::configure_scores;
+    use crate::model::stid;
 
     /// Infernal's own correctness check for `psi`: over every node, the occupancy of the
     /// split-set (non-insert) states must sum to 1 — each node is visited once per parse, its
@@ -338,5 +437,71 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// CP9 emissions must be probability distributions, and a singlet (MATL) column must
+    /// reproduce the CM's consensus emission exactly (its match maps to one CM state, MATL_ML).
+    #[test]
+    fn cp9_emissions_are_distributions() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/tRNA.cm");
+        let mut cm = parse_cm_file(path).expect("parse tRNA.cm");
+        configure_scores(&mut cm);
+        let map = build_cp9_map(&cm);
+        let hmm = build_cp9_emissions(&cm);
+
+        for node in 1..=hmm.m {
+            let s: f64 = hmm.mat[node].iter().sum();
+            assert!((s - 1.0).abs() < 1e-9, "mat[{node}] sums to {s}");
+        }
+        for node in 0..=hmm.m {
+            let s: f64 = hmm.ins[node].iter().sum();
+            assert!((s - 1.0).abs() < 1e-9, "ins[{node}] sums to {s}");
+        }
+
+        // A MATL column (match maps to a single MATL_ML state) reproduces the CM emission.
+        for node in 0..=hmm.m {
+            if hmm.ins[node].iter().sum::<f64>() == 0.0 {
+                let n = map.pos2nd[node];
+                let nt = if n >= 0 {
+                    cm.ndtype[n as usize] as i32
+                } else {
+                    -1
+                };
+                let nn = if node < hmm.m {
+                    map.pos2nd[node + 1]
+                } else {
+                    -1
+                };
+                let nnt = if nn >= 0 {
+                    cm.ndtype[nn as usize] as i32
+                } else {
+                    -1
+                };
+                eprintln!("DBG empty-ins node={node} ndtype={nt} hns2cs_ins={:?} k+1_nd={nn} k+1_type={nnt} nd2lpos[k+1nd]={} nd2rpos[k+1nd]={}",
+                    map.hns2cs[node][HMM_INSERT], if nn>=0 {map.nd2lpos[nn as usize]} else {-99}, if nn>=0 {map.nd2rpos[nn as usize]} else {-99});
+            }
+        }
+        let mut checked = 0;
+        for node in 1..=hmm.m {
+            let n = map.pos2nd[node] as usize;
+            if cm.ndtype[n] == nd::MATL && map.hns2cs[node][HMM_MATCH][1] == -1 {
+                let ml = cm.nodemap[n]; // MATL_ML
+                assert_eq!(cm.stid[ml], stid::MATL_ML);
+                // Compare against the *renormalized* CM emission (the CP9 build renormalizes, and
+                // the stored f32 distribution doesn't sum to exactly 1).
+                let denom: f64 = (0..hmm.k).map(|i| cm.e[ml][i] as f64).sum();
+                for i in 0..hmm.k {
+                    let want = cm.e[ml][i] as f64 / denom;
+                    assert!(
+                        (hmm.mat[node][i] - want).abs() < 1e-9,
+                        "MATL column {node} emission[{i}] {} != cm.e {}",
+                        hmm.mat[node][i],
+                        want
+                    );
+                }
+                checked += 1;
+            }
+        }
+        assert!(checked > 0, "expected at least one MATL column to validate");
     }
 }
