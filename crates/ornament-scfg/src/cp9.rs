@@ -7,8 +7,8 @@
 //!   2. the CP9 HMM construction — CM↔CP9 map, occupancy-weighted emissions, subpath-summation
 //!      transitions + begin/end — validated by the psi-vs-phi occupancy check (`build_cp9`).  ✓
 //!   3. CP9 Forward / Backward + posteriors (per sequence), validated F==B + Σ posteriors==1.  ✓
-//!   4. posteriors → HMM position bands → CM i,j bands → per-j d-bands (`hdmin`/`hdmax`).  ← next
-//!   5. the doubly-ragged (j- and d-banded) CYK kernel that consumes them.
+//!   4. posteriors → HMM position bands → CM i,j bands → per-j d-bands (`hdmin`/`hdmax`).  ✓
+//!   5. the doubly-ragged (j- and d-banded) CYK kernel that consumes them.  ← next
 //!
 //! The CP9 build (1–2) depends only on the CM, so it runs once per model; 3–4 are per sequence.
 //!
@@ -18,7 +18,7 @@
 #![allow(dead_code, clippy::needless_range_loop)]
 
 use crate::emitmap::EmitMap;
-use crate::model::{nd, st, Cm};
+use crate::model::{emits_left, n_emit, nd, st, stid, Cm};
 use ornament_alphabet::Dsq;
 
 /// `ln(p)`, mapping `p ≤ 0` to −∞ (the log-space sentinel).
@@ -1016,6 +1016,796 @@ pub(crate) fn cp9_fb2hmmbands(
     bands
 }
 
+// ---------------------------------------------------------------------------
+// Milestone 4b: HMM position bands -> CM per-state i,j bands -> per-j d-bands.
+//
+// Ports `HMMBandsEnforceValidParse` + `cp9_HMM2ijBands` + `ij2d_bands` from
+// `hmmband.c`, restricted to the glocal case we run (no local begins/ends, no
+// EL, `do_trunc = FALSE`): all the local/truncation/EL branches drop out.
+// ---------------------------------------------------------------------------
+
+/// Per-CM-state position bands derived from the CP9 HMM bands. `imin[v]..imax[v]` is the band on
+/// the left border `i`, `jmin[v]..jmax[v]` the band on the right border `j` of the subsequence
+/// emitted by the subtree rooted at state `v` (1-based positions). The sentinel for an unreachable
+/// state is `imin=-1, imax=-2` (likewise for `j`). `hdmin[v][j-jmin[v]] .. hdmax[v][..]` is the
+/// per-`(v,j)` band on the subsequence length `d` — the "doubly-ragged" structure the banded CYK
+/// (milestone 5) consumes.
+pub(crate) struct Cp9Bands {
+    pub m: usize,
+    pub imin: Vec<i32>,
+    pub imax: Vec<i32>,
+    pub jmin: Vec<i32>,
+    pub jmax: Vec<i32>,
+    pub hdmin: Vec<Vec<i32>>,
+    pub hdmax: Vec<Vec<i32>>,
+}
+
+/// The "reachable residue" bands per HMM state, filled by [`hmm_bands_enforce_valid_parse`]. For
+/// each HMM state, `r_*n[k]..r_*x[k]` is the set of residue positions for which that state is
+/// reachable under *some* HMM parse that stays within the position bands. The `r_nn_i`/`r_nx_i`
+/// (used to set CM `i` bands) and `r_nn_j`/`r_nx_j` (used for `j` bands) differ by an off-by-one on
+/// the non-emitting delete/`M_0` states (see the long comment in the C source).
+struct RBands {
+    r_mn: Vec<i32>,
+    r_mx: Vec<i32>,
+    r_in: Vec<i32>,
+    r_ix: Vec<i32>,
+    r_dn: Vec<i32>,
+    r_dx: Vec<i32>,
+    r_nn_i: Vec<i32>,
+    r_nx_i: Vec<i32>,
+    r_nn_j: Vec<i32>,
+    r_nx_j: Vec<i32>,
+}
+
+/// `HMMBandsFillGap`: two transitions into the same HMM state imply reachable ranges with a hole
+/// between them; widen `I_k`'s position band so the hole can be bridged, letting us treat the
+/// merged range as reachable. Mutates `pn_*_i[k]`. (`max2` is unused, mirroring the C signature.)
+#[allow(clippy::too_many_arguments)]
+fn hmm_bands_fill_gap(
+    bands: &mut HmmBands,
+    k: usize,
+    min1: i32,
+    min2: i32,
+    prv_nd_r_mn: i32,
+    prv_nd_r_dn: i32,
+) {
+    let right_min = if min1 <= min2 { min2 } else { min1 };
+    let mut in_ = i32::MAX;
+    if prv_nd_r_mn != i32::MAX {
+        in_ = in_.min(prv_nd_r_mn + 1);
+    }
+    if prv_nd_r_dn != i32::MAX {
+        in_ = in_.min(prv_nd_r_dn);
+    }
+    let ix = right_min - 1;
+    bands.pn_min_i[k] = if bands.pn_min_i[k] != -1 {
+        bands.pn_min_i[k].min(in_)
+    } else {
+        in_
+    };
+    bands.pn_max_i[k] = if bands.pn_max_i[k] != -1 {
+        bands.pn_max_i[k].max(ix)
+    } else {
+        ix
+    };
+}
+
+/// `HMMBandsFixUnreachable`: node `k` can't be reached within the current position bands. Greedily
+/// widen the bands (scenario 1: let `I_{k-1}` emit the missing residues; scenario 2: force the
+/// delete states of nodes `k..` to be used) so that at least one parse reaches `k`. Mutates the
+/// `pn_*` bands. Only fires for impractically tight `tau`.
+fn hmm_bands_fix_unreachable(bands: &mut HmmBands, k: usize, r_prv_min: i32) {
+    let mut nxt_m = -1i32;
+    let mut nxt_d = -1i32;
+    if bands.pn_min_m[k] != -1 && bands.pn_max_m[k] != -1 && bands.pn_max_m[k] - 1 > r_prv_min {
+        nxt_m = (bands.pn_min_m[k] - 1).max(r_prv_min);
+    }
+    if bands.pn_min_d[k] != -1 && bands.pn_max_d[k] != -1 && bands.pn_max_d[k] > r_prv_min {
+        nxt_d = bands.pn_min_d[k].max(r_prv_min);
+    }
+    if nxt_m != -1 || nxt_d != -1 {
+        // scenario 1: bridge the hole with I_{k-1}.
+        let nxt_n = if nxt_m == -1 {
+            nxt_d
+        } else if nxt_d == -1 {
+            nxt_m
+        } else {
+            nxt_m.min(nxt_d)
+        };
+        bands.pn_min_i[k - 1] = if bands.pn_min_i[k - 1] != -1 {
+            bands.pn_min_i[k - 1].min(r_prv_min + 1)
+        } else {
+            r_prv_min + 1
+        };
+        bands.pn_max_i[k - 1] = if bands.pn_max_i[k - 1] != -1 {
+            bands.pn_max_i[k - 1].max(nxt_n)
+        } else {
+            nxt_n
+        };
+    } else {
+        // scenario 2: force delete states k..kp to absorb the over-emitted residues.
+        let mut kp = k;
+        while kp <= bands.m
+            && bands.pn_max_m[kp] < (r_prv_min + 1)
+            && bands.pn_max_d[kp] < r_prv_min
+        {
+            bands.pn_min_d[kp] = r_prv_min;
+            bands.pn_max_d[kp] = r_prv_min;
+            kp += 1;
+        }
+    }
+}
+
+/// Port of `HMMBandsEnforceValidParse` (glocal). Walks the HMM left-to-right propagating, for each
+/// state, the residue positions reachable under the position bands; where the bands admit no parse
+/// it widens them (via [`hmm_bands_fill_gap`] / [`hmm_bands_fix_unreachable`]) so a parse exists.
+/// Returns the `r_*` reachable bands consumed by [`cp9_hmm2ij_bands`]. Mutates `bands` in place.
+fn hmm_bands_enforce_valid_parse(
+    s: &Cp9Scores,
+    bands: &mut HmmBands,
+    i0: i32,
+    j0: i32,
+    doing_search: bool,
+) -> RBands {
+    let hmm_m = bands.m;
+    let big = i32::MAX;
+    let small = i32::MIN;
+    let n1 = hmm_m + 1;
+    let mut r_mn = vec![big; n1];
+    let mut r_mx = vec![small; n1];
+    let mut r_in = vec![big; n1];
+    let mut r_ix = vec![small; n1];
+    let mut r_dn = vec![big; n1];
+    let mut r_dx = vec![small; n1];
+    let mut r_nn_i = vec![big; n1];
+    let mut r_nx_i = vec![small; n1];
+    let mut r_nn_j = vec![big; n1];
+    let mut r_nx_j = vec![small; n1];
+    let mut r_nn_hmm = vec![big; n1];
+    let mut r_nx_hmm = vec![small; n1];
+    let mut r_begn = big;
+    let mut r_begx = small;
+    let mut r_endn = big;
+    let mut r_endx = small;
+    let mut was_unr = vec![false; n1];
+    let mut filled_gap = vec![false; n1];
+
+    if bands.pn_min_m[0] != -1 {
+        r_mn[0] = bands.pn_min_m[0];
+        r_mx[0] = bands.pn_max_m[0];
+    }
+
+    // Transition relaxation into a target state's reachable band: project the source band forward by
+    // `sd`, clip to the target's position band, and fold it in. Returns the (n, x) actually folded
+    // (or None if there's no overlap). Inlined as a closure-free helper to keep the borrow simple.
+    let mut k: i32 = 0;
+    while k <= hmm_m as i32 {
+        let ku = k as usize;
+        let mut just_filled_gap = false;
+
+        // --- transitions to the insert of node k (I_k) ---
+        if r_mn[ku] <= r_mx[ku] && bands.pn_min_i[ku] != -1 {
+            let n = r_mn[ku] + 1;
+            let x = r_mx[ku] + 1;
+            if x.min(bands.pn_max_i[ku]) - n.max(bands.pn_min_i[ku]) >= 0 {
+                r_in[ku] = r_in[ku].min(n.max(bands.pn_min_i[ku]).min(bands.pn_max_i[ku]));
+                r_ix[ku] = r_ix[ku].max(x.min(bands.pn_max_i[ku]));
+            }
+        }
+        if r_dn[ku] <= r_dx[ku] && bands.pn_min_i[ku] != -1 {
+            let n = r_dn[ku] + 1;
+            let x = r_dx[ku] + 1;
+            if x.min(bands.pn_max_i[ku]) - n.max(bands.pn_min_i[ku]) >= 0 {
+                r_in[ku] = r_in[ku].min(n.max(bands.pn_min_i[ku]).min(bands.pn_max_i[ku]));
+                r_ix[ku] = r_ix[ku].max(x.min(bands.pn_max_i[ku]));
+            }
+        }
+        if r_in[ku] <= r_ix[ku] && bands.pn_min_i[ku] != -1 {
+            // self-emitter: once entered we can emit up to pn_max_i[k].
+            if r_in[ku] <= bands.pn_max_i[ku] {
+                r_ix[ku] = bands.pn_max_i[ku];
+            } else {
+                r_in[ku] = big;
+                r_ix[ku] = small;
+            }
+        }
+
+        // --- transitions to the match of node k+1 (M_{k+1}) ---
+        if k < hmm_m as i32 && bands.pn_min_m[ku + 1] != -1 {
+            // sources: M_k, D_k, I_k (all project by +1 onto the match band).
+            let srcs = [
+                (r_mn[ku], r_mx[ku]),
+                (r_dn[ku], r_dx[ku]),
+                (r_in[ku], r_ix[ku]),
+            ];
+            for (sn, sx) in srcs {
+                if sn > sx {
+                    continue;
+                }
+                let n = sn + 1;
+                let x = sx + 1;
+                if x.min(bands.pn_max_m[ku + 1]) - n.max(bands.pn_min_m[ku + 1]) >= 0 {
+                    let n = n.max(bands.pn_min_m[ku + 1]).min(bands.pn_max_m[ku + 1]);
+                    let x = x.min(bands.pn_max_m[ku + 1]);
+                    if r_mn[ku + 1] != big && x.min(r_mx[ku + 1]) - n.max(r_mn[ku + 1]) < -1 {
+                        hmm_bands_fill_gap(bands, ku, n, r_mn[ku + 1], r_mn[ku - 1], r_dn[ku - 1]);
+                        just_filled_gap = true;
+                    }
+                    r_mn[ku + 1] = r_mn[ku + 1].min(n);
+                    r_mx[ku + 1] = r_mx[ku + 1].max(x);
+                }
+            }
+        }
+        // --- transitions to the END state (glocal: only from the last node) ---
+        if k == hmm_m as i32 {
+            if r_mn[ku] <= r_mx[ku] && s.esc[ku].is_finite() {
+                r_endn = r_endn.min(r_mn[ku]);
+                r_endx = r_endx.max(r_mx[ku]);
+            }
+            if r_dn[ku] <= r_dx[ku] && s.tsc[ku][CTDM].is_finite() {
+                r_endn = r_endn.min(r_dn[ku]);
+                r_endx = r_endx.max(r_dx[ku]);
+            }
+            if r_in[ku] <= r_ix[ku] && s.tsc[ku][CTIM].is_finite() {
+                r_endn = r_endn.min(r_in[ku]);
+                r_endx = r_endx.max(r_in[ku]); // C uses r_in[k] for both ends here
+            }
+        }
+
+        // --- transitions to the delete of node k+1 (D_{k+1}) ---
+        if k < hmm_m as i32 && bands.pn_min_d[ku + 1] != -1 {
+            // sources: M_k, I_k, D_k (deletes don't emit, so no +1).
+            let srcs = [
+                (r_mn[ku], r_mx[ku]),
+                (r_in[ku], r_ix[ku]),
+                (r_dn[ku], r_dx[ku]),
+            ];
+            for (sn, sx) in srcs {
+                if sn > sx {
+                    continue;
+                }
+                let n = sn;
+                let x = sx;
+                if x.min(bands.pn_max_d[ku + 1]) - n.max(bands.pn_min_d[ku + 1]) >= 0 {
+                    let n = n.max(bands.pn_min_d[ku + 1]).min(bands.pn_max_d[ku + 1]);
+                    let x = x.min(bands.pn_max_d[ku + 1]);
+                    if r_dn[ku + 1] != big && x.min(r_dx[ku + 1]) - n.max(r_dn[ku + 1]) < -1 {
+                        hmm_bands_fill_gap(bands, ku, n, r_dn[ku + 1], r_mn[ku - 1], r_dn[ku - 1]);
+                        just_filled_gap = true;
+                    }
+                    r_dn[ku + 1] = r_dn[ku + 1].min(n);
+                    r_dx[ku + 1] = r_dx[ku + 1].max(x);
+                }
+            }
+        }
+
+        // --- update the reachable-by-node bands (r_nn_*, r_nx_*) ---
+        if r_mn[ku] <= r_mx[ku] {
+            r_nn_hmm[ku] = r_nn_hmm[ku].min(r_mn[ku]);
+            r_nx_hmm[ku] = r_nx_hmm[ku].max(r_mx[ku]);
+            if ku != hmm_m {
+                r_nn_i[ku + 1] = r_nn_i[ku + 1].min(r_mn[ku] + 1);
+                r_nx_i[ku + 1] = r_nx_i[ku + 1].max(r_mx[ku] + 1);
+            }
+            if ku != 0 {
+                r_nn_j[ku - 1] = r_nn_j[ku - 1].min(r_mn[ku] - 1);
+                r_nx_j[ku - 1] = r_nx_j[ku - 1].max(r_mx[ku] - 1);
+            }
+            if ku == hmm_m {
+                if doing_search {
+                    r_nn_j[ku] = r_nn_j[ku].min(r_mn[ku]);
+                    r_nx_j[ku] = r_nx_j[ku].max(r_mx[ku]);
+                } else if r_mx[ku] == j0 {
+                    r_nn_j[ku] = r_nn_j[ku].min(j0);
+                    r_nx_j[ku] = r_nx_j[ku].max(j0);
+                }
+            }
+            if ku == 1 {
+                if doing_search {
+                    r_nn_i[ku] = r_nn_i[ku].min(r_mn[ku]);
+                    r_nx_i[ku] = r_nx_i[ku].max(r_mx[ku]);
+                    r_begn = r_begn.min(r_mn[ku]);
+                    r_begx = r_begx.max(r_mx[ku]);
+                } else if r_mn[ku] == i0 {
+                    r_nn_i[ku] = r_nn_i[ku].min(i0);
+                    r_nx_i[ku] = r_nx_i[ku].max(i0);
+                }
+            }
+        }
+        if r_in[ku] <= r_ix[ku] {
+            r_nn_hmm[ku] = r_nn_hmm[ku].min(r_in[ku]);
+            r_nx_hmm[ku] = r_nx_hmm[ku].max(r_ix[ku]);
+            if ku != hmm_m {
+                r_nn_i[ku + 1] = r_nn_i[ku + 1].min(r_in[ku] + 1);
+                r_nx_i[ku + 1] = r_nx_i[ku + 1].max(r_ix[ku] + 1);
+            }
+            r_nn_j[ku] = r_nn_j[ku].min(r_in[ku] - 1);
+            r_nx_j[ku] = r_nx_j[ku].max(r_ix[ku] - 1);
+            if ku == 0 {
+                r_begn = r_begn.min(r_in[ku]);
+                r_begx = r_begx.max(r_ix[ku]);
+            }
+        }
+        if r_dn[ku] <= r_dx[ku] {
+            r_nn_hmm[ku] = r_nn_hmm[ku].min(r_dn[ku]);
+            r_nx_hmm[ku] = r_nx_hmm[ku].max(r_dx[ku]);
+            if ku != hmm_m {
+                r_nn_i[ku + 1] = r_nn_i[ku + 1].min(r_dn[ku] + 1); // off-by-one
+                r_nx_i[ku + 1] = r_nx_i[ku + 1].max(r_dx[ku] + 1);
+            }
+            if ku != 0 {
+                r_nn_j[ku - 1] = r_nn_j[ku - 1].min(r_dn[ku]);
+                r_nx_j[ku - 1] = r_nx_j[ku - 1].max(r_dx[ku]);
+            }
+            if ku == 1 {
+                r_begn = r_begn.min(r_dn[ku] + 1);
+                r_begx = r_begx.max(r_dx[ku] + 1);
+            }
+        }
+
+        // --- is the node reachable? if not, widen bands and reprocess ---
+        if r_mn[ku] > r_mx[ku] && r_dn[ku] > r_dx[ku] {
+            assert!(ku != 0);
+            assert!(!was_unr[ku], "cp9 bands: node {ku} unreachable on 2nd pass");
+            was_unr[ku] = true;
+            hmm_bands_fix_unreachable(bands, ku, r_nn_hmm[ku - 1]);
+            k -= 2; // reprocess from k-1 after the loop's k += 1
+        } else if just_filled_gap {
+            assert!(
+                !filled_gap[ku],
+                "cp9 bands: node {ku} gap-filled on 2nd pass"
+            );
+            filled_gap[ku] = true;
+            k -= 1; // reprocess k after the loop's k += 1
+        }
+        k += 1;
+    }
+
+    // Alignment pins the first/last emitted residue; search leaves the begin/end ranges as found.
+    if !doing_search {
+        r_begn = i0;
+        r_begx = i0;
+        r_endn = j0;
+        r_endx = j0;
+    }
+    r_nn_i[1] = r_nn_i[1].min(r_begn);
+    r_nx_i[1] = r_nx_i[1].max(r_begx);
+    r_nn_j[hmm_m] = r_nn_j[hmm_m].min(r_endn);
+    r_nx_j[hmm_m] = r_nx_j[hmm_m].max(r_endx);
+
+    // Convert the INT_MAX/INT_MIN sentinels to the -1/-2 the band setter expects.
+    let fix = |v: &mut [i32], lo: i32| {
+        for x in v.iter_mut() {
+            if *x == big {
+                *x = -1;
+            }
+            if *x == small {
+                *x = lo;
+            }
+        }
+    };
+    fix(&mut r_mn, -1);
+    fix(&mut r_mx, -2);
+    fix(&mut r_in, -1);
+    fix(&mut r_ix, -2);
+    fix(&mut r_dn, -1);
+    fix(&mut r_dx, -2);
+    fix(&mut r_nn_i, -1);
+    fix(&mut r_nx_i, -2);
+    fix(&mut r_nn_j, -1);
+    fix(&mut r_nx_j, -2);
+
+    RBands {
+        r_mn,
+        r_mx,
+        r_in,
+        r_ix,
+        r_dn,
+        r_dx,
+        r_nn_i,
+        r_nx_i,
+        r_nn_j,
+        r_nx_j,
+    }
+}
+
+/// `ij2d_bands` (glocal, `do_trunc = FALSE`): from the per-state i,j bands, derive the per-`(v,j)`
+/// band on the subsequence length `d`. `hdmin[v]`/`hdmax[v]` are indexed by `jp = j - jmin[v]`.
+fn ij2d_bands(cm: &Cm, b: &mut Cp9Bands) {
+    for v in 0..cm.m {
+        let jspan = (b.jmax[v] - b.jmin[v]).max(-1); // -1 if unreachable -> empty
+        let nj = (jspan + 1).max(0) as usize;
+        let mut hdmin = vec![0i32; nj];
+        let mut hdmax = vec![0i32; nj];
+        if cm.sttype[v] == st::E {
+            // E states always emit d=0.
+            for jp in 0..nj {
+                hdmin[jp] = 0;
+                hdmax[jp] = 0;
+            }
+        } else {
+            let sd = n_emit(cm.sttype[v]) as i32;
+            for jp in 0..nj {
+                let j = jp as i32 + b.jmin[v];
+                let hdn = j - b.imax[v] + 1;
+                let hdx = j - b.imin[v] + 1;
+                if hdx < sd {
+                    hdmin[jp] = -1;
+                    hdmax[jp] = -2;
+                } else {
+                    hdmin[jp] = hdn.max(sd);
+                    hdmax[jp] = hdx;
+                }
+            }
+        }
+        b.hdmin[v] = hdmin;
+        b.hdmax[v] = hdmax;
+    }
+}
+
+/// Port of `cp9_HMM2ijBands` (glocal, `do_trunc = FALSE`). Maps the HMM position bands onto CM
+/// per-state i,j bands by walking the guide tree left-to-right (each node visited on the left then
+/// the right, around the perimeter of the tree), then derives the per-j d-bands via [`ij2d_bands`].
+/// `bands` is mutated by the enforce-valid-parse pass. `i0`/`j0` are the 1-based window endpoints.
+pub(crate) fn cp9_hmm2ij_bands(
+    cm: &Cm,
+    map: &Cp9Map,
+    s: &Cp9Scores,
+    bands: &mut HmmBands,
+    i0: i32,
+    j0: i32,
+    doing_search: bool,
+) -> Cp9Bands {
+    let hmm_m = bands.m;
+    let r = hmm_bands_enforce_valid_parse(s, bands, i0, j0, doing_search);
+
+    let m = cm.m;
+    let mut imin = vec![-1i32; m];
+    let mut imax = vec![-2i32; m];
+    let mut jmin = vec![-1i32; m];
+    let mut jmax = vec![-2i32; m];
+
+    // Perimeter traversal: a stack of (on_right, node); a side-stack of remembered lpos for BIFs.
+    let mut nd_pda: Vec<(bool, usize)> = vec![(false, 0)];
+    let mut lpos_pda: Vec<i32> = Vec::new();
+    let mut lpos: i32 = 0;
+    let mut rpos: i32 = 0;
+
+    while let Some((on_right, n)) = nd_pda.pop() {
+        if on_right {
+            match cm.ndtype[n] {
+                nd::BIF => {
+                    let v = cm.nodemap[n];
+                    let w = cm.cfirst[v] as usize; // BEGL_S
+                    let y = cm.cnum[v] as usize; // BEGR_S
+                    imin[v] = if imin[w] != -1 { imin[w] } else { imin[y] };
+                    imax[v] = if imax[w] != -2 { imax[w] } else { imax[y] };
+                    jmin[v] = if jmin[y] != -1 { jmin[y] } else { jmin[w] };
+                    jmax[v] = if jmax[y] != -2 { jmax[y] } else { jmax[w] };
+                    // If either child is unreachable (only possible with local on, but kept), make
+                    // the whole bifurcation unreachable.
+                    if imin[w] == -1
+                        || jmin[w] == -1
+                        || imin[y] == -1
+                        || jmin[y] == -1
+                        || imax[w] == -2
+                        || jmax[y] == -2
+                    {
+                        imin[v] = -1;
+                        imin[w] = -1;
+                        imin[y] = -1;
+                        jmin[v] = -1;
+                        jmin[w] = -1;
+                        jmin[y] = -1;
+                        imax[v] = -2;
+                        imax[w] = -2;
+                        imax[y] = -2;
+                        jmax[v] = -2;
+                        jmax[w] = -2;
+                        jmax[y] = -2;
+                        imin[y + 1] = -1;
+                        jmin[y + 1] = -1;
+                        imax[y + 1] = -2;
+                        jmax[y + 1] = -2;
+                    }
+                }
+                nd::MATP => {
+                    lpos = map.nd2lpos[n];
+                    rpos = map.nd2rpos[n];
+                    let v = cm.nodemap[n];
+                    let rp = rpos as usize;
+                    jmin[v] = r.r_mn[rp]; // MATP_MP
+                    jmax[v] = r.r_mx[rp];
+                    jmin[v + 1] = r.r_dn[rp]; // MATP_ML
+                    jmax[v + 1] = r.r_dx[rp];
+                    jmin[v + 2] = r.r_mn[rp]; // MATP_MR
+                    jmax[v + 2] = r.r_mx[rp];
+                    jmin[v + 3] = r.r_dn[rp]; // MATP_D
+                    jmax[v + 3] = r.r_dx[rp];
+                    jmin[v + 4] = r.r_nn_j[rp - 1]; // MATP_IL
+                    jmax[v + 4] = r.r_nx_j[rp - 1];
+                    jmin[v + 5] = r.r_in[rp - 1]; // MATP_IR
+                    jmax[v + 5] = r.r_ix[rp - 1];
+                    imin[v + 5] = r.r_nn_i[(lpos + 1) as usize];
+                    imax[v + 5] = r.r_nx_i[(lpos + 1) as usize];
+                }
+                nd::MATL => {
+                    lpos = map.nd2lpos[n];
+                    let v = cm.nodemap[n];
+                    let rp = rpos as usize;
+                    jmin[v] = r.r_nn_j[rp]; // MATL_ML
+                    jmax[v] = r.r_nx_j[rp];
+                    jmin[v + 1] = r.r_nn_j[rp]; // MATL_D
+                    jmax[v + 1] = r.r_nx_j[rp];
+                    jmin[v + 2] = r.r_nn_j[rp]; // MATL_IL
+                    jmax[v + 2] = r.r_nx_j[rp];
+                }
+                nd::MATR => {
+                    rpos = map.nd2rpos[n];
+                    let v = cm.nodemap[n];
+                    let rp = rpos as usize;
+                    let lp = lpos as usize;
+                    jmin[v] = r.r_mn[rp]; // MATR_MR
+                    jmax[v] = r.r_mx[rp];
+                    imin[v] = r.r_nn_i[lp];
+                    imax[v] = r.r_nx_i[lp];
+                    jmin[v + 1] = r.r_dn[rp]; // MATR_D
+                    jmax[v + 1] = r.r_dx[rp];
+                    imin[v + 1] = r.r_nn_i[lp];
+                    imax[v + 1] = r.r_nx_i[lp];
+                    jmin[v + 2] = r.r_in[rp - 1]; // MATR_IR
+                    jmax[v + 2] = r.r_ix[rp - 1];
+                    imin[v + 2] = r.r_nn_i[lp];
+                    imax[v + 2] = r.r_nx_i[lp];
+                }
+                nd::BEGL | nd::BEGR => {
+                    let v = cm.nodemap[n];
+                    let mut imn = i32::MAX;
+                    let mut imx = i32::MIN;
+                    let mut jmn = i32::MAX;
+                    let mut jmx = i32::MIN;
+                    let cf = cm.cfirst[v] as usize;
+                    let cn = cm.cnum[v] as usize;
+                    for y in cf..cf + cn {
+                        if imin[y] != -1 {
+                            imn = imn.min(imin[y]);
+                            imx = imx.max(imax[y]);
+                        }
+                        if jmin[y] != -1 {
+                            jmn = jmn.min(jmin[y]);
+                            jmx = jmx.max(jmax[y]);
+                        }
+                    }
+                    if imn == i32::MAX {
+                        imin[v] = -1;
+                        imax[v] = -2;
+                    } else {
+                        imin[v] = imn;
+                        imax[v] = imx;
+                    }
+                    if jmn == i32::MAX {
+                        jmin[v] = -1;
+                        jmax[v] = -2;
+                    } else {
+                        jmin[v] = jmn;
+                        jmax[v] = jmx;
+                    }
+                    if cm.ndtype[n] == nd::BEGR {
+                        // BEGR_IL: i band explicit from the HMM, emits before lpos.
+                        let il = v + 1;
+                        imin[il] = r.r_in[(lpos - 1) as usize];
+                        imax[il] = r.r_ix[(lpos - 1) as usize];
+                        if imin[il - 1] != -1 && imin[il] != -1 {
+                            imin[il - 1] = imin[il - 1].min(imin[il]);
+                            jmin[il] = if jmin[il - 1] == -1 {
+                                -1
+                            } else {
+                                jmin[il - 1].max(i0)
+                            };
+                            jmax[il] = jmax[il - 1];
+                        } else {
+                            imin[il] = -1;
+                            jmin[il] = -1;
+                            imax[il] = -2;
+                            jmax[il] = -2;
+                        }
+                        lpos = lpos_pda.pop().expect("lpos_pda underflow");
+                    } else {
+                        lpos_pda.push(lpos);
+                        lpos = rpos + 1; // sister BEGR is on the right
+                    }
+                }
+                nd::END => {
+                    let v = cm.nodemap[n]; // END_E
+                    let lp = lpos as usize;
+                    imin[v] = r.r_nn_i[lp];
+                    imax[v] = if r.r_nx_i[lp] == -2 {
+                        -2
+                    } else {
+                        (r.r_nx_i[lp] + 1).min(j0 + 1) // +1 for StateDelta
+                    };
+                    if r.r_in[lp] != -1 {
+                        imin[v] = imin[v].min((r.r_in[lp] - 1).max(i0));
+                        imax[v] = imax[v].max((r.r_ix[lp] - 1).max(i0));
+                    }
+                    rpos = lpos;
+                    if imin[v] != -1 {
+                        jmin[v] = imin[v] - 1; // E emits d=0, so j = i-1
+                        jmax[v] = imax[v] - 1;
+                    }
+                }
+                nd::ROOT => {
+                    debug_assert_eq!(lpos, 1);
+                    debug_assert_eq!(rpos, hmm_m as i32);
+                    let v = cm.nodemap[n]; // ROOT_S
+                    imin[v] = r.r_nn_i[1];
+                    imax[v] = r.r_nx_i[1];
+                    jmin[v] = r.r_nn_j[hmm_m];
+                    jmax[v] = r.r_nx_j[hmm_m];
+
+                    let il = v + 1; // ROOT_IL
+                    imin[il] = r.r_in[0];
+                    imax[il] = r.r_ix[0];
+                    jmin[il] = if r.r_nn_j[hmm_m] == -1 {
+                        -1
+                    } else {
+                        r.r_nn_j[hmm_m].max(i0)
+                    };
+                    jmax[il] = r.r_nx_j[hmm_m];
+                    if r.r_in[hmm_m] != -1 {
+                        jmin[il] = jmin[il].min(r.r_in[hmm_m]);
+                        jmax[il] = jmax[il].min(r.r_ix[hmm_m]);
+                    }
+
+                    let ir = v + 2; // ROOT_IR
+                    if r.r_in[hmm_m] != -1 {
+                        imin[ir] = r.r_nn_i[1];
+                        imax[ir] = r.r_nx_i[1];
+                        if imin[il] != -1 {
+                            imin[ir] = imin[ir].min(imin[il] + 1);
+                            imax[ir] = imax[ir].max(imax[il] + 1);
+                        }
+                        jmin[ir] = r.r_in[hmm_m];
+                        jmax[ir] = r.r_ix[hmm_m];
+                    }
+                }
+                _ => {}
+            }
+        } else {
+            // on the left: set i bands for MATP / MATL only.
+            match cm.ndtype[n] {
+                nd::MATP => {
+                    lpos = map.nd2lpos[n];
+                    let v = cm.nodemap[n];
+                    let lp = lpos as usize;
+                    imin[v] = r.r_mn[lp]; // MATP_MP
+                    imax[v] = r.r_mx[lp];
+                    imin[v + 1] = r.r_mn[lp]; // MATP_ML
+                    imax[v + 1] = r.r_mx[lp];
+                    imin[v + 2] = if r.r_dn[lp] == -1 { -1 } else { r.r_dn[lp] + 1 }; // MATP_MR
+                    imax[v + 2] = if r.r_dx[lp] == -2 { -2 } else { r.r_dx[lp] + 1 };
+                    imin[v + 3] = if r.r_dn[lp] == -1 { -1 } else { r.r_dn[lp] + 1 }; // MATP_D
+                    imax[v + 3] = if r.r_dx[lp] == -2 { -2 } else { r.r_dx[lp] + 1 };
+                    imin[v + 4] = r.r_in[lp]; // MATP_IL
+                    imax[v + 4] = r.r_ix[lp];
+                    // MATP_IR i band is set on the right.
+                }
+                nd::MATL => {
+                    lpos = map.nd2lpos[n];
+                    let v = cm.nodemap[n];
+                    let lp = lpos as usize;
+                    imin[v] = r.r_mn[lp]; // MATL_ML
+                    imax[v] = r.r_mx[lp];
+                    imin[v + 1] = if r.r_dn[lp] == -1 { -1 } else { r.r_dn[lp] + 1 }; // MATL_D
+                    imax[v + 1] = if r.r_dx[lp] == -2 { -2 } else { r.r_dx[lp] + 1 };
+                    imin[v + 2] = r.r_in[lp]; // MATL_IL
+                    imax[v + 2] = r.r_ix[lp];
+                }
+                _ => {}
+            }
+
+            // push children for the right pass (and recurse into subtree).
+            if cm.ndtype[n] == nd::BIF {
+                let v = cm.nodemap[n];
+                let left_child = cm.ndidx[cm.cfirst[v] as usize];
+                let right_child = cm.ndidx[cm.cnum[v] as usize];
+                nd_pda.push((true, n)); // BIF right
+                nd_pda.push((false, right_child)); // right child left
+                nd_pda.push((false, left_child)); // left child left (popped first)
+            } else {
+                nd_pda.push((true, n)); // this node, right pass
+                if cm.ndtype[n] != nd::END {
+                    nd_pda.push((false, n + 1)); // child in tree order
+                }
+            }
+        }
+    }
+
+    // Alignment: pin the root's i/j to span the whole window.
+    if !doing_search {
+        imin[0] = i0;
+        if imin[1] != -1 {
+            imin[1] = i0;
+        }
+        jmax[0] = j0;
+        if jmin[1] != -1 {
+            jmax[1] = j0;
+        }
+        if jmin[2] != -1 {
+            jmax[2] = j0;
+        }
+    }
+
+    // Final pass: collapse contradictory/detached states to unreachable; enforce minimum emission
+    // for left emitters and MP states (glocal, do_trunc = FALSE).
+    for v in 0..m {
+        if imin[v] == -1 || jmin[v] == -1 {
+            imin[v] = -1;
+            jmin[v] = -1;
+            imax[v] = -2;
+            jmax[v] = -2;
+        }
+        if v + 1 < m && cm.stid[v + 1] == stid::END_E {
+            // detached insert (an IL/MATP_IR immediately before an END)
+            imin[v] = -1;
+            jmin[v] = -1;
+            imax[v] = -2;
+            jmax[v] = -2;
+        }
+        if cm.sttype[v] == st::MP {
+            if jmax[v] == i0 {
+                imin[v] = -1;
+                jmin[v] = -1;
+                imax[v] = -2;
+                jmax[v] = -2;
+            } else if jmin[v] == i0 {
+                jmin[v] += 1;
+            }
+        }
+        if emits_left(cm.sttype[v]) && imin[v] != -1 {
+            if jmax[v] == i0 - 1 {
+                imin[v] = -1;
+                jmin[v] = -1;
+                imax[v] = -2;
+                jmax[v] = -2;
+            } else if jmin[v] == i0 - 1 {
+                jmin[v] = i0;
+            }
+        }
+    }
+
+    let mut out = Cp9Bands {
+        m,
+        imin,
+        imax,
+        jmin,
+        jmax,
+        hdmin: vec![Vec::new(); m],
+        hdmax: vec![Vec::new(); m],
+    };
+    ij2d_bands(cm, &mut out);
+    out
+}
+
+/// Per-sequence driver: CP9 Forward/Backward → posteriors → HMM position bands → CM i,j,d bands.
+/// `tau` is the per-side posterior tail excluded from each band; `doing_search` selects the search
+/// vs. alignment band semantics. `dsq` is 1-based with sentinels at `0` and `L+1`.
+pub(crate) fn cp9_seq2bands(
+    cm: &Cm,
+    map: &Cp9Map,
+    s: &Cp9Scores,
+    dsq: &[Dsq],
+    tau: f64,
+    doing_search: bool,
+) -> Cp9Bands {
+    let (fmx, ftot) = cp9_forward(s, dsq);
+    let (bmx, _btot) = cp9_backward(s, dsq);
+    let mut hmmbands = cp9_fb2hmmbands(s, dsq, &fmx, &bmx, ftot, tau);
+    let l = (dsq.len() - 2) as i32;
+    cp9_hmm2ij_bands(cm, map, s, &mut hmmbands, 1, l, doing_search)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1371,6 +2161,144 @@ mod tests {
             assert!(
                 mn <= k as i32 && k as i32 <= mx,
                 "node {k} match band {mn}..{mx} excludes diagonal position {k}"
+            );
+        }
+    }
+
+    /// The no-drop guarantee (milestone 4b): the CM i,j,d bands derived from the HMM bands must
+    /// **contain the true CYK parse**. We align the model consensus, then assert every parsed state
+    /// `(v, i, j, d)` falls inside its band — if any didn't, HMM-banded search could silently lose
+    /// the optimal hit.
+    #[test]
+    fn cp9_ij_bands_contain_consensus_parse() {
+        use crate::align::align_glocal_parse;
+
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/tRNA.cm");
+        let mut cm = parse_cm_file(path).expect("parse tRNA.cm");
+        configure_scores(&mut cm);
+        let map = build_cp9_map(&cm);
+        let scores = Cp9Scores::from_cp9(&build_cp9(&cm));
+
+        let cons = ornament_alphabet::read_fasta(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/data/trna_cons.fa"
+        ))
+        .expect("read cons")[0]
+            .seq
+            .clone();
+        let dsq = cm.abc.digitize(&cons).expect("digitize");
+        let l = dsq.len() - 2;
+
+        let emap = EmitMap::build(&cm);
+        let parse = align_glocal_parse(&cm, &dsq, 1, l, &emap);
+
+        // Both band modes must contain the true full-span parse: alignment mode (the parse must
+        // span the whole window) and search mode (the semantics milestone 5's scan will use).
+        for doing_search in [false, true] {
+            let bands = cp9_seq2bands(&cm, &map, &scores, &dsq, 1e-7, doing_search);
+            for &(v, i, j, d) in &parse {
+                let (i, j, d) = (i as i32, j as i32, d as i32);
+                assert!(
+                    bands.imin[v] != -1,
+                    "[search={doing_search}] state {v} ({}) used by parse but marked unreachable",
+                    cm.sttype[v]
+                );
+                assert!(
+                    bands.imin[v] <= i && i <= bands.imax[v],
+                    "[search={doing_search}] state {v} ({}): parse i={i} outside i-band {}..{}",
+                    cm.sttype[v],
+                    bands.imin[v],
+                    bands.imax[v]
+                );
+                assert!(
+                    bands.jmin[v] <= j && j <= bands.jmax[v],
+                    "[search={doing_search}] state {v} ({}): parse j={j} outside j-band {}..{}",
+                    cm.sttype[v],
+                    bands.jmin[v],
+                    bands.jmax[v]
+                );
+                let jp = (j - bands.jmin[v]) as usize;
+                assert!(
+                    bands.hdmin[v][jp] <= d && d <= bands.hdmax[v][jp],
+                    "[search={doing_search}] state {v} ({}): parse d={d} outside d-band {}..{} at j={j}",
+                    cm.sttype[v],
+                    bands.hdmin[v][jp],
+                    bands.hdmax[v][jp]
+                );
+            }
+        }
+    }
+
+    /// No-drop on a *real* tRNA (not the consensus): its parse has indels relative to the model, so
+    /// it pushes off the band diagonal and exercises the off-diagonal / reachability logic. We find
+    /// the hit window with the unbanded CYK scanner, then check its parse against the HMM bands.
+    #[test]
+    fn cp9_ij_bands_contain_real_trna_parse() {
+        use crate::align::align_glocal_parse;
+        use crate::search::cyk_search;
+
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/tRNA.cm");
+        let mut cm = parse_cm_file(path).expect("parse tRNA.cm");
+        configure_scores(&mut cm);
+        let map = build_cp9_map(&cm);
+        let scores = Cp9Scores::from_cp9(&build_cp9(&cm));
+        let emap = EmitMap::build(&cm);
+
+        let seq = ornament_alphabet::read_fasta(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/data/trna_embedded.fa"
+        ))
+        .expect("read embedded")[0]
+            .seq
+            .clone();
+        let dsq = cm.abc.digitize(&seq).expect("digitize");
+
+        // Locate the tRNA with the unbanded glocal CYK scanner; take the best forward-strand hit.
+        let hits = cyk_search(&cm, &dsq, cm.w as usize, 10.0);
+        let hit = hits
+            .iter()
+            .filter(|h| matches!(h.strand, crate::search::Strand::Plus))
+            .max_by(|a, b| a.score.partial_cmp(&b.score).unwrap())
+            .expect("a forward-strand tRNA hit");
+        let (i0, j0) = (hit.i, hit.j);
+
+        // Window sub-dsq (1-based, own sentinels) for the CP9 Forward/Backward over just the hit.
+        let mut wdsq = vec![dsq[0]];
+        wdsq.extend_from_slice(&dsq[i0..=j0]);
+        wdsq.push(dsq[dsq.len() - 1]);
+
+        // Parse is in window-local coordinates (1..=wlen); bands likewise, so they line up.
+        let parse = align_glocal_parse(&cm, &dsq, i0, j0, &emap);
+        let bands = cp9_seq2bands(&cm, &map, &scores, &wdsq, 1e-7, false);
+
+        for &(v, i, j, d) in &parse {
+            let (i, j, d) = (i as i32, j as i32, d as i32);
+            assert!(
+                bands.imin[v] != -1,
+                "state {v} ({}) used by parse but marked unreachable",
+                cm.sttype[v]
+            );
+            assert!(
+                bands.imin[v] <= i && i <= bands.imax[v],
+                "state {v} ({}): parse i={i} outside i-band {}..{}",
+                cm.sttype[v],
+                bands.imin[v],
+                bands.imax[v]
+            );
+            assert!(
+                bands.jmin[v] <= j && j <= bands.jmax[v],
+                "state {v} ({}): parse j={j} outside j-band {}..{}",
+                cm.sttype[v],
+                bands.jmin[v],
+                bands.jmax[v]
+            );
+            let jp = (j - bands.jmin[v]) as usize;
+            assert!(
+                bands.hdmin[v][jp] <= d && d <= bands.hdmax[v][jp],
+                "state {v} ({}): parse d={d} outside d-band {}..{} at j={j}",
+                cm.sttype[v],
+                bands.hdmin[v][jp],
+                bands.hdmax[v][jp]
             );
         }
     }
