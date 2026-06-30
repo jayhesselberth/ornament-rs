@@ -7,6 +7,6 @@ pub mod native;
 pub mod parser;
 pub mod runner;
 
-pub use native::scan_native;
+pub use native::{scan_native, scan_native_multi};
 pub use parser::{CMAlignment, CMHit};
 pub use runner::InfernalRunner;

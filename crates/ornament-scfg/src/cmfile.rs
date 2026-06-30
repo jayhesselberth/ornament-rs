@@ -47,11 +47,63 @@ fn opt_char(tok: &str) -> Option<char> {
     }
 }
 
-/// Parse a `.cm` file from disk.
+/// Read a `.cm` file to a string, transparently decompressing gzip. Detected by the gzip magic
+/// bytes (`1f 8b`), so a `.gz` works whether or not it carries the extension; `MultiGzDecoder`
+/// handles multi-member streams (the full `Rfam.cm.gz` is one such). Plain text is passed through.
+fn read_cm_text<P: AsRef<Path>>(path: P) -> Result<String, InfernalError> {
+    use std::io::Read;
+    let path = path.as_ref();
+    let bytes =
+        std::fs::read(path).map_err(|e| InfernalError::Io(format!("{}: {e}", path.display())))?;
+    if bytes.starts_with(&[0x1f, 0x8b]) {
+        let mut s = String::new();
+        flate2::read::MultiGzDecoder::new(&bytes[..])
+            .read_to_string(&mut s)
+            .map_err(|e| InfernalError::Io(format!("{}: gzip decode: {e}", path.display())))?;
+        Ok(s)
+    } else {
+        String::from_utf8(bytes)
+            .map_err(|e| InfernalError::Io(format!("{}: not UTF-8: {e}", path.display())))
+    }
+}
+
+/// Parse a `.cm` file from disk (transparently gzip-decompressed if `.gz`).
 pub fn parse_cm_file<P: AsRef<Path>>(path: P) -> Result<Cm, InfernalError> {
-    let text = std::fs::read_to_string(path.as_ref())
-        .map_err(|e| InfernalError::Io(format!("{}: {e}", path.as_ref().display())))?;
-    parse_cm_str(&text)
+    parse_cm_str(&read_cm_text(path)?)
+}
+
+/// Parse every model in a possibly-multi-model `.cm` file (e.g. the full `Rfam.cm`). Records are
+/// split on the `INFERNAL1/a` format tag that opens each model; each chunk (one CM + its embedded
+/// filter HMM, through the HMM's closing `//`) is parsed by [`parse_cm_str`]. A single-model file
+/// yields a one-element vector. The model index of any parse failure is reported.
+pub fn parse_cm_records(text: &str) -> Result<Vec<Cm>, InfernalError> {
+    let mut starts: Vec<usize> = text
+        .match_indices("INFERNAL1/a")
+        // A record tag is at the very start of a line (column 0).
+        .filter(|&(i, _)| i == 0 || text.as_bytes()[i - 1] == b'\n')
+        .map(|(i, _)| i)
+        .collect();
+    if starts.is_empty() {
+        return Err(InfernalError::Parse(
+            "no INFERNAL1/a model found in CM file".into(),
+        ));
+    }
+    starts.push(text.len()); // sentinel end
+    let mut models = Vec::with_capacity(starts.len() - 1);
+    for w in starts.windows(2) {
+        let chunk = &text[w[0]..w[1]];
+        let idx = models.len();
+        let cm =
+            parse_cm_str(chunk).map_err(|e| InfernalError::Parse(format!("model #{idx}: {e}")))?;
+        models.push(cm);
+    }
+    Ok(models)
+}
+
+/// Parse every model in a possibly-multi-model `.cm` file from disk (transparently
+/// gzip-decompressed if `.gz`, e.g. the full `Rfam.cm.gz`). See [`parse_cm_records`].
+pub fn parse_cm_records_file<P: AsRef<Path>>(path: P) -> Result<Vec<Cm>, InfernalError> {
+    parse_cm_records(&read_cm_text(path)?)
 }
 
 /// Parse a `.cm` model from text.
@@ -436,5 +488,62 @@ impl Header {
             _ => {} // ignore COM/DATE/WBETA/QDBBETA*/N2OMEGA/N3OMEGA/CKSUM/etc.
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TRNA: &str = include_str!("../tests/data/tRNA.cm");
+    const EUK: &str = include_str!("../tests/data/TRNAinf-euk.cm");
+
+    /// A single-model file parses to a one-element vector identical to `parse_cm_str`.
+    #[test]
+    fn records_single_model() {
+        let models = parse_cm_records(TRNA).expect("parse single");
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].clen, 71);
+    }
+
+    /// Concatenated models are split on the `INFERNAL1/a` record boundary and each parses
+    /// independently (the embedded filter HMM of model N is not slurped into model N+1).
+    #[test]
+    fn records_multi_model() {
+        let combined = format!("{TRNA}{EUK}");
+        let models = parse_cm_records(&combined).expect("parse multi");
+        assert_eq!(models.len(), 2, "expected two models");
+        assert_eq!((models[0].clen, models[1].clen), (71, 90));
+        assert_eq!(models[0].name, "tRNA");
+        assert_eq!(models[1].name, "euk-031616");
+        // Each model kept its own embedded filter HMM (not concatenated into one).
+        assert!(models[0].fp7_text.is_some());
+        assert!(models[1].fp7_text.is_some());
+    }
+
+    /// A file with no model tag is a clear error.
+    #[test]
+    fn records_empty_is_error() {
+        assert!(parse_cm_records("not a cm file\n").is_err());
+    }
+
+    /// Gzipped `.cm` files (e.g. `Rfam.cm.gz`) are read transparently: a gzipped two-model file
+    /// parses identically to its plaintext form.
+    #[test]
+    fn reads_gzipped_cm() {
+        use std::io::Write;
+        let combined = format!("{TRNA}{EUK}");
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(combined.as_bytes()).unwrap();
+        let gz = enc.finish().unwrap();
+
+        let path =
+            std::env::temp_dir().join(format!("ornament_gz_test_{}.cm.gz", std::process::id()));
+        std::fs::write(&path, &gz).unwrap();
+        let models = parse_cm_records_file(&path).expect("parse gzipped multi-model");
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(models.len(), 2);
+        assert_eq!((models[0].clen, models[1].clen), (71, 90));
     }
 }
