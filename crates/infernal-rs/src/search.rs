@@ -130,6 +130,19 @@ impl Gamma {
 pub trait Semiring {
     /// Combine two scores (both in bits / log2 space).
     fn or(a: f32, b: f32) -> f32;
+
+    /// Fold a child transition into the accumulator row: `acc[i] ⊕= (src[i] ⊗ tsc)` for every
+    /// `i in 0..acc.len()` (`src` must be at least that long). This is the hot inner step of
+    /// the scanning DP — the `cnum`-way child max/sum over a contiguous `d`-slice. The default
+    /// is the scalar fold via [`Semiring::or`] and the sentinel-clamping [`add`]; [`MaxPlus`]
+    /// overrides it with a branchless max-plus loop the compiler auto-vectorizes (AVX2
+    /// `vaddps`/`vmaxps`).
+    #[inline]
+    fn accumulate(acc: &mut [f32], src: &[f32], tsc: f32) {
+        for (a, &s) in acc.iter_mut().zip(src) {
+            *a = Self::or(*a, add(s, tsc));
+        }
+    }
 }
 
 /// Max-plus semiring → CYK (best single parse).
@@ -142,6 +155,71 @@ impl Semiring for MaxPlus {
         } else {
             b
         }
+    }
+
+    /// Branchless max-plus fold. Bit-identical to the default scalar path despite skipping the
+    /// sentinel-clamping `add`: `src[i] + tsc` adds at most **one** `IMPOSSIBLE` (the child may
+    /// be impossible; `tsc` is a finite transition score, or itself `IMPOSSIBLE`), and
+    /// `IMPOSSIBLE` (`-1e36`) so dwarfs a finite addend that the f32 sum stays exactly
+    /// `IMPOSSIBLE`. The running `max` never drops below the caller's `>= IMPOSSIBLE` init, so a
+    /// two-sentinel `-2e36` can never become the chosen value. No `or`/`add` calls and no
+    /// sentinel branch ⇒ the loop vectorizes.
+    #[inline]
+    fn accumulate(acc: &mut [f32], src: &[f32], tsc: f32) {
+        // Runtime dispatch: AVX2 256-bit `vmaxps` when available (the whole cluster has it via
+        // the x86-64-v3 baseline), else the scalar fallback. Both are bit-identical — AVX2
+        // reserved here for the explicit kernel; AVX-512 could slot in the same way.
+        #[cfg(target_arch = "x86_64")]
+        {
+            if std::is_x86_feature_detected!("avx2") {
+                // SAFETY: guarded by the feature detection above.
+                unsafe { accumulate_max_avx2(acc, src, tsc) };
+                return;
+            }
+        }
+        accumulate_max_scalar(acc, src, tsc);
+    }
+}
+
+/// Scalar max-plus child fold: `acc[i] = max(acc[i], src[i] + tsc)`. The fallback for
+/// [`accumulate_max_avx2`] and the reference the SIMD path must match bit-for-bit.
+#[inline]
+fn accumulate_max_scalar(acc: &mut [f32], src: &[f32], tsc: f32) {
+    let n = acc.len();
+    let src = &src[..n];
+    for i in 0..n {
+        // `a < v ? v : a` mirrors `vmaxps(a, v)` exactly (no NaN/-0 here).
+        let a = acc[i];
+        let v = src[i] + tsc;
+        acc[i] = if a < v { v } else { a };
+    }
+}
+
+/// AVX2 max-plus child fold (8 lanes via `vmaxps`). Bit-identical to [`accumulate_max_scalar`]:
+/// `_mm256_max_ps(a, v)` returns `a < v ? v : a` lane-wise, and the scalar tail uses the same
+/// rule. `src` is guaranteed at least `acc.len()` long by the caller.
+///
+/// # Safety
+/// Requires the `avx2` target feature (checked by the caller via `is_x86_feature_detected!`).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn accumulate_max_avx2(acc: &mut [f32], src: &[f32], tsc: f32) {
+    use std::arch::x86_64::*;
+    let n = acc.len();
+    let tv = _mm256_set1_ps(tsc);
+    let (ap, sp) = (acc.as_mut_ptr(), src.as_ptr());
+    let mut i = 0;
+    while i + 8 <= n {
+        let a = _mm256_loadu_ps(ap.add(i));
+        let v = _mm256_add_ps(_mm256_loadu_ps(sp.add(i)), tv);
+        _mm256_storeu_ps(ap.add(i), _mm256_max_ps(a, v));
+        i += 8;
+    }
+    while i < n {
+        let a = *ap.add(i);
+        let v = *sp.add(i) + tsc;
+        *ap.add(i) = if a < v { v } else { a };
+        i += 1;
     }
 }
 
@@ -357,6 +435,9 @@ fn scan_core<S: Semiring>(
     let width = w + 1;
     let mut alpha = vec![vec![IMPOSSIBLE; m * width]; 2];
     let mut alpha_begl = vec![vec![IMPOSSIBLE; n_begl.max(1) * width]; width];
+    // Reused per-state accumulator for the vectorized child-transition fold (holds the running
+    // ⊕ over children for each `d`, before the per-`d` emission is applied).
+    let mut acc = vec![IMPOSSIBLE; width];
 
     // Local-mode initialization: a state may end locally (v -> EL), emitting `dd` further
     // residues at `el_selfsc` each. init_sc(v, dd) = endsc[v] + el_selfsc*dd (IMPOSSIBLE in
@@ -450,18 +531,51 @@ fn scan_core<S: Semiring>(
             let single = oesc.single[v].as_deref();
             let pairtab = oesc.pair[v].as_deref();
 
-            for d in 1..=dx {
-                if d < sd {
-                    continue; // emitters with too few residues stay IMPOSSIBLE
+            if dx < sd {
+                continue; // not enough residues to emit at this j; all cells stay IMPOSSIBLE
+            }
+            // A same-row self-transition (`v` among its own current-row children) makes the
+            // `d`-recurrence loop-carried: `alpha[cur][v][d]` reads `alpha[cur][v][d-1]` computed
+            // earlier this loop. That's the insert-left (IL) case — it can't be split into a
+            // bulk child fold, so keep the sequential recurrence. IR self-loops too but reads the
+            // *previous* row (`prv`), so it stays in the vectorized path below.
+            let self_loop = child_row == cur && (ych..ych + cnum).contains(&v);
+
+            // `d` starts at `sd.max(1)`: emitters need `d >= sd`, and the `d=0` cell of S/D
+            // states is a constant set in the base case that must not be overwritten here.
+            if self_loop {
+                for d in sd.max(1)..=dx {
+                    let cd = d - sd;
+                    let mut sc = init_sc(v, cd);
+                    #[allow(clippy::needless_range_loop)] // yoff indexes both the child row and tsc
+                    for yoff in 0..cnum {
+                        sc = S::or(
+                            sc,
+                            add(alpha[child_row][(ych + yoff) * width + cd], tsc[yoff]),
+                        );
+                    }
+                    // IL is the only self-loop here (left emitter); store with its left emission.
+                    let val = add(sc, single.unwrap()[dsq[j - d + 1] as usize]);
+                    alpha[cur][v * width + d] = val;
                 }
-                let cd = d - sd;
-                let mut sc = init_sc(v, cd); // local-end path: emit sd, then EL emits cd
-                for yoff in 0..cnum {
-                    sc = S::or(
-                        sc,
-                        add(alpha[child_row][(ych + yoff) * width + cd], tsc[yoff]),
-                    );
-                }
+                continue;
+            }
+
+            // Phase 1: child-transition fold over the contiguous `cd = d - sd` range (the hot,
+            // vectorized inner step). `cd` runs 0..nrange, i.e. `d` runs sd..=dx.
+            let nrange = dx - sd + 1;
+            let accs = &mut acc[..nrange];
+            for (cd, a) in accs.iter_mut().enumerate() {
+                *a = init_sc(v, cd); // local-end path: emit sd, then EL emits cd (IMPOSSIBLE glocal)
+            }
+            #[allow(clippy::needless_range_loop)] // yoff indexes both the child row and tsc
+            for yoff in 0..cnum {
+                let base = (ych + yoff) * width;
+                S::accumulate(accs, &alpha[child_row][base..base + nrange], tsc[yoff]);
+            }
+            // Phase 2: add the per-`d` emission score and store (begl states have no emission).
+            for d in sd.max(1)..=dx {
+                let sc = accs[d - sd];
                 let val = match sttype {
                     st::ML | st::IL => {
                         let i = j - d + 1;
@@ -533,4 +647,71 @@ fn scan_core<S: Semiring>(
 
     let hits = gamma.map(|g| g.traceback(l)).unwrap_or_default();
     (CykScan { best, bestsc_per_j }, hits)
+}
+
+#[cfg(test)]
+mod simd_tests {
+    use super::*;
+
+    /// The vectorized [`MaxPlus::accumulate`] must be **bit-for-bit** identical to the generic
+    /// scalar fold (`or(acc, add(src, tsc))`) — the SIMD-vs-scalar parity invariant from #5.
+    /// Inputs respect the DP invariant that stored cells are always `>= IMPOSSIBLE` (either a
+    /// finite score or exactly the sentinel); `tsc` may additionally be `IMPOSSIBLE`.
+    #[test]
+    fn maxplus_accumulate_is_bit_exact_vs_scalar() {
+        let mut s: u64 = 0xDEAD_BEEF_1234_5678;
+        let mut next = || {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            s
+        };
+        // A value respecting `>= IMPOSSIBLE`: ~1/4 of the time the sentinel, else a finite
+        // log-odds-scale score in roughly [-80, 40).
+        let cell = |r: u64| -> f32 {
+            if r & 3 == 0 {
+                IMPOSSIBLE
+            } else {
+                ((r >> 8) % 12000) as f32 / 100.0 - 80.0
+            }
+        };
+
+        for _ in 0..2000 {
+            let n = 1 + (next() as usize % 40); // odd lengths exercise the SIMD remainder
+            let cnum = 1 + (next() as usize % 4);
+            let init: Vec<f32> = (0..n).map(|_| cell(next())).collect();
+            let children: Vec<Vec<f32>> = (0..cnum)
+                .map(|_| (0..n).map(|_| cell(next())).collect())
+                .collect();
+            // tsc: finite, or IMPOSSIBLE for an impossible transition.
+            let tsc: Vec<f32> = (0..cnum)
+                .map(|_| {
+                    let r = next();
+                    if r & 7 == 0 {
+                        IMPOSSIBLE
+                    } else {
+                        (r >> 8) as i32 as f32 / 1e7
+                    }
+                })
+                .collect();
+
+            let mut got = init.clone();
+            let mut want = init.clone();
+            for y in 0..cnum {
+                MaxPlus::accumulate(&mut got, &children[y], tsc[y]);
+                for i in 0..n {
+                    want[i] = MaxPlus::or(want[i], add(children[y][i], tsc[y]));
+                }
+            }
+            for i in 0..n {
+                assert_eq!(
+                    got[i].to_bits(),
+                    want[i].to_bits(),
+                    "mismatch at i={i}: vectorized {} vs scalar {}",
+                    got[i],
+                    want[i]
+                );
+            }
+        }
+    }
 }
