@@ -6,8 +6,8 @@
 //!   1. **expected state occupancy** (`psi`) — the foundation of the CM→CP9 parameter mapping.  ✓
 //!   2. the CP9 HMM construction — CM↔CP9 map, occupancy-weighted emissions, subpath-summation
 //!      transitions + begin/end — validated by the psi-vs-phi occupancy check (`build_cp9`).  ✓
-//!   3. CP9 Forward / Backward + posteriors.  ← next
-//!   4. posteriors → HMM position bands → CM i,j bands → per-j d-bands (`hdmin`/`hdmax`).
+//!   3. CP9 Forward / Backward + posteriors (per sequence), validated F==B + Σ posteriors==1.  ✓
+//!   4. posteriors → HMM position bands → CM i,j bands → per-j d-bands (`hdmin`/`hdmax`).  ← next
 //!   5. the doubly-ragged (j- and d-banded) CYK kernel that consumes them.
 //!
 //! The CP9 build (1–2) depends only on the CM, so it runs once per model; 3–4 are per sequence.
@@ -19,6 +19,40 @@
 
 use crate::emitmap::EmitMap;
 use crate::model::{nd, st, Cm};
+use ornament_alphabet::Dsq;
+
+/// `ln(p)`, mapping `p ≤ 0` to −∞ (the log-space sentinel).
+#[inline]
+fn ln(p: f64) -> f64 {
+    if p > 0.0 {
+        p.ln()
+    } else {
+        f64::NEG_INFINITY
+    }
+}
+
+/// Numerically-stable `log(e^a + e^b)`.
+#[inline]
+fn logsum(a: f64, b: f64) -> f64 {
+    if a == f64::NEG_INFINITY {
+        return b;
+    }
+    if b == f64::NEG_INFINITY {
+        return a;
+    }
+    let (hi, lo) = if a > b { (a, b) } else { (b, a) };
+    hi + (lo - hi).exp().ln_1p()
+}
+
+#[inline]
+fn logsum3(a: f64, b: f64, c: f64) -> f64 {
+    logsum(logsum(a, b), c)
+}
+
+#[inline]
+fn logsum4(a: f64, b: f64, c: f64, d: f64) -> f64 {
+    logsum(logsum(a, b), logsum(c, d))
+}
 
 /// CP9 node-internal state types (index into `hns2cs[k][_]` and the CP9 transition tables).
 pub(crate) const HMM_MATCH: usize = 0;
@@ -632,6 +666,232 @@ pub(crate) fn has_adjacent_basepair(map: &Cp9Map) -> bool {
     (2..=map.hmm_m).any(|k| map.pos2nd[k] == map.pos2nd[k - 1])
 }
 
+/// The CP9 in **log-probability** form, ready for the Forward/Backward DP (`CP9Logoddsify`).
+/// Emissions are log-probabilities rather than HMMER's log-*odds*; the null model cancels in the
+/// state posteriors used for banding, so this changes the Forward score by a per-residue constant
+/// but leaves the posteriors (hence the bands) identical, and keeps the DP self-contained.
+pub(crate) struct Cp9Scores {
+    pub m: usize,
+    pub k: usize,
+    pub tsc: Vec<[f64; 10]>, // [k][CT*]
+    pub bsc: Vec<f64>,       // [k] begin (B→M_k)
+    pub esc: Vec<f64>,       // [k] end (M_k→E)
+    pub msc: Vec<Vec<f64>>,  // [k][residue] match emission
+    pub isc: Vec<Vec<f64>>,  // [k][residue] insert emission
+}
+
+impl Cp9Scores {
+    pub fn from_cp9(hmm: &Cp9) -> Cp9Scores {
+        let m = hmm.m;
+        let tsc = (0..=m)
+            .map(|k| {
+                let mut a = [f64::NEG_INFINITY; 10];
+                for (c, slot) in a.iter_mut().enumerate() {
+                    *slot = ln(hmm.t[k][c]);
+                }
+                a
+            })
+            .collect();
+        let bsc = (0..=m).map(|k| ln(hmm.begin[k])).collect();
+        let esc = (0..=m).map(|k| ln(hmm.end[k])).collect();
+        let msc = (0..=m)
+            .map(|k| (0..hmm.k).map(|x| ln(hmm.mat[k][x])).collect())
+            .collect();
+        let isc = (0..=m)
+            .map(|k| (0..hmm.k).map(|x| ln(hmm.ins[k][x])).collect())
+            .collect();
+        Cp9Scores {
+            m,
+            k: hmm.k,
+            tsc,
+            bsc,
+            esc,
+            msc,
+            isc,
+        }
+    }
+}
+
+/// A CP9 DP matrix: log-space scores for the match / insert / delete state of each node, at each
+/// sequence row `0..=L`.
+pub(crate) struct Cp9Mx {
+    pub mmx: Vec<Vec<f64>>,
+    pub imx: Vec<Vec<f64>>,
+    pub dmx: Vec<Vec<f64>>,
+}
+
+/// CP9 **Forward** DP (glocal, full retained matrix) — a port of `cp9_Forward`. `dsq` is 1-based
+/// with sentinels at `0` and `L+1`. Returns the matrix and the total log-probability of the
+/// sequence (the score at the end state after the last residue).
+pub(crate) fn cp9_forward(s: &Cp9Scores, dsq: &[Dsq]) -> (Cp9Mx, f64) {
+    let m = s.m;
+    let l = dsq.len() - 2;
+    let ninf = f64::NEG_INFINITY;
+    let mut mmx = vec![vec![ninf; m + 1]; l + 1];
+    let mut imx = vec![vec![ninf; m + 1]; l + 1];
+    let mut dmx = vec![vec![ninf; m + 1]; l + 1];
+
+    // Row 0: B is entered (M_0 = 0); the all-delete path is reachable for every node.
+    mmx[0][0] = 0.0;
+    for k in 1..=m {
+        dmx[0][k] = logsum3(
+            mmx[0][k - 1] + s.tsc[k - 1][CTMD],
+            imx[0][k - 1] + s.tsc[k - 1][CTID],
+            dmx[0][k - 1] + s.tsc[k - 1][CTDD],
+        );
+    }
+
+    for j in 1..=l {
+        let res = dsq[j] as usize;
+        imx[j][0] = s.isc[0][res]
+            + logsum3(
+                mmx[j - 1][0] + s.tsc[0][CTMI],
+                imx[j - 1][0] + s.tsc[0][CTII],
+                dmx[j - 1][0] + s.tsc[0][CTDI],
+            );
+        for k in 1..=m {
+            mmx[j][k] = s.msc[k][res]
+                + logsum4(
+                    mmx[j - 1][k - 1] + s.tsc[k - 1][CTMM],
+                    imx[j - 1][k - 1] + s.tsc[k - 1][CTIM],
+                    dmx[j - 1][k - 1] + s.tsc[k - 1][CTDM],
+                    mmx[j - 1][0] + s.bsc[k], // begin: B→M_k (only at the first emitting row)
+                );
+            imx[j][k] = s.isc[k][res]
+                + logsum3(
+                    mmx[j - 1][k] + s.tsc[k][CTMI],
+                    imx[j - 1][k] + s.tsc[k][CTII],
+                    dmx[j - 1][k] + s.tsc[k][CTDI],
+                );
+            dmx[j][k] = logsum3(
+                mmx[j][k - 1] + s.tsc[k - 1][CTMD],
+                imx[j][k - 1] + s.tsc[k - 1][CTID],
+                dmx[j][k - 1] + s.tsc[k - 1][CTDD],
+            );
+        }
+    }
+
+    // End: any M_k→E (only M_M in glocal), plus D_M→E and I_M→E.
+    let mut endsc = ninf;
+    for k in 1..=m {
+        endsc = logsum(endsc, mmx[l][k] + s.esc[k]);
+    }
+    endsc = logsum(endsc, dmx[l][m] + s.tsc[m][CTDM]);
+    endsc = logsum(endsc, imx[l][m] + s.tsc[m][CTIM]);
+    (Cp9Mx { mmx, imx, dmx }, endsc)
+}
+
+/// CP9 **Backward** DP (glocal, full retained matrix) — a port of `cp9_Backward`. Returns the
+/// matrix (rows `1..=L` are the backward scores at emitting positions) and the total
+/// log-probability (the score at the B state before the first residue), which must equal the
+/// Forward score.
+pub(crate) fn cp9_backward(s: &Cp9Scores, dsq: &[Dsq]) -> (Cp9Mx, f64) {
+    let m = s.m;
+    let l = dsq.len() - 2;
+    let ninf = f64::NEG_INFINITY;
+    let mut mmx = vec![vec![ninf; m + 1]; l + 1];
+    let mut imx = vec![vec![ninf; m + 1]; l + 1];
+    let mut dmx = vec![vec![ninf; m + 1]; l + 1];
+
+    // Row L (last residue): everything ends in E.
+    let rl = dsq[l] as usize;
+    mmx[l][m] = s.esc[m] + s.msc[m][rl];
+    imx[l][m] = s.tsc[m][CTIM] + s.isc[m][rl];
+    dmx[l][m] = s.tsc[m][CTDM];
+    for k in (1..m).rev() {
+        mmx[l][k] = logsum(s.esc[k], dmx[l][k + 1] + s.tsc[k][CTMD]) + s.msc[k][rl];
+        imx[l][k] = dmx[l][k + 1] + s.tsc[k][CTID] + s.isc[k][rl];
+        dmx[l][k] = dmx[l][k + 1] + s.tsc[k][CTDD];
+    }
+    mmx[l][0] = dmx[l][1] + s.tsc[0][CTMD];
+    imx[l][0] = dmx[l][1] + s.tsc[0][CTID] + s.isc[0][rl];
+
+    // Rows L-1 .. 1.
+    for i in (1..l).rev() {
+        let res = dsq[i] as usize;
+        mmx[i][m] = imx[i + 1][m] + s.tsc[m][CTMI] + s.msc[m][res];
+        imx[i][m] = imx[i + 1][m] + s.tsc[m][CTII] + s.isc[m][res];
+        dmx[i][m] = imx[i + 1][m] + s.tsc[m][CTDI];
+        for k in (1..m).rev() {
+            mmx[i][k] = logsum3(
+                mmx[i + 1][k + 1] + s.tsc[k][CTMM],
+                imx[i + 1][k] + s.tsc[k][CTMI],
+                dmx[i][k + 1] + s.tsc[k][CTMD],
+            ) + s.msc[k][res];
+            imx[i][k] = logsum3(
+                mmx[i + 1][k + 1] + s.tsc[k][CTIM],
+                imx[i + 1][k] + s.tsc[k][CTII],
+                dmx[i][k + 1] + s.tsc[k][CTID],
+            ) + s.isc[k][res];
+            dmx[i][k] = logsum3(
+                mmx[i + 1][k + 1] + s.tsc[k][CTDM],
+                imx[i + 1][k] + s.tsc[k][CTDI],
+                dmx[i][k + 1] + s.tsc[k][CTDD],
+            );
+        }
+        imx[i][0] = logsum3(
+            mmx[i + 1][1] + s.tsc[0][CTIM],
+            imx[i + 1][0] + s.tsc[0][CTII],
+            dmx[i][1] + s.tsc[0][CTID],
+        ) + s.isc[0][res];
+        let mut b = ninf;
+        for k in 1..=m {
+            b = logsum(b, mmx[i + 1][k] + s.bsc[k]);
+        }
+        b = logsum(b, imx[i + 1][0] + s.tsc[0][CTMI]);
+        b = logsum(b, dmx[i][1] + s.tsc[0][CTMD]);
+        mmx[i][0] = b;
+    }
+
+    // Row 0 (B before the first residue): the total. Deletes here emit nothing.
+    let mut d0 = vec![ninf; m + 1];
+    d0[m] = imx[1][m] + s.tsc[m][CTDI];
+    for k in (1..m).rev() {
+        d0[k] = logsum3(
+            mmx[1][k + 1] + s.tsc[k][CTDM],
+            imx[1][k] + s.tsc[k][CTDI],
+            d0[k + 1] + s.tsc[k][CTDD],
+        );
+    }
+    let mut total = ninf;
+    for k in 1..=m {
+        total = logsum(total, mmx[1][k] + s.bsc[k]);
+    }
+    total = logsum(total, imx[1][0] + s.tsc[0][CTMI]);
+    total = logsum(total, d0[1] + s.tsc[0][CTMD]);
+    (Cp9Mx { mmx, imx, dmx }, total)
+}
+
+/// CP9 state **posteriors** — `pmx[state][i][k]` = log P(node `k`'s state occupies position `i`
+/// given the sequence), a port of `cp9_Posterior`. Combines Forward × Backward, dividing out the
+/// emission (double-counted in both passes) and the total. Node 0's match is the non-emitting B
+/// state, so its posterior is left at −∞. These feed the band computation (milestone 4).
+pub(crate) fn cp9_posterior(
+    s: &Cp9Scores,
+    dsq: &[Dsq],
+    fmx: &Cp9Mx,
+    bmx: &Cp9Mx,
+    total: f64,
+) -> Cp9Mx {
+    let m = s.m;
+    let l = dsq.len() - 2;
+    let ninf = f64::NEG_INFINITY;
+    let mut mmx = vec![vec![ninf; m + 1]; l + 1];
+    let mut imx = vec![vec![ninf; m + 1]; l + 1];
+    let mut dmx = vec![vec![ninf; m + 1]; l + 1];
+    for i in 1..=l {
+        let res = dsq[i] as usize;
+        for k in 1..=m {
+            mmx[i][k] = fmx.mmx[i][k] + bmx.mmx[i][k] - s.msc[k][res] - total;
+        }
+        for k in 0..=m {
+            imx[i][k] = fmx.imx[i][k] + bmx.imx[i][k] - s.isc[k][res] - total;
+            dmx[i][k] = fmx.dmx[i][k] + bmx.dmx[i][k] - total;
+        }
+    }
+    Cp9Mx { mmx, imx, dmx }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -877,5 +1137,78 @@ mod tests {
             }
         }
         assert_eq!(violations, 0, "{violations} psi-vs-phi violations (>1e-4)");
+    }
+
+    /// CP9 Forward/Backward consistency: the two DPs must agree on the total log-probability, and
+    /// at every position the summed match+insert occupancy (`Σ_k F·B / emission`) must equal that
+    /// total (a port of `cp9_CheckFB`). Also: every state posterior is a probability (≤ 1).
+    #[test]
+    fn cp9_forward_backward_consistent() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/tRNA.cm");
+        let mut cm = parse_cm_file(path).expect("parse tRNA.cm");
+        configure_scores(&mut cm);
+        let scores = Cp9Scores::from_cp9(&build_cp9(&cm));
+
+        let cons = ornament_alphabet::read_fasta(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/data/trna_cons.fa"
+        ))
+        .expect("read cons")[0]
+            .seq
+            .clone();
+        let dsq = cm.abc.digitize(&cons).expect("digitize");
+        let l = dsq.len() - 2;
+
+        let (fmx, fsc) = cp9_forward(&scores, &dsq);
+        let (bmx, bsc) = cp9_backward(&scores, &dsq);
+
+        // 1. Forward and Backward agree on the total.
+        assert!((fsc - bsc).abs() < 1e-6, "Forward {fsc} != Backward {bsc}");
+
+        // 2. Per-position consistency + posteriors are probabilities.
+        for i in 1..=l {
+            let res = dsq[i] as usize;
+            let mut fb = f64::NEG_INFINITY;
+            // Match states emit at nodes 1..=M (node 0's match is the non-emitting B state).
+            for k in 1..=scores.m {
+                let pm = fmx.mmx[i][k] + bmx.mmx[i][k] - scores.msc[k][res];
+                fb = logsum(fb, pm);
+                assert!(
+                    pm - fsc < 1e-6,
+                    "match post i={i} k={k} = {}",
+                    (pm - fsc).exp()
+                );
+            }
+            // Insert states emit at nodes 0..=M (node 0's insert is ROOT_IL).
+            for k in 0..=scores.m {
+                let pi = fmx.imx[i][k] + bmx.imx[i][k] - scores.isc[k][res];
+                fb = logsum(fb, pi);
+                assert!(
+                    pi - fsc < 1e-6,
+                    "insert post i={i} k={k} = {}",
+                    (pi - fsc).exp()
+                );
+            }
+            assert!(
+                (fb - fsc).abs() < 1e-4,
+                "position {i}: Σ F·B = {fb} != total {fsc}"
+            );
+        }
+
+        // 3. cp9_posterior: at each position the emitting (match k≥1 + insert) posteriors sum to 1.
+        let pmx = cp9_posterior(&scores, &dsq, &fmx, &bmx, fsc);
+        for i in 1..=l {
+            let mut p = 0.0;
+            for k in 1..=scores.m {
+                p += pmx.mmx[i][k].exp();
+            }
+            for k in 0..=scores.m {
+                p += pmx.imx[i][k].exp();
+            }
+            assert!(
+                (p - 1.0).abs() < 1e-4,
+                "position {i}: posterior mass {p} != 1"
+            );
+        }
     }
 }
