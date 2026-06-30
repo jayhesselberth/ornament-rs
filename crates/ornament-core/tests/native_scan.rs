@@ -97,6 +97,20 @@ fn native_scan_finds_trnas_and_maps_sprinzl() {
     let minus = hits.iter().find(|h| h.strand == '-').unwrap();
     assert!(minus.target_start > minus.target_end);
 
+    // Each is a full-length tRNA, so its glocal traceback spans the whole consensus (1..=71).
+    // This also exercises the minus-strand window math: the minus hit must report the same
+    // model span as the plus hits despite being aligned on the reverse complement.
+    for h in &hits {
+        assert_eq!(
+            (h.mdl_from, h.mdl_to),
+            (1, 71),
+            "hit {}..{} ({}) model span",
+            h.target_start,
+            h.target_end,
+            h.strand
+        );
+    }
+
     let db = ModificationDatabase::eukaryotic();
     for h in &hits {
         let trna = hit_to_trna(&full, h);
@@ -162,6 +176,14 @@ fn native_matches_cmsearch_oracle() {
                     && o.strand == h.strand
             })
             .unwrap();
+        // The native model span (from our glocal traceback) must match cmsearch's mdl from/to.
+        assert_eq!(
+            (h.mdl_from, h.mdl_to),
+            (oh.mdl_from, oh.mdl_to),
+            "model span differs at {}..{} from cmsearch",
+            h.target_start,
+            h.target_end
+        );
         let native_aln = align_to_sprinzl(&hit_sequence(&full, h));
         let oracle_aln = align_to_sprinzl(&hit_sequence(&full, oh));
         assert_eq!(
