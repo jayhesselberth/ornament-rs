@@ -13,8 +13,9 @@ use std::path::Path;
 
 use ornament_alphabet::Dsq;
 use ornament_scfg::{
-    align_glocal, calc_qdb_bands, configure_local, configure_scores, cyk_search_banded,
-    parse_cm_file, parse_cm_records_file, Cm, EmitMap, QdbBands, Strand,
+    align_glocal, calc_qdb_bands, cm_pipeline_search, configure_local, configure_scores,
+    cyk_search_banded, parse_cm_file, parse_cm_records_file, Cm, EmitMap, PipelineParams, QdbBands,
+    Strand,
 };
 
 use super::CMHit;
@@ -23,6 +24,29 @@ use super::CMHit;
 /// are dropped before E-value filtering; it keeps significant tRNAs while discarding
 /// the spurious low-scoring hits, mirroring the differential-test reporting floor.
 const REPORTING_BITS: f32 = 20.0;
+
+/// Per-model CM-DP memory budget (bytes). Large structured RNAs (e.g. LSU/SSU rRNA, `W` in the
+/// thousands) blow up the scanning matrix — dominated by the BEGL rolling deck, which is
+/// `O(W² · n_bifurcations)` — and would OOM a multi-model genome scan. Models whose estimate
+/// exceeds this are skipped (with a warning) rather than crashing the whole run. ~1.5 GiB leaves
+/// headroom under the default thread-count concurrency. (The proper fix for huge models is tighter
+/// HMM bands / banded storage, not a bigger matrix.)
+const MAX_SCAN_BYTES: usize = 1_500_000_000;
+
+/// Estimate the peak CM scanning-DP footprint for `cm` at window `w_max` (the dominant `alpha` +
+/// `alpha_begl` decks from `scan_core`). Used to skip pathologically large models before they OOM.
+fn estimated_scan_bytes(cm: &ornament_scfg::Cm, w_max: usize) -> usize {
+    let width = w_max + 1;
+    let n_begl = cm
+        .sttype
+        .iter()
+        .filter(|&&t| t == ornament_scfg::model::st::B)
+        .count()
+        .max(1);
+    // alpha: 2 decks of m·width floats; alpha_begl: width·(n_begl·width) floats. f32 = 4 bytes.
+    let cells = 2 * cm.m * width + width * width * n_begl;
+    cells.saturating_mul(4)
+}
 
 /// Scan a FASTA file for CM hits using the native `ornament-scfg` engine.
 ///
@@ -131,12 +155,38 @@ pub fn scan_native_multi<P: AsRef<Path>, Q: AsRef<Path>>(
     let records = ornament_alphabet::read_fasta(fasta)
         .map_err(|e| anyhow!("failed to read FASTA {}: {e}", fasta.display()))?;
 
-    // Per-model setup (QDB bands + max window + emit map), computed once per model in parallel.
+    // Memory guard: skip models whose scanning DP would exceed the budget (huge rRNAs etc.) so one
+    // pathological model can't OOM the whole collection scan. Reported, not silent.
+    let mut n_skipped = 0usize;
+    let feasible: Vec<bool> = models
+        .iter()
+        .map(|cm| {
+            let ok = estimated_scan_bytes(cm, cm.w as usize) <= MAX_SCAN_BYTES;
+            if !ok {
+                n_skipped += 1;
+                eprintln!(
+                    "warning: skipping model {} (W={}, ~{:.1} GiB DP > budget); too large for the scanning matrix",
+                    cm.name,
+                    cm.w,
+                    estimated_scan_bytes(cm, cm.w as usize) as f64 / (1u64 << 30) as f64,
+                );
+            }
+            ok
+        })
+        .collect();
+    if n_skipped > 0 {
+        eprintln!(
+            "warning: {n_skipped} of {} models skipped (too large)",
+            models.len()
+        );
+    }
+
+    // Per-model setup: a glocal-configured copy for per-hit model-span alignment + the emit map.
+    // QDB bands aren't needed here — the p7 pipeline computes its own internally.
     struct Prepared {
         cm: Cm,
         /// Glocal-configured copy used only for per-hit alignment (see `scan_native`).
         align_cm: Cm,
-        bands: QdbBands,
         w_max: usize,
         emap: EmitMap,
     }
@@ -146,23 +196,23 @@ pub fn scan_native_multi<P: AsRef<Path>, Q: AsRef<Path>>(
             let mut align_cm = cm.clone();
             configure_scores(&mut align_cm);
             configure_local(&mut cm); // cmsearch/cmscan default (local mode)
-            let bands = calc_qdb_bands(&cm, QdbBands::DEFAULT_BETA);
             let w_max = cm.w as usize;
             let emap = EmitMap::build(&cm);
             Prepared {
                 cm,
                 align_cm,
-                bands,
                 w_max,
                 emap,
             }
         })
         .collect();
 
-    // Parallelize across the full model × record product: every (model, record) scan is
+    // Parallelize across the feasible model × record product: every (model, record) scan is
     // independent, so the whole collection saturates the thread pool regardless of how many
-    // models or sequences there are. Order-preserving collect → thread-count-independent output.
+    // models or sequences there are. Each scan uses the p7-filtered pipeline (the brute QDB scan
+    // is infeasible at genome scale), which prunes the genome cheaply before the CM DP.
     let pairs: Vec<(usize, usize)> = (0..prepared.len())
+        .filter(|&mi| feasible[mi])
         .flat_map(|mi| (0..records.len()).map(move |ri| (mi, ri)))
         .collect();
 
@@ -176,7 +226,14 @@ pub fn scan_native_multi<P: AsRef<Path>, Q: AsRef<Path>>(
                     .digitize(&rec.seq)
                     .map_err(|e| anyhow!("failed to digitize sequence {}: {e}", rec.name))?;
 
-            let raw = cyk_search_banded(&p.cm, &dsq, p.w_max, REPORTING_BITS, &p.bands);
+            let (raw, _stats) = cm_pipeline_search(
+                &p.cm,
+                &dsq,
+                p.w_max,
+                REPORTING_BITS,
+                PipelineParams::default(),
+            )
+            .map_err(|e| anyhow!("pipeline failed for model {}: {e}", p.cm.name))?;
             let rc = maybe_revcomp(&p.cm, &dsq, &raw, &rec.name)?;
 
             let mut hits = Vec::new();
