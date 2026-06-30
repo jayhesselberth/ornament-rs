@@ -74,6 +74,27 @@ fn bench_filters(c: &mut Criterion) {
         gd.bench_function("striped_sse", |b| b.iter(|| sp.score_nats(black_box(&dsq))));
     }
     gd.finish();
+
+    // Striped uint8 MSV prefilter DP: SSE 16-lane vs AVX2 32-lane (vs the scalar float MSV).
+    #[cfg(target_arch = "x86_64")]
+    {
+        let mut gm = c.benchmark_group("p7_msv_dp");
+        gm.throughput(Throughput::Elements(l as u64));
+        gm.bench_function("scalar", |b| {
+            b.iter(|| msv_bits(black_box(&hmm), black_box(&abc), black_box(&dsq)))
+        });
+        let sse = ornament_hmm::MsvProfile::with_lanes(&prof, 16);
+        gm.bench_function("striped_sse16", |b| {
+            b.iter(|| sse.score_bits(black_box(&dsq)))
+        });
+        if std::is_x86_feature_detected!("avx2") {
+            let avx = ornament_hmm::MsvProfile::with_lanes(&prof, 32);
+            gm.bench_function("striped_avx2_32", |b| {
+                b.iter(|| avx.score_bits(black_box(&dsq)))
+            });
+        }
+        gm.finish();
+    }
 }
 
 criterion_group!(benches, bench_filters);

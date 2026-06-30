@@ -20,9 +20,10 @@ use crate::profile::P7Profile;
 #[cfg(target_arch = "x86_64")]
 use ornament_alphabet::Dsq;
 
-/// SSE uint8 lane count.
+/// Max uint8 lane count (AVX2). Each striped block is stored `[u8; VBMAX]`; the active width
+/// `vb` (16 = SSE, 32 = AVX2) selects how many lanes are populated and read.
 #[cfg(target_arch = "x86_64")]
-const VB: usize = 16;
+const VBMAX: usize = 32;
 
 /// `unbiased_byteify`: round a (log-prob) score to a non-negative uint8 cost. `255` = −∞.
 #[cfg(target_arch = "x86_64")]
@@ -54,6 +55,8 @@ fn biased_byteify(scale_b: f32, bias_b: u8, sc: f32) -> u8 {
 #[cfg(target_arch = "x86_64")]
 #[derive(Clone)]
 pub struct MsvProfile {
+    /// Active lane width: 32 (AVX2) or 16 (SSE). Only lanes `0..vb` of each block are used.
+    vb: usize,
     q: usize,
     scale_b: f32,
     base_b: u8,
@@ -61,17 +64,37 @@ pub struct MsvProfile {
     tbm_b: u8, // B->Mk entry (from M)
     tec_b: u8, // E->C / E->J (constant, multihit)
     tjb_b: u8, // N/C/J move (length-dependent)
-    /// `rbv[x]` = `Q` striped 16-byte vectors of biased emission costs for residue `x`.
-    rbv: Vec<Vec<[u8; VB]>>,
+    /// `rbv[x]` = `Q` striped blocks of biased emission costs for residue `x` (lanes `vb..` = 255).
+    rbv: Vec<Vec<[u8; VBMAX]>>,
 }
 
 #[cfg(target_arch = "x86_64")]
 impl MsvProfile {
-    /// Build the uint8 MSV profile from a configured profile (length-model from `prof.l`).
+    /// Build the uint8 MSV profile, striped for the widest SIMD that actually helps. AVX2's
+    /// 32-lane kernel only wins once the model is long enough to amortize its pricier cross-lane
+    /// shift — at small `M` (few stripes, e.g. tRNA's M≈71) it's marginally *slower* than SSE
+    /// (measured), so we keep SSE 16-lane below `M = 128` and switch to AVX2 above it. Length
+    /// model from `prof.l`.
     pub fn new(prof: &P7Profile) -> MsvProfile {
+        let vb = if prof.m >= 128 && std::is_x86_feature_detected!("avx2") {
+            32
+        } else {
+            16
+        };
+        Self::build(prof, vb)
+    }
+
+    /// Build forcing a specific SIMD lane width (16 = SSE, 32 = AVX2). For benchmarks/tests;
+    /// production code uses [`MsvProfile::new`] (auto-selects the widest supported). Scoring a
+    /// `vb = 32` profile on a non-AVX2 CPU is unsound, so only use 32 when AVX2 is present.
+    pub fn with_lanes(prof: &P7Profile, lanes: usize) -> MsvProfile {
+        Self::build(prof, lanes)
+    }
+
+    fn build(prof: &P7Profile, vb: usize) -> MsvProfile {
         let m = prof.m;
         let kp = prof.kp;
-        let q = m.div_ceil(VB);
+        let q = m.div_ceil(vb);
         let scale_b = 3.0 / std::f32::consts::LN_2;
         let base_b = 190u8;
 
@@ -86,13 +109,14 @@ impl MsvProfile {
         }
         let bias_b = unbiased_byteify(scale_b, -max);
 
-        // Striped biased emission bytes: lane z of vector q holds position p = q+1+z*Q.
-        let rbv: Vec<Vec<[u8; VB]>> = (0..kp)
+        // Striped biased emission bytes: lane z (0..vb) of vector q holds position p = q+1+z*Q.
+        // Out-of-range positions and the unused `vb..VBMAX` lanes stay 255 (the -inf cost).
+        let rbv: Vec<Vec<[u8; VBMAX]>> = (0..kp)
             .map(|x| {
                 (0..q)
                     .map(|qq| {
-                        let mut v = [255u8; VB]; // 255 = -inf padding
-                        for (z, b) in v.iter_mut().enumerate() {
+                        let mut v = [255u8; VBMAX];
+                        for (z, b) in v.iter_mut().enumerate().take(vb) {
                             let p = qq + 1 + z * q;
                             if p <= m {
                                 *b = biased_byteify(scale_b, bias_b, prof.msc[x][p]);
@@ -107,6 +131,7 @@ impl MsvProfile {
         let tbm_b = unbiased_byteify(scale_b, (2.0 / (m as f32 * (m as f32 + 1.0))).ln());
         let tec_b = unbiased_byteify(scale_b, 0.5f32.ln());
         let mut sp = MsvProfile {
+            vb,
             q,
             scale_b,
             base_b,
@@ -125,11 +150,19 @@ impl MsvProfile {
         self.tjb_b = unbiased_byteify(self.scale_b, (3.0 / (l as f32 + 3.0)).ln());
     }
 
-    /// MSV **bit** score for `dsq` (1-based, sentinels at 0 and L+1). Returns `+∞` on uint8
-    /// overflow (a saturating-strong hit) — the caller treats that as a pass.
+    /// MSV **bit** score for `dsq` (1-based, sentinels at 0 and L+1). Dispatches to the AVX2
+    /// (32-lane) or SSE (16-lane) kernel matching how the profile was striped. Returns `+∞` on
+    /// uint8 overflow (a saturating-strong hit) — the caller treats that as a pass.
     pub fn score_bits(&self, dsq: &[Dsq]) -> f32 {
-        // SAFETY: SSE2 is part of the x86_64 baseline ABI, always present.
-        unsafe { msv_sse(self, dsq) }
+        // SAFETY: width was chosen from `is_x86_feature_detected!` at build time; SSE2 is
+        // baseline and AVX2 was confirmed present when `vb == 32`.
+        unsafe {
+            if self.vb == 32 {
+                msv_avx2(self, dsq)
+            } else {
+                msv_sse(self, dsq)
+            }
+        }
     }
 }
 
@@ -167,7 +200,7 @@ unsafe fn msv_sse(sp: &MsvProfile, dsq: &[Dsq]) -> f32 {
         }
 
         // Horizontal max over the 16 bytes (scalar reduce — cheap, once per row).
-        let mut bytes = [0u8; VB];
+        let mut bytes = [0u8; 16];
         _mm_storeu_si128(bytes.as_mut_ptr() as *mut __m128i, xev);
         let xe = bytes.iter().copied().max().unwrap();
 
@@ -185,8 +218,76 @@ unsafe fn msv_sse(sp: &MsvProfile, dsq: &[Dsq]) -> f32 {
     // Recover the raw MSV score in nats (HMMER's MSVFilter recovery), then null-correct to bits
     // exactly as the scalar `msv_bits` does, so the result is on the scale `msv_pvalue` expects.
     let xj = (_mm_extract_epi16::<0>(xjv) & 0xff) as u8;
+    recover_bits(sp, xj, l)
+}
+
+/// Shared score recovery (SSE/AVX2): byte → null-corrected bits on the `msv_pvalue` scale.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn recover_bits(sp: &MsvProfile, xj: u8, l: usize) -> f32 {
     let raw_nats = ((xj as f32 - sp.tjb_b as f32) - sp.base_b as f32) / sp.scale_b - 3.0;
     (raw_nats - crate::profile::null_one(l)) / std::f32::consts::LN_2
+}
+
+/// AVX2 (32-lane) uint8 MSV — the same algorithm as [`msv_sse`] at double the width. Requires
+/// the profile striped for `vb = 32`.
+///
+/// # Safety
+/// Requires the `avx2` target feature (the build picked `vb == 32` only after detecting it).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[allow(clippy::needless_range_loop)]
+unsafe fn msv_avx2(sp: &MsvProfile, dsq: &[Dsq]) -> f32 {
+    use std::arch::x86_64::*;
+
+    let q = sp.q;
+    let l = dsq.len().saturating_sub(2);
+    let biasv = _mm256_set1_epi8(sp.bias_b as i8);
+    let basev = _mm256_set1_epi8(sp.base_b as i8);
+    let tjbmv = _mm256_set1_epi8(sp.tjb_b.wrapping_add(sp.tbm_b) as i8);
+    let tecv = _mm256_set1_epi8(sp.tec_b as i8);
+
+    // Shift the whole 256-bit register left by one byte, zero in (the striped k-1 wrap). AVX2's
+    // `slli_si256` only shifts within each 128-bit lane, so bring lane0's top byte across into
+    // lane1's low byte via `permute2x128` (→ [lane0 | 0]) + a per-lane `alignr`.
+    let shift1 = |v: __m256i| -> __m256i {
+        let t = _mm256_permute2x128_si256::<0x08>(v, v); // [hi = lane0(v), lo = 0]
+        _mm256_alignr_epi8::<15>(v, t)
+    };
+
+    let mut dp = vec![_mm256_setzero_si256(); q];
+    let mut xjv = _mm256_setzero_si256();
+    let mut xbv = _mm256_subs_epu8(basev, tjbmv);
+
+    for i in 1..=l {
+        let rsc = &sp.rbv[dsq[i] as usize];
+        let mut xev = _mm256_setzero_si256();
+        let mut mpv = shift1(dp[q - 1]);
+
+        for qq in 0..q {
+            let mut sv = _mm256_max_epu8(mpv, xbv);
+            sv = _mm256_adds_epu8(sv, biasv);
+            sv = _mm256_subs_epu8(sv, _mm256_loadu_si256(rsc[qq].as_ptr() as *const __m256i));
+            xev = _mm256_max_epu8(xev, sv);
+            mpv = dp[qq];
+            dp[qq] = sv;
+        }
+
+        let mut bytes = [0u8; 32];
+        _mm256_storeu_si256(bytes.as_mut_ptr() as *mut __m256i, xev);
+        let xe = bytes.iter().copied().max().unwrap();
+
+        if xe.saturating_add(sp.bias_b) == 255 {
+            return f32::INFINITY;
+        }
+
+        let xev_b = _mm256_set1_epi8(xe as i8);
+        xjv = _mm256_max_epu8(xjv, _mm256_subs_epu8(xev_b, tecv));
+        xbv = _mm256_subs_epu8(_mm256_max_epu8(basev, xjv), tjbmv);
+    }
+
+    let xj = (_mm256_extract_epi8::<0>(xjv) & 0xff) as u8;
+    recover_bits(sp, xj, l)
 }
 
 #[cfg(test)]
@@ -255,5 +356,43 @@ mod tests {
             cons_msv > rand_msv,
             "hit {cons_msv} must outscore junk {rand_msv}"
         );
+    }
+
+    /// SSE (16-lane) and AVX2 (32-lane) must produce the *same* score — the striping width only
+    /// changes the traversal order of an associative max-plus DP, not the result.
+    #[test]
+    fn msv_sse_and_avx2_agree() {
+        let hmm = crate::parse_p7_hmm(
+            &std::fs::read_to_string(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../ornament-scfg/tests/data/trna_fp7.hmm"
+            ))
+            .expect("read hmm"),
+        )
+        .expect("parse hmm");
+        let abc = Alphabet::rna();
+        let bg = bg_freqs(hmm.k);
+        if !std::is_x86_feature_detected!("avx2") {
+            return; // no AVX2 to compare against
+        }
+        let mut s: u64 = 0xBEEF;
+        let bases = [b'A', b'C', b'G', b'U'];
+        for &len in &[20usize, 73, 200, 436, 900] {
+            let seq: String = (0..len)
+                .map(|_| {
+                    s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    bases[((s >> 40) & 3) as usize] as char
+                })
+                .collect();
+            let dsq = abc.digitize(&seq).expect("digitize");
+            let prof = P7Profile::config_local(&hmm, &abc, &bg, len);
+            let sse = MsvProfile::build(&prof, 16).score_bits(&dsq);
+            let avx2 = MsvProfile::build(&prof, 32).score_bits(&dsq);
+            assert_eq!(
+                sse.to_bits(),
+                avx2.to_bits(),
+                "len {len}: SSE {sse} vs AVX2 {avx2}"
+            );
+        }
     }
 }
