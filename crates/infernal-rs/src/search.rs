@@ -17,6 +17,7 @@ use crate::config::IMPOSSIBLE;
 use crate::emit::Oesc;
 use crate::evalues::{evalue, SearchMode};
 use crate::model::{emits_right, n_emit, st, stid, Cm};
+use crate::qdb::QdbBands;
 
 /// A single hit (1-based, inclusive coordinates on the forward strand).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -320,8 +321,8 @@ fn search<S: Semiring>(
     let mut rc = dsq.to_vec();
     cm.abc.revcomp(&mut rc).expect("revcomp digital sequence");
     let (fwd, rev) = rayon::join(
-        || scan_core::<S>(cm, dsq, w_max, Some(cutoff_bits)).1,
-        || scan_core::<S>(cm, &rc, w_max, Some(cutoff_bits)).1,
+        || scan_core::<S>(cm, dsq, w_max, Some(cutoff_bits), None).1,
+        || scan_core::<S>(cm, &rc, w_max, Some(cutoff_bits), None).1,
     );
 
     let mut hits: Vec<Hit> = Vec::with_capacity(fwd.len() + rev.len());
@@ -363,7 +364,7 @@ fn search<S: Semiring>(
 
 /// Single-best convenience wrapper over [`scan_core`] (no multi-hit gamma resolution).
 fn scan<S: Semiring>(cm: &Cm, dsq: &[Dsq], w_max: usize) -> CykScan {
-    scan_core::<S>(cm, dsq, w_max, None).0
+    scan_core::<S>(cm, dsq, w_max, None, None).0
 }
 
 /// Multi-hit gamma scan over a *standalone* sub-sequence `sub` (its own sentinels at 0 and
@@ -381,11 +382,12 @@ pub(crate) fn scan_subseq(
     w_max: usize,
     cutoff_bits: f32,
     do_inside: bool,
+    bands: Option<&QdbBands>,
 ) -> Vec<(f32, usize, usize)> {
     let raw = if do_inside {
-        scan_core::<LogSum>(cm, sub, w_max, Some(cutoff_bits)).1
+        scan_core::<LogSum>(cm, sub, w_max, Some(cutoff_bits), bands).1
     } else {
-        scan_core::<MaxPlus>(cm, sub, w_max, Some(cutoff_bits)).1
+        scan_core::<MaxPlus>(cm, sub, w_max, Some(cutoff_bits), bands).1
     };
     raw.into_iter().map(|h| (h.score, h.i, h.j)).collect()
 }
@@ -403,6 +405,7 @@ fn scan_core<S: Semiring>(
     dsq: &[Dsq],
     w_max: usize,
     gamma_cutoff: Option<f32>,
+    bands: Option<&QdbBands>,
 ) -> (CykScan, Vec<RawHit>) {
     let l = dsq.len().saturating_sub(2);
     let w = w_max.min(l);
@@ -509,6 +512,12 @@ fn scan_core<S: Semiring>(
             let right = emits_right(sttype);
             let is_begl = cm.stid[v] == stid::BEGL_S;
 
+            // QDB band for this state: only `d in [dmin_v, dmax_v]` is computed/stored. The band
+            // is j-independent, so out-of-band cells are never written and stay at their
+            // one-time IMPOSSIBLE init — reads of them are correctly IMPOSSIBLE. Unbanded =
+            // the full `[0, dx]` range (identical to the pre-QDB scan).
+            let (dmin_v, dmax_v) = bands.map_or((0, dx), |b| (b.dmin[v], b.dmax[v].min(dx)));
+
             if sttype == st::B {
                 // Bifurcation: sc[d] = ⊕_{k=0..d} left(j-k, d-k) ⊗ right(j, k). Reordering to
                 // outer-`k` makes the left child's cells contiguous in `d-k`, so each split is
@@ -517,21 +526,50 @@ fn scan_core<S: Semiring>(
                 let wbi = begl_idx[cm.cfirst[v] as usize];
                 let ych = cm.cnum[v] as usize;
                 let base = wbi * width;
-                #[allow(clippy::needless_range_loop)] // d feeds init_sc and indexes acc
-                for d in 0..=dx {
-                    acc[d] = init_sc(v, d); // B sd=0; IMPOSSIBLE unless v can local-end. acc[0] unused.
+                let dlo = dmin_v.max(1);
+                let dhi = dmax_v;
+                if dhi < dlo {
+                    continue;
                 }
-                for k in 0..=dx {
+                // Children's bands: `k` = right-fragment length (BEGR via cnum), `d-k` = left
+                // (BEGL via cfirst). Restricting both keeps the convolution in-band (Infernal's
+                // kmin/kmax) — out-of-band child cells are IMPOSSIBLE anyway, so this is purely
+                // skipping guaranteed-no-op work.
+                let (lmin, lmax, rmin, rmax) = bands.map_or((0, dx, 0, dx), |b| {
+                    let l = cm.cfirst[v] as usize;
+                    (
+                        b.dmin[l],
+                        b.dmax[l].min(dx),
+                        b.dmin[ych],
+                        b.dmax[ych].min(dx),
+                    )
+                });
+                #[allow(clippy::needless_range_loop)] // d feeds init_sc and indexes acc
+                for d in dlo..=dhi {
+                    acc[d] = init_sc(v, d); // B sd=0; IMPOSSIBLE unless v can local-end
+                }
+                for k in rmin..=rmax {
                     let right_k = alpha[cur][ych * width + k];
                     if right_k <= IMPOSSIBLE {
                         continue; // left ⊗ IMPOSSIBLE contributes nothing to any d
                     }
                     let deck = (j - k) % width;
-                    let n = dx - k + 1; // d ranges k..=dx; left index (d-k) ranges 0..n
-                    S::accumulate(&mut acc[k..=dx], &alpha_begl[deck][base..base + n], right_k);
+                    // d in band, d >= k, and left length d-k in [lmin, lmax].
+                    let d_start = dlo.max(k + lmin);
+                    let d_end = dhi.min(k + lmax);
+                    if d_end < d_start {
+                        continue;
+                    }
+                    let n = d_end - d_start + 1;
+                    let loff = base + (d_start - k); // left index (d-k) at d = d_start
+                    S::accumulate(
+                        &mut acc[d_start..=d_end],
+                        &alpha_begl[deck][loff..loff + n],
+                        right_k,
+                    );
                 }
                 #[allow(clippy::needless_range_loop)] // d indexes acc and the alpha row offset
-                for d in 1..=dx {
+                for d in dlo..=dhi {
                     alpha[cur][v * width + d] = acc[d];
                 }
                 continue;
@@ -544,8 +582,11 @@ fn scan_core<S: Semiring>(
             let single = oesc.single[v].as_deref();
             let pairtab = oesc.pair[v].as_deref();
 
-            if dx < sd {
-                continue; // not enough residues to emit at this j; all cells stay IMPOSSIBLE
+            // Banded d-range for this emitter/D/S state: `d in [sd.max(dmin_v), dmax_v]`.
+            let dlo = sd.max(dmin_v);
+            let dhi = dmax_v;
+            if dhi < dlo {
+                continue; // empty band / too few residues; all cells stay IMPOSSIBLE
             }
             // A same-row self-transition (`v` among its own current-row children) makes the
             // `d`-recurrence loop-carried: `alpha[cur][v][d]` reads `alpha[cur][v][d-1]` computed
@@ -557,7 +598,10 @@ fn scan_core<S: Semiring>(
             // `d` starts at `sd.max(1)`: emitters need `d >= sd`, and the `d=0` cell of S/D
             // states is a constant set in the base case that must not be overwritten here.
             if self_loop {
-                for d in sd.max(1)..=dx {
+                // IL self-loop reads `alpha[cur][v][d-1]` (its own earlier cell). At `d = dlo`
+                // that read is out-of-band → IMPOSSIBLE, exactly as the minimal-length parse
+                // requires; processing `d` ascending keeps the recurrence correct.
+                for d in dlo.max(1)..=dhi {
                     let cd = d - sd;
                     let mut sc = init_sc(v, cd);
                     #[allow(clippy::needless_range_loop)] // yoff indexes both the child row and tsc
@@ -574,21 +618,26 @@ fn scan_core<S: Semiring>(
                 continue;
             }
 
-            // Phase 1: child-transition fold over the contiguous `cd = d - sd` range (the hot,
-            // vectorized inner step). `cd` runs 0..nrange, i.e. `d` runs sd..=dx.
-            let nrange = dx - sd + 1;
-            let accs = &mut acc[..nrange];
-            for (cd, a) in accs.iter_mut().enumerate() {
-                *a = init_sc(v, cd); // local-end path: emit sd, then EL emits cd (IMPOSSIBLE glocal)
+            // Phase 1: child-transition fold over the banded `cd = d - sd` range (the hot,
+            // vectorized inner step). `cd` runs cd0..=cd1, i.e. `d` runs dlo..=dhi.
+            let cd0 = dlo - sd;
+            let cd1 = dhi - sd;
+            #[allow(clippy::needless_range_loop)] // cd feeds init_sc and indexes acc
+            for cd in cd0..=cd1 {
+                acc[cd] = init_sc(v, cd); // local-end path: emit sd, then EL emits cd (IMPOSSIBLE glocal)
             }
             #[allow(clippy::needless_range_loop)] // yoff indexes both the child row and tsc
             for yoff in 0..cnum {
                 let base = (ych + yoff) * width;
-                S::accumulate(accs, &alpha[child_row][base..base + nrange], tsc[yoff]);
+                S::accumulate(
+                    &mut acc[cd0..=cd1],
+                    &alpha[child_row][base + cd0..base + cd1 + 1],
+                    tsc[yoff],
+                );
             }
             // Phase 2: add the per-`d` emission score and store (begl states have no emission).
-            for d in sd.max(1)..=dx {
-                let sc = accs[d - sd];
+            for d in dlo.max(1)..=dhi {
+                let sc = acc[d - sd];
                 let val = match sttype {
                     st::ML | st::IL => {
                         let i = j - d + 1;
