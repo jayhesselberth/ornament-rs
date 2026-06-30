@@ -16,6 +16,7 @@ pub mod emitmap;
 pub mod evalues;
 pub mod model;
 pub mod pipeline;
+pub mod qdb;
 pub mod search;
 
 pub use align::{align_glocal, AlignedResidue, Alignment};

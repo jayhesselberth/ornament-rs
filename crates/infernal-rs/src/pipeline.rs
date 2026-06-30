@@ -30,6 +30,7 @@ use rayon::prelude::*;
 
 use crate::evalues::{evalue, SearchMode};
 use crate::model::Cm;
+use crate::qdb::{calc_qdb_bands, QdbBands};
 use crate::search::{scan_subseq, Hit, Strand};
 use crate::InfernalError;
 
@@ -110,6 +111,10 @@ pub fn cm_pipeline_search(
     let prof = P7Profile::config_local(&hmm, cm.abc.as_ref(), &bg, l);
     let nj = prof.nj;
     let filt = fwdfilter::build(&prof);
+    // Query-dependent bands for the CM stage, computed once and shared across every survivor
+    // window (and both strands). A safe `beta` keeps every real hit's optimal parse in-band, so
+    // the banded scan reports identical hits to the unbanded one — just faster.
+    let bands = calc_qdb_bands(cm, QdbBands::DEFAULT_BETA);
     let w = w_max.min(l).max(1);
     let searched = 2.0 * l as f64;
     let do_inside = params.do_inside;
@@ -130,7 +135,7 @@ pub fn cm_pipeline_search(
             .par_iter()
             .flat_map_iter(|&(s, e)| {
                 let sub = subseq(dsq, s, e);
-                scan_subseq(cm, &sub, w_max, cutoff_bits, do_inside)
+                scan_subseq(cm, &sub, w_max, cutoff_bits, do_inside, Some(&bands))
                     .into_iter()
                     .map(move |(score, i, j)| Hit {
                         score,
@@ -149,7 +154,7 @@ pub fn cm_pipeline_search(
             .par_iter()
             .flat_map_iter(|&(s, e)| {
                 let sub = subseq(&rc, s, e);
-                scan_subseq(cm, &sub, w_max, cutoff_bits, do_inside)
+                scan_subseq(cm, &sub, w_max, cutoff_bits, do_inside, Some(&bands))
                     .into_iter()
                     .map(move |(score, i, j)| Hit {
                         score,
