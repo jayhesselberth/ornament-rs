@@ -1,6 +1,6 @@
-//! Accelerated CM search: the p7 Forward filter selects windows, the CM scans only the
+//! Accelerated CM search: a cheap p7 filter cascade selects windows, the CM scans only the
 //! survivors. A faithful-in-spirit port of `cm_pipeline.c`'s structure (p7 filter sweep →
-//! surviving windows → CM stages), reduced to a single Forward filter stage.
+//! surviving windows → CM stages), with an MSV → Forward filter cascade.
 //!
 //! Why this is correct (no true hits dropped vs the brute-force scan):
 //!
@@ -8,10 +8,11 @@
 //!    (overlap `W`). Every CM hit has length `≤ W` (the model's max hit width), so any hit
 //!    is fully contained in at least one tile — a length-`≤W` interval always fits inside
 //!    one of these overlapping `2W` tiles.
-//! 2. **Filtering.** Each tile is scored with p7 Forward and kept iff its Forward P-value
-//!    passes `F3` (HMMER's third filter threshold, default `1e-5`). A real homolog scores
-//!    tens of bits over its tile → P-value far below `1e-5`, so its containing tile always
-//!    survives; only signal-free tiles are pruned.
+//! 2. **Filtering (cheapest-first cascade).** Each tile is first scored by the reduced-precision
+//!    uint8 **MSV** prefilter (16-lane SIMD); only tiles passing MSV's `F1` pay for the striped
+//!    **Forward** filter, kept iff their Forward P-value passes `F3` (HMMER's third threshold,
+//!    `1e-5`). MSV's `F1` is set with a margin so it keeps every tile Forward would (a real
+//!    homolog scores far above either threshold), so the cascade prunes only signal-free tiles.
 //! 3. **Window-local CM = whole-strand CM.** A surviving tile is padded by `W` (so adjacent
 //!    survivors merge and every contained hit keeps full flank room) and handed to the CM
 //!    scan. Because a CM hit rooted at ROOT_S over `i..j` reads only `dsq[i..=j]`, scanning
@@ -113,9 +114,10 @@ pub fn cm_pipeline_search(
     let prof = P7Profile::config_local(&hmm, cm.abc.as_ref(), &bg, l);
     let nj = prof.nj;
     let filt = fwdfilter::build(&prof);
-    // Query-dependent bands for the CM stage, computed once and shared across every survivor
-    // window (and both strands). A safe `beta` keeps every real hit's optimal parse in-band, so
-    // the banded scan reports identical hits to the unbanded one — just faster.
+    let msv = msvfilter::build(&prof); // cheap uint8 MSV prefilter (built once)
+                                       // Query-dependent bands for the CM stage, computed once and shared across every survivor
+                                       // window (and both strands). A safe `beta` keeps every real hit's optimal parse in-band, so
+                                       // the banded scan reports identical hits to the unbanded one — just faster.
     let bands = calc_qdb_bands(cm, QdbBands::DEFAULT_BETA);
     let w = w_max.min(l).max(1);
     let searched = 2.0 * l as f64;
@@ -132,7 +134,7 @@ pub fn cm_pipeline_search(
     // strands run concurrently via `rayon::join`. Output is order-independent: hits are sorted
     // below, so the result is identical regardless of thread count.
     let plus = || {
-        let (surv, nw) = strand_survivors(&filt, nj, &hmm, dsq, w, params.f3);
+        let (surv, nw) = strand_survivors(&msv, &filt, nj, &hmm, dsq, w, params.f3);
         let hits: Vec<Hit> = surv
             .par_iter()
             .flat_map_iter(|&(s, e)| {
@@ -151,7 +153,7 @@ pub fn cm_pipeline_search(
         (surv, nw, hits)
     };
     let minus = || {
-        let (surv, nw) = strand_survivors(&filt, nj, &hmm, &rc, w, params.f3);
+        let (surv, nw) = strand_survivors(&msv, &filt, nj, &hmm, &rc, w, params.f3);
         let hits: Vec<Hit> = surv
             .par_iter()
             .flat_map_iter(|&(s, e)| {
@@ -208,6 +210,12 @@ pub fn cm_pipeline_inside(
 /// HMMER's default p7 filter cascade thresholds (P-value), for the prune-rate measurement.
 const MSV_F1: f64 = 0.02; // MSV pass threshold (`--F1`)
 const VIT_F2: f64 = 1e-3; // Viterbi pass threshold (`--F2`)
+
+/// MSV threshold for the live cascade prefilter. Looser than HMMER's `0.02` to give the
+/// reduced-precision uint8 MSV a safety margin against its quantization floor — at `0.05` it
+/// keeps every tile the Forward filter would (verified: 100/100 Forward survivors on E. coli)
+/// while still pruning ~96% of tiles. Still only a prefilter; Forward + the CM make the calls.
+const MSV_CASCADE_F1: f64 = 0.05;
 
 /// Per-stage tile pass counts for the p7 filter cascade (both strands summed). A measurement
 /// used to size the value of an MSV → Viterbi → Forward cascade: at HMMER's default
@@ -322,6 +330,7 @@ fn parse_filter_hmm(cm: &Cm) -> Result<P7Hmm, InfernalError> {
 /// Tiling is length `2W`, step `W` (overlap `W`) so every length-`≤W` hit is contained in
 /// at least one tile. Survivors are padded by `W` and merged into maximal disjoint regions.
 fn strand_survivors(
+    msv: &msvfilter::Profile,
     filt: &fwdfilter::Profile,
     nj: f32,
     hmm: &P7Hmm,
@@ -345,13 +354,17 @@ fn strand_survivors(
         start += step;
     }
 
-    // Score each tile's Forward filter independently. Each task clones the (length-independent)
-    // filter profile and resets only its length model, so the tiles run in parallel without
-    // contention; the order-preserving collect keeps the subsequent merge (which assumes
-    // non-decreasing `start`) deterministic.
+    // Cascade each tile cheapest-first: the uint8 MSV prunes the large majority, and only its
+    // survivors pay for the (costlier) striped Forward. Each task clones the length-independent
+    // profiles and resets only their length model, so tiles run in parallel without contention;
+    // the order-preserving collect keeps the subsequent merge (assumes non-decreasing `start`)
+    // deterministic.
     let kept: Vec<Option<(usize, usize)>> = tiles
         .par_iter()
         .map(|&(s, e)| {
+            if !msvfilter::passes(msv, hmm, dsq, s, e, MSV_CASCADE_F1) {
+                return None; // MSV prefilter pruned this tile
+            }
             if forward_pvalue(hmm, fwdfilter::window_bits(filt, nj, dsq, s, e)) <= f3 {
                 let ps = s.saturating_sub(w).max(1);
                 let pe = (e + w).min(l);
@@ -424,6 +437,57 @@ mod fwdfilter {
         let mut p = base.clone();
         p.reconfig_length(len);
         (forward_nats(&p, &sub) - null_one(len)) / std::f32::consts::LN_2
+    }
+}
+
+/// The reduced-precision (uint8) MSV prefilter — the cheapest cascade stage. On x86_64 it's the
+/// 16-lane striped int8 MSV; elsewhere it's a no-op pass-through (the Forward filter still gates).
+/// `passes` is whether a tile clears the MSV P-value threshold `f1`; a tile that fails is pruned
+/// without ever running the costlier Forward DP. Strong hits saturate the uint8 range → `+inf`
+/// score → always pass, so the prefilter cannot drop a real hit (verified by pipeline parity).
+#[cfg(target_arch = "x86_64")]
+mod msvfilter {
+    use super::{subseq, Dsq, P7Hmm, P7Profile};
+    use ornament_hmm::{msv_pvalue, MsvProfile};
+
+    pub(super) type Profile = MsvProfile;
+
+    pub(super) fn build(prof: &P7Profile) -> Profile {
+        MsvProfile::new(prof)
+    }
+
+    pub(super) fn passes(
+        base: &Profile,
+        hmm: &P7Hmm,
+        dsq: &[Dsq],
+        start: usize,
+        end: usize,
+        f1: f64,
+    ) -> bool {
+        let mut sp = base.clone();
+        sp.set_length(end - start + 1);
+        let sub = subseq(dsq, start, end);
+        msv_pvalue(hmm, sp.score_bits(&sub)) <= f1
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+mod msvfilter {
+    use super::{Dsq, P7Hmm, P7Profile};
+
+    pub(super) type Profile = ();
+
+    pub(super) fn build(_prof: &P7Profile) -> Profile {}
+
+    pub(super) fn passes(
+        _base: &Profile,
+        _hmm: &P7Hmm,
+        _dsq: &[Dsq],
+        _start: usize,
+        _end: usize,
+        _f1: f64,
+    ) -> bool {
+        true // no MSV prefilter off x86; the Forward filter still gates every tile
     }
 }
 

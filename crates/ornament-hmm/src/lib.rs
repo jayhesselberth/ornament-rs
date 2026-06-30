@@ -22,6 +22,7 @@ pub mod fwd_simd;
 pub mod hmm;
 pub mod logsum;
 pub mod msv;
+pub mod msv_simd;
 pub mod profile;
 pub mod pvalue;
 pub mod vit;
@@ -32,6 +33,8 @@ pub use fwd_simd::forward_odds_nats;
 pub use fwd_simd::{forward_striped_nats, StripedProfile};
 pub use hmm::{parse_p7_hmm, EvParam, P7Hmm};
 pub use msv::{msv_bits, msv_nats};
+#[cfg(target_arch = "x86_64")]
+pub use msv_simd::MsvProfile;
 pub use profile::P7Profile;
 pub use pvalue::{forward_pvalue, msv_pvalue, viterbi_pvalue};
 pub use vit::viterbi_bits;
