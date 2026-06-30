@@ -19,6 +19,7 @@
 
 pub mod fwd;
 pub mod hmm;
+pub mod logsum;
 pub mod msv;
 pub mod profile;
 pub mod pvalue;

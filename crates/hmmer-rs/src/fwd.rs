@@ -28,43 +28,44 @@ const NINF: f32 = f32::NEG_INFINITY;
 
 /// The "⊕" operation that combines alternative sub-parses within a DP cell. The identity
 /// (empty disjunction) is `-inf` for both implementors.
+///
+/// `Ctx` is per-DP state built once via [`Semiring::ctx`] and threaded into every `or` call,
+/// so Forward can carry the [`crate::logsum`] correction table without paying a per-cell
+/// `OnceLock` load, while Viterbi's `Ctx` is `()` and compiles away.
 pub(crate) trait Semiring {
-    fn or(a: f32, b: f32) -> f32;
+    type Ctx;
+    fn ctx() -> Self::Ctx;
+    fn or(ctx: &Self::Ctx, a: f32, b: f32) -> f32;
 }
 
-/// Log-sum-exp semiring → Forward (sum over all paths).
+/// Log-sum-exp semiring → Forward (sum over all paths), via the fast table.
 pub(crate) struct LogSum;
 impl Semiring for LogSum {
+    type Ctx = &'static [f32];
     #[inline]
-    fn or(a: f32, b: f32) -> f32 {
-        flogsum(a, b)
+    fn ctx() -> Self::Ctx {
+        crate::logsum::table()
+    }
+    #[inline]
+    fn or(ctx: &Self::Ctx, a: f32, b: f32) -> f32 {
+        crate::logsum::flogsum(ctx, a, b)
     }
 }
 
 /// Max-plus semiring → Viterbi (best single path).
 pub(crate) struct MaxPlus;
 impl Semiring for MaxPlus {
+    type Ctx = ();
     #[inline]
-    fn or(a: f32, b: f32) -> f32 {
+    fn ctx() -> Self::Ctx {}
+    #[inline]
+    fn or(_ctx: &Self::Ctx, a: f32, b: f32) -> f32 {
         if a >= b {
             a
         } else {
             b
         }
     }
-}
-
-/// Natural-log log-sum-exp: `log(e^a + e^b)`.
-#[inline]
-fn flogsum(a: f32, b: f32) -> f32 {
-    if a == NINF {
-        return b;
-    }
-    if b == NINF {
-        return a;
-    }
-    let (hi, lo) = if a >= b { (a, b) } else { (b, a) };
-    hi + ((lo - hi) as f64).exp().ln_1p() as f32
 }
 
 /// Raw Forward score in nats for a 1-based digital sequence `dsq` (with sentinels at 0 and
@@ -96,6 +97,7 @@ fn dp_nats<S: Semiring>(prof: &P7Profile, dsq: &[Dsq]) -> f32 {
 
     let esc = 0.0f32; // local mode: E exit from any match/delete
     let tsc = |ty: usize, k: usize| prof.tsc(ty, k);
+    let ctx = S::ctx(); // built once (Forward: the logsum table; Viterbi: unit)
 
     // Row 0.
     xmx[mx::N] = 0.0;
@@ -119,11 +121,14 @@ fn dp_nats<S: Semiring>(prof: &P7Profile, dsq: &[Dsq]) -> f32 {
         for k in 1..m {
             // match
             let sc = S::or(
+                &ctx,
                 S::or(
+                    &ctx,
                     mmx[prow + k - 1] + tsc(p7p::MM, k - 1),
                     imx[prow + k - 1] + tsc(p7p::IM, k - 1),
                 ),
                 S::or(
+                    &ctx,
                     xmx[pxrow + mx::B] + tsc(p7p::BM, k - 1),
                     dmx[prow + k - 1] + tsc(p7p::DM, k - 1),
                 ),
@@ -132,6 +137,7 @@ fn dp_nats<S: Semiring>(prof: &P7Profile, dsq: &[Dsq]) -> f32 {
 
             // insert
             let sc = S::or(
+                &ctx,
                 mmx[prow + k] + tsc(p7p::MI, k),
                 imx[prow + k] + tsc(p7p::II, k),
             );
@@ -139,24 +145,29 @@ fn dp_nats<S: Semiring>(prof: &P7Profile, dsq: &[Dsq]) -> f32 {
 
             // delete
             dmx[row + k] = S::or(
+                &ctx,
                 mmx[row + k - 1] + tsc(p7p::MD, k - 1),
                 dmx[row + k - 1] + tsc(p7p::DD, k - 1),
             );
 
             // E
             xmx[xrow + mx::E] = S::or(
-                S::or(mmx[row + k] + esc, dmx[row + k] + esc),
+                &ctx,
+                S::or(&ctx, mmx[row + k] + esc, dmx[row + k] + esc),
                 xmx[xrow + mx::E],
             );
         }
 
         // unrolled M_M
         let sc = S::or(
+            &ctx,
             S::or(
+                &ctx,
                 mmx[prow + m - 1] + tsc(p7p::MM, m - 1),
                 imx[prow + m - 1] + tsc(p7p::IM, m - 1),
             ),
             S::or(
+                &ctx,
                 xmx[pxrow + mx::B] + tsc(p7p::BM, m - 1),
                 dmx[prow + m - 1] + tsc(p7p::DM, m - 1),
             ),
@@ -164,22 +175,30 @@ fn dp_nats<S: Semiring>(prof: &P7Profile, dsq: &[Dsq]) -> f32 {
         mmx[row + m] = sc + msc[x][m];
         imx[row + m] = NINF;
         dmx[row + m] = S::or(
+            &ctx,
             mmx[row + m - 1] + tsc(p7p::MD, m - 1),
             dmx[row + m - 1] + tsc(p7p::DD, m - 1),
         );
-        xmx[xrow + mx::E] = S::or(S::or(mmx[row + m], dmx[row + m]), xmx[xrow + mx::E]);
+        xmx[xrow + mx::E] = S::or(
+            &ctx,
+            S::or(&ctx, mmx[row + m], dmx[row + m]),
+            xmx[xrow + mx::E],
+        );
 
         // specials
         xmx[xrow + mx::J] = S::or(
+            &ctx,
             xmx[pxrow + mx::J] + prof.xsc[xstate::J][xstate::LOOP],
             xmx[xrow + mx::E] + prof.xsc[xstate::E][xstate::LOOP],
         );
         xmx[xrow + mx::C] = S::or(
+            &ctx,
             xmx[pxrow + mx::C] + prof.xsc[xstate::C][xstate::LOOP],
             xmx[xrow + mx::E] + prof.xsc[xstate::E][xstate::MOVE],
         );
         xmx[xrow + mx::N] = xmx[pxrow + mx::N] + prof.xsc[xstate::N][xstate::LOOP];
         xmx[xrow + mx::B] = S::or(
+            &ctx,
             xmx[xrow + mx::N] + prof.xsc[xstate::N][xstate::MOVE],
             xmx[xrow + mx::J] + prof.xsc[xstate::J][xstate::MOVE],
         );

@@ -611,6 +611,7 @@ dependencies = [
  "criterion",
  "easel-rs",
  "hmmer-rs",
+ "rayon",
  "thiserror",
 ]
 
@@ -883,6 +884,7 @@ dependencies = [
  "infernal-rs",
  "infernal-sys",
  "lazy_static",
+ "rayon",
  "regex",
  "rustc-hash",
  "serde",
