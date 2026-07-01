@@ -46,10 +46,11 @@ So the boundary is: **GPU filters the flood; CPU handles the heavy CM tail on th
 
 ## Concrete wins, in priority order
 
-1. **Resident sequence + offset windows.** Upload each strand to the device *once*; make windows
-   `(start,end)` offsets into device-resident memory instead of copying residues per window. The
-   scan tiles at length `2W` step `W` (2× overlap), so the current per-window copy moves each base
-   ~2×. This likely beats the uint8 conversion on its own.
+1. **Resident sequence + offset windows** *(done — `DeviceStrand` + `Tiles`)*. Each strand is
+   uploaded to the device once (RAII buffer, reused across windows and cascade stages); windows are
+   `(start,end)` offsets into it instead of copied residues. The scan tiles at length `2W` step `W`
+   (2× overlap), so the old per-window copy moved each base ~2×. *Still to do:* CUDA streams +
+   double-buffering so H2D upload / kernel / D2H overlap (the full Level-1 producer/consumer).
 2. **uint8 MSV** *(done — `msv_u8_batch_kernel`)*: 4× smaller emission table → better bandwidth on
    the memory-bound one-thread-per-window batch.
 3. **Batch across models and sequences.** A single small model (tRNA, M≈71) underutilizes the GPU.

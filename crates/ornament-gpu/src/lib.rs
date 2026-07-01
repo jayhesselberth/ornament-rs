@@ -8,15 +8,19 @@
 //! device result matches the CPU to f32 rounding.
 //!
 //! ## Layout of a batch
-//! A batch is one configured model's emission table plus N independent windows:
-//! - [`FlatProfile`] — the model's match-emission log-odds flattened to `msc[x*(M+1)+k]`.
-//! - [`Windows`] — every window's residue codes concatenated, with per-window offset/length.
+//! One configured model's emission table, a strand uploaded once, and windows as offsets into it:
+//! - [`FlatProfile`] / [`ByteMsvProfile`] — the model's match-emission log-odds (f32 / uint8),
+//!   flattened to `[x*(M+1)+k]`.
+//! - [`DeviceStrand`] — a strand's residues, resident on the device and reused across windows and
+//!   cascade stages (avoids re-copying overlapping tiles).
+//! - [`Tiles`] — the windows as 1-based `(start, end)` spans → device offsets.
 //!
 //! ## Feature gating
 //! The `cuda` feature turns on the device path (build.rs compiles the kernel with nvcc and links
-//! the CUDA runtime). Without it the crate still builds and the CPU oracle + batch builders are
-//! available — only [`msv_nats_gpu`] is compiled out. This keeps the workspace buildable on
-//! login nodes that have no CUDA toolchain; build/run the GPU path on the `compgpu` nodes.
+//! the CUDA runtime). Without it the crate still builds and the CPU oracle + batch builders
+//! ([`FlatProfile`], [`ByteMsvProfile`], [`Tiles`], [`msv_nats_cpu`]) are available; the device
+//! types ([`DeviceStrand`], [`msv_nats_gpu`]) are compiled out. This keeps the workspace buildable
+//! on login nodes with no CUDA toolchain; build/run the GPU path on the `compgpu` nodes.
 
 use ornament_alphabet::Dsq;
 use ornament_hmm::profile::null_one;
@@ -155,44 +159,40 @@ impl ByteMsvProfile {
     }
 }
 
-/// A batch of windows to score against one [`FlatProfile`]: every window's residue codes packed
-/// contiguously for the kernel, indexed by per-window `offsets`/`lengths`. The packed codes are
-/// **raw** digital symbols (0..Kp) with the sentinels stripped — the kernel does its own 1-based
-/// indexing, so it wants only the residues.
+/// Windows into a [`DeviceStrand`], as `(start, length)` offsets rather than copied residues. The
+/// scan tiles overlap (length `2W`, step `W`), so a copy-per-window batch moves each base ~2× over
+/// PCIe; referencing a resident strand moves it once. `starts` are 0-based offsets into the
+/// strand's residues (sentinels already stripped), matching the kernel's own 1-based indexing.
 #[derive(Debug, Clone, Default)]
-pub struct Windows {
-    /// Concatenated residue codes of every window (no sentinels).
-    pub dsq: Vec<u8>,
-    /// Start index of window `j` into `dsq`.
-    pub offsets: Vec<i32>,
+pub struct Tiles {
+    /// 0-based start offset of window `j` into the resident strand.
+    pub starts: Vec<i32>,
     /// Residue length of window `j`.
     pub lengths: Vec<i32>,
 }
 
-impl Windows {
-    /// Pack a list of windows into one batch. Each input window is a sentinel-padded 1-based
-    /// digital sequence (the codebase's `dsq` convention, as returned by `Alphabet::digitize`);
-    /// the surrounding sentinels are dropped when packing.
-    pub fn from_slices(windows: &[&[Dsq]]) -> Windows {
-        let mut w = Windows::default();
-        for win in windows {
-            // Strip the leading/trailing sentinel to get the raw residues.
-            let res = &win[1..win.len().saturating_sub(1).max(1)];
-            w.offsets.push(w.dsq.len() as i32);
-            w.lengths.push(res.len() as i32);
-            w.dsq.extend_from_slice(res);
+impl Tiles {
+    /// Build from 1-based inclusive `(start, end)` spans — the coordinate convention the scan
+    /// pipeline tiles in (`strand_survivors`). A span `(s, e)` covers residues `s..=e` of the
+    /// strand, i.e. 0-based start `s-1`, length `e-s+1`.
+    pub fn from_spans(spans: &[(usize, usize)]) -> Tiles {
+        let mut t = Tiles::default();
+        for &(s, e) in spans {
+            debug_assert!(s >= 1 && e >= s, "1-based inclusive span, got ({s},{e})");
+            t.starts.push((s - 1) as i32);
+            t.lengths.push((e - s + 1) as i32);
         }
-        w
+        t
     }
 
-    /// Number of windows in the batch.
+    /// Number of windows.
     pub fn len(&self) -> usize {
-        self.offsets.len()
+        self.starts.len()
     }
 
-    /// Whether the batch is empty.
+    /// Whether there are no windows.
     pub fn is_empty(&self) -> bool {
-        self.offsets.is_empty()
+        self.starts.is_empty()
     }
 }
 
@@ -219,20 +219,25 @@ pub fn msv_nats_cpu(prof: &P7Profile, windows: &[&[Dsq]]) -> Vec<f32> {
 #[cfg(feature = "cuda")]
 extern "C" {
     fn ornament_gpu_device_count(count: *mut i32) -> i32;
+    fn ornament_gpu_strand_upload(
+        dsq: *const u8,
+        len: i32,
+        d_out: *mut *mut core::ffi::c_void,
+    ) -> i32;
+    fn ornament_gpu_strand_free(d: *mut core::ffi::c_void) -> i32;
     #[allow(clippy::too_many_arguments)]
-    fn ornament_gpu_msv_batch(
+    fn ornament_gpu_msv_batch_resident(
         msc: *const f32,
         kp: i32,
         m: i32,
-        dsq: *const u8,
-        total_res: i32,
-        offsets: *const i32,
+        d_strand: *const core::ffi::c_void,
+        starts: *const i32,
         lengths: *const i32,
         n: i32,
         out: *mut f32,
     ) -> i32;
     #[allow(clippy::too_many_arguments)]
-    fn ornament_gpu_msv_u8_batch(
+    fn ornament_gpu_msv_u8_batch_resident(
         rbv: *const u8,
         kp: i32,
         m: i32,
@@ -241,13 +246,66 @@ extern "C" {
         bias_b: i32,
         tbm_b: i32,
         tec_b: i32,
-        dsq: *const u8,
-        total_res: i32,
-        offsets: *const i32,
+        d_strand: *const core::ffi::c_void,
+        starts: *const i32,
         lengths: *const i32,
         n: i32,
         out: *mut f32,
     ) -> i32;
+}
+
+/// A strand's residues uploaded to the device **once**, reusable across every window batch and
+/// every cascade stage (MSV/Viterbi/Forward) without re-copying. RAII: the device buffer is freed
+/// on drop.
+#[cfg(feature = "cuda")]
+pub struct DeviceStrand {
+    ptr: *mut core::ffi::c_void,
+    len: usize,
+}
+
+#[cfg(feature = "cuda")]
+impl DeviceStrand {
+    /// Upload a sentinel-padded 1-based `dsq` (as `Alphabet::digitize` returns). The surrounding
+    /// sentinels are stripped; the raw residues live on the device until this is dropped.
+    pub fn upload(dsq: &[Dsq]) -> Result<DeviceStrand, GpuError> {
+        if device_count()? == 0 {
+            return Err(GpuError::NoDevice);
+        }
+        // Strip the leading/trailing sentinel to get the raw residues.
+        let res: &[u8] = if dsq.len() >= 2 {
+            &dsq[1..dsq.len() - 1]
+        } else {
+            &[]
+        };
+        let mut ptr: *mut core::ffi::c_void = core::ptr::null_mut();
+        let rc = unsafe { ornament_gpu_strand_upload(res.as_ptr(), res.len() as i32, &mut ptr) };
+        if rc != 0 {
+            return Err(GpuError::Cuda(rc));
+        }
+        Ok(DeviceStrand {
+            ptr,
+            len: res.len(),
+        })
+    }
+
+    /// Residue length of the resident strand.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether the strand is empty.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl Drop for DeviceStrand {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            unsafe { ornament_gpu_strand_free(self.ptr) };
+        }
+    }
 }
 
 /// Number of visible CUDA devices, or `Err` if the runtime call fails / the crate lacks `cuda`.
@@ -267,27 +325,28 @@ pub fn device_count() -> Result<usize, GpuError> {
     }
 }
 
-/// Batch MSV raw scores (nats) on the GPU, one score per window. Requires the `cuda` feature and
-/// a visible device. The result is element-for-element comparable to [`msv_nats_cpu`].
+/// Batch MSV raw scores (nats) on the GPU: score `tiles` against a resident `strand`, one score
+/// per tile. The strand is uploaded once ([`DeviceStrand::upload`]) and reused across tiles and
+/// cascade stages. Results are element-for-element comparable to [`msv_nats_cpu`].
 #[cfg(feature = "cuda")]
-pub fn msv_nats_gpu(fp: &FlatProfile, w: &Windows) -> Result<Vec<f32>, GpuError> {
-    let n = w.len();
+pub fn msv_nats_gpu(
+    fp: &FlatProfile,
+    strand: &DeviceStrand,
+    tiles: &Tiles,
+) -> Result<Vec<f32>, GpuError> {
+    let n = tiles.len();
     if n == 0 {
         return Ok(Vec::new());
     }
-    if device_count()? == 0 {
-        return Err(GpuError::NoDevice);
-    }
     let mut out = vec![f32::NEG_INFINITY; n];
     let rc = unsafe {
-        ornament_gpu_msv_batch(
+        ornament_gpu_msv_batch_resident(
             fp.msc.as_ptr(),
             fp.kp as i32,
             fp.m as i32,
-            w.dsq.as_ptr(),
-            w.dsq.len() as i32,
-            w.offsets.as_ptr(),
-            w.lengths.as_ptr(),
+            strand.ptr,
+            tiles.starts.as_ptr(),
+            tiles.lengths.as_ptr(),
             n as i32,
             out.as_mut_ptr(),
         )
@@ -298,29 +357,23 @@ pub fn msv_nats_gpu(fp: &FlatProfile, w: &Windows) -> Result<Vec<f32>, GpuError>
     Ok(out)
 }
 
-/// Stub when built without `cuda`: always [`GpuError::NotCompiled`]. Lets callers link against a
-/// stable signature regardless of feature state.
-#[cfg(not(feature = "cuda"))]
-pub fn msv_nats_gpu(_fp: &FlatProfile, _w: &Windows) -> Result<Vec<f32>, GpuError> {
-    Err(GpuError::NotCompiled)
-}
-
-/// Reduced-precision (uint8) batch MSV raw scores (nats) on the GPU, one per window — the
-/// throughput analogue of [`msv_nats_gpu`]. Matches `ornament-hmm::MsvProfile::score_bits` (the
-/// striped uint8 filter), not the f32 `msv_nats`: it floors weak scores and reports saturating
-/// hits as `+inf`. Convert to bits with [`nats_to_bits`].
+/// Reduced-precision (uint8) batch MSV raw scores (nats) on the GPU — the throughput analogue of
+/// [`msv_nats_gpu`], scoring `tiles` against a resident `strand`. Matches
+/// `ornament-hmm::MsvProfile::score_bits` (the striped uint8 filter), not the f32 `msv_nats`: it
+/// floors weak scores and reports saturating hits as `+inf`. Convert to bits with [`nats_to_bits`].
 #[cfg(feature = "cuda")]
-pub fn msv_u8_nats_gpu(bp: &ByteMsvProfile, w: &Windows) -> Result<Vec<f32>, GpuError> {
-    let n = w.len();
+pub fn msv_u8_nats_gpu(
+    bp: &ByteMsvProfile,
+    strand: &DeviceStrand,
+    tiles: &Tiles,
+) -> Result<Vec<f32>, GpuError> {
+    let n = tiles.len();
     if n == 0 {
         return Ok(Vec::new());
     }
-    if device_count()? == 0 {
-        return Err(GpuError::NoDevice);
-    }
     let mut out = vec![f32::NEG_INFINITY; n];
     let rc = unsafe {
-        ornament_gpu_msv_u8_batch(
+        ornament_gpu_msv_u8_batch_resident(
             bp.rbv.as_ptr(),
             bp.kp as i32,
             bp.m as i32,
@@ -329,10 +382,9 @@ pub fn msv_u8_nats_gpu(bp: &ByteMsvProfile, w: &Windows) -> Result<Vec<f32>, Gpu
             bp.bias_b as i32,
             bp.tbm_b as i32,
             bp.tec_b as i32,
-            w.dsq.as_ptr(),
-            w.dsq.len() as i32,
-            w.offsets.as_ptr(),
-            w.lengths.as_ptr(),
+            strand.ptr,
+            tiles.starts.as_ptr(),
+            tiles.lengths.as_ptr(),
             n as i32,
             out.as_mut_ptr(),
         )
@@ -343,21 +395,26 @@ pub fn msv_u8_nats_gpu(bp: &ByteMsvProfile, w: &Windows) -> Result<Vec<f32>, Gpu
     Ok(out)
 }
 
-/// Stub when built without `cuda`: always [`GpuError::NotCompiled`].
-#[cfg(not(feature = "cuda"))]
-pub fn msv_u8_nats_gpu(_bp: &ByteMsvProfile, _w: &Windows) -> Result<Vec<f32>, GpuError> {
-    Err(GpuError::NotCompiled)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use ornament_alphabet::Alphabet;
     use ornament_hmm::profile::{bg_freqs, P7Profile};
 
-    /// Build the embedded tRNA filter HMM + a configured local profile, plus a set of random
-    /// windows of varied length. Shared fixture for the CPU-oracle and GPU-parity tests.
-    fn fixture() -> (P7Profile, Vec<Vec<Dsq>>) {
+    /// Overlapping 1-based inclusive `(start, end)` spans into the fixture strand — exercises the
+    /// resident-strand offset indexing (adjacent, nested, and full-length windows).
+    const SPANS: &[(usize, usize)] = &[
+        (1, 73),
+        (50, 260),
+        (200, 260),
+        (300, 900),
+        (1, 1200),
+        (1100, 1200),
+    ];
+
+    /// Build the embedded tRNA filter HMM + a configured local profile, and one long random strand
+    /// (sentinel-padded `dsq`, length 1200). Windows are [`SPANS`] into it. Shared fixture.
+    fn fixture() -> (P7Profile, Vec<Dsq>) {
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../ornament-scfg/tests/data/trna_fp7.hmm"
@@ -370,99 +427,101 @@ mod tests {
 
         let mut s: u64 = 0xC0FFEE;
         let bases = [b'A', b'C', b'G', b'U'];
-        let windows: Vec<Vec<Dsq>> = [20usize, 73, 73, 160, 300, 436]
-            .iter()
-            .map(|&len| {
-                let seq: String = (0..len)
-                    .map(|_| {
-                        s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
-                        bases[((s >> 40) & 3) as usize] as char
-                    })
-                    .collect();
-                abc.digitize(&seq).expect("digitize")
+        let seq: String = (0..1200)
+            .map(|_| {
+                s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
+                bases[((s >> 40) & 3) as usize] as char
             })
             .collect();
-        (prof, windows)
+        let strand = abc.digitize(&seq).expect("digitize");
+        (prof, strand)
     }
 
-    /// The batch builders and CPU oracle agree with per-window scalar `msv_nats`, and the flat
-    /// emission table round-trips the profile. Runs everywhere (no GPU needed).
+    /// Sentinel-padded subsequence for a 1-based inclusive span `(s, e)` of a padded strand — the
+    /// per-window `dsq` the scalar oracles expect.
+    fn padded_span(strand: &[Dsq], s: usize, e: usize) -> Vec<Dsq> {
+        let mut out = Vec::with_capacity(e - s + 3);
+        out.push(ornament_alphabet::alphabet::SENTINEL);
+        out.extend_from_slice(&strand[s..=e]); // strand[k] is residue k (1-based)
+        out.push(ornament_alphabet::alphabet::SENTINEL);
+        out
+    }
+
+    /// The flat emission table round-trips the profile and the CPU oracle scores each span finitely.
+    /// Runs everywhere (no GPU needed).
     #[test]
     fn cpu_batch_matches_scalar() {
-        let (prof, windows) = fixture();
-        let refs: Vec<&[Dsq]> = windows.iter().map(|w| w.as_slice()).collect();
-
+        let (prof, strand) = fixture();
         let fp = FlatProfile::new(&prof);
         assert_eq!(fp.msc.len(), fp.kp * (fp.m + 1));
 
-        let cpu = msv_nats_cpu(&prof, &refs);
-        assert_eq!(cpu.len(), refs.len());
-        // nats -> bits conversion (residue length = padded len - 2) is finite for these lengths.
-        for (raw, w) in cpu.iter().zip(&refs) {
-            assert!(nats_to_bits(*raw, w.len() - 2).is_finite());
+        for &(s, e) in SPANS {
+            let win = padded_span(&strand, s, e);
+            let raw = msv_nats_cpu(&prof, &[&win])[0];
+            assert!(nats_to_bits(raw, e - s + 1).is_finite());
         }
     }
 
-    /// GPU parity: the device kernel must match the scalar oracle to f32 rounding. Skips when the
-    /// crate lacks `cuda` or no device is visible.
+    /// GPU parity (f32): scoring [`SPANS`] against a resident [`DeviceStrand`] must match the scalar
+    /// oracle applied to each span's subsequence — confirming the offset indexing reads the right
+    /// slice of the resident strand. Skips when no `cuda` device is visible.
     #[cfg(feature = "cuda")]
     #[test]
     fn gpu_matches_cpu() {
-        let (prof, windows) = fixture();
-        let refs: Vec<&[Dsq]> = windows.iter().map(|w| w.as_slice()).collect();
-
+        let (prof, strand) = fixture();
         match device_count() {
             Ok(0) | Err(_) => return, // no device on this host — skip.
             Ok(_) => {}
         }
 
         let fp = FlatProfile::new(&prof);
-        let batch = Windows::from_slices(&refs);
-        let gpu = msv_nats_gpu(&fp, &batch).expect("gpu msv");
-        let cpu = msv_nats_cpu(&prof, &refs);
+        let dstrand = DeviceStrand::upload(&strand).expect("upload strand");
+        let tiles = Tiles::from_spans(SPANS);
+        let gpu = msv_nats_gpu(&fp, &dstrand, &tiles).expect("gpu msv");
 
-        for (i, (g, c)) in gpu.iter().zip(&cpu).enumerate() {
+        for (i, &(s, e)) in SPANS.iter().enumerate() {
+            let win = padded_span(&strand, s, e);
+            let cpu = msv_nats_cpu(&prof, &[&win])[0];
             assert!(
-                (g - c).abs() < 0.01,
-                "window {i} (len {}): gpu {g} vs cpu {c}",
-                refs[i].len()
+                (gpu[i] - cpu).abs() < 0.01,
+                "span {i} ({s},{e}): gpu {} vs cpu {cpu}",
+                gpu[i]
             );
         }
     }
 
-    /// uint8 GPU parity: the reduced-precision device kernel must match the CPU striped uint8
-    /// filter (`ornament_hmm::MsvProfile::score_bits`) — same quantization, same recurrence, just
-    /// a linear vs striped traversal of an associative max-plus DP. Compared in bit space (the
-    /// scale `msv_pvalue` expects). Skips when no `cuda` device is visible; the oracle is
-    /// x86_64-only (that's where `MsvProfile` lives), which the `compgpu` nodes are.
+    /// uint8 GPU parity: the reduced-precision device kernel over a resident strand must match the
+    /// CPU striped uint8 filter (`ornament_hmm::MsvProfile::score_bits`) per span — same
+    /// quantization, same recurrence, linear vs striped traversal of an associative max-plus DP.
+    /// Skips when no `cuda` device is visible; the oracle is x86_64-only (the `compgpu` nodes are).
     #[cfg(all(feature = "cuda", target_arch = "x86_64"))]
     #[test]
     fn gpu_u8_matches_striped() {
         use ornament_hmm::MsvProfile;
 
-        let (prof, windows) = fixture();
-        let refs: Vec<&[Dsq]> = windows.iter().map(|w| w.as_slice()).collect();
-
+        let (prof, strand) = fixture();
         match device_count() {
             Ok(0) | Err(_) => return,
             Ok(_) => {}
         }
 
         let bp = ByteMsvProfile::new(&prof);
-        let batch = Windows::from_slices(&refs);
-        let gpu_raw = msv_u8_nats_gpu(&bp, &batch).expect("gpu u8 msv");
+        let dstrand = DeviceStrand::upload(&strand).expect("upload strand");
+        let tiles = Tiles::from_spans(SPANS);
+        let gpu_raw = msv_u8_nats_gpu(&bp, &dstrand, &tiles).expect("gpu u8 msv");
 
-        for (i, win) in refs.iter().enumerate() {
-            let res_len = win.len() - 2; // strip sentinels for the length model
+        for (i, &(s, e)) in SPANS.iter().enumerate() {
+            let res_len = e - s + 1;
+            let win = padded_span(&strand, s, e);
             let mut sp = MsvProfile::new(&prof);
             sp.set_length(res_len);
-            let cpu_bits = sp.score_bits(win);
+            let cpu_bits = sp.score_bits(&win);
             let gpu_bits = nats_to_bits(gpu_raw[i], res_len);
             // Both saturate to +inf together, or agree to f32 quantization.
             assert!(
                 (gpu_bits - cpu_bits).abs() < 0.01
                     || (gpu_bits.is_infinite() && cpu_bits.is_infinite()),
-                "window {i} (len {res_len}): gpu {gpu_bits} vs cpu striped {cpu_bits}"
+                "span {i} ({s},{e}): gpu {gpu_bits} vs cpu striped {cpu_bits}"
             );
         }
     }

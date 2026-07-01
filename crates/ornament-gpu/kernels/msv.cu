@@ -180,22 +180,47 @@ extern "C" int ornament_gpu_device_count(int* count) {
     return check(cudaGetDeviceCount(count));
 }
 
-// msc: Kp*(M+1) floats. dsq: total_res u8. offsets/lengths: n ints. out: n floats (host).
-extern "C" int ornament_gpu_msv_batch(
+// ---- Resident strand ------------------------------------------------------------------------
+// Upload a strand's residues to the device ONCE and score many windows against it as (start,len)
+// offsets — instead of re-copying overlapping window bytes per batch. The scan tiles at length 2W
+// step W (2x overlap), so packing windows moves each base ~2x over PCIe; a resident strand moves
+// it once, and the same device buffer is reused across the MSV/Viterbi/Forward cascade.
+
+// Upload `len` residue bytes; return the device pointer in `*d_out` (opaque handle for Rust).
+extern "C" int ornament_gpu_strand_upload(const uint8_t* dsq, int len, void** d_out) {
+    int rc = 0;
+    uint8_t* d = nullptr;
+    *d_out = nullptr;
+    if (len < 0) return (int)cudaErrorInvalidValue;
+    CUDA_TRY(cudaMalloc(&d, (size_t)len * sizeof(uint8_t)));
+    CUDA_TRY(cudaMemcpy(d, dsq, (size_t)len * sizeof(uint8_t), cudaMemcpyHostToDevice));
+    *d_out = d;
+    return 0;
+cleanup:
+    if (d) cudaFree(d);
+    return rc;
+}
+
+// Free a device strand from `ornament_gpu_strand_upload`.
+extern "C" int ornament_gpu_strand_free(void* d) {
+    return check(cudaFree(d));
+}
+
+// f32 MSV over a resident strand. `d_strand` is a device pointer (from strand_upload); `starts`
+// are 0-based offsets into it and `lengths` the window lengths. msc: Kp*(M+1) floats (host).
+extern "C" int ornament_gpu_msv_batch_resident(
     const float*   msc,
     int            Kp,
     int            M,
-    const uint8_t* dsq,
-    int            total_res,
-    const int*     offsets,
+    const void*    d_strand,
+    const int*     starts,
     const int*     lengths,
     int            n,
     float*         out)
 {
     int rc = 0;
-    float   *d_msc = nullptr, *d_scratch = nullptr, *d_out = nullptr;
-    uint8_t *d_dsq = nullptr;
-    int     *d_off = nullptr, *d_len = nullptr;
+    float *d_msc = nullptr, *d_scratch = nullptr, *d_out = nullptr;
+    int   *d_off = nullptr, *d_len = nullptr;
 
     if (n <= 0) return 0;
 
@@ -203,21 +228,20 @@ extern "C" int ornament_gpu_msv_batch(
     size_t scratch_bytes = (size_t)n * (M + 1) * sizeof(float);
 
     CUDA_TRY(cudaMalloc(&d_msc,     msc_bytes));
-    CUDA_TRY(cudaMalloc(&d_dsq,     (size_t)total_res * sizeof(uint8_t)));
     CUDA_TRY(cudaMalloc(&d_off,     (size_t)n * sizeof(int)));
     CUDA_TRY(cudaMalloc(&d_len,     (size_t)n * sizeof(int)));
     CUDA_TRY(cudaMalloc(&d_out,     (size_t)n * sizeof(float)));
     CUDA_TRY(cudaMalloc(&d_scratch, scratch_bytes));
 
-    CUDA_TRY(cudaMemcpy(d_msc, msc, msc_bytes,                      cudaMemcpyHostToDevice));
-    CUDA_TRY(cudaMemcpy(d_dsq, dsq, (size_t)total_res,              cudaMemcpyHostToDevice));
-    CUDA_TRY(cudaMemcpy(d_off, offsets, (size_t)n * sizeof(int),    cudaMemcpyHostToDevice));
-    CUDA_TRY(cudaMemcpy(d_len, lengths, (size_t)n * sizeof(int),    cudaMemcpyHostToDevice));
+    CUDA_TRY(cudaMemcpy(d_msc, msc, msc_bytes,                   cudaMemcpyHostToDevice));
+    CUDA_TRY(cudaMemcpy(d_off, starts,  (size_t)n * sizeof(int), cudaMemcpyHostToDevice));
+    CUDA_TRY(cudaMemcpy(d_len, lengths, (size_t)n * sizeof(int), cudaMemcpyHostToDevice));
 
     {
         int threads = 128;
         int blocks  = (n + threads - 1) / threads;
-        msv_batch_kernel<<<blocks, threads>>>(d_msc, Kp, M, d_dsq, d_off, d_len, n, d_scratch, d_out);
+        msv_batch_kernel<<<blocks, threads>>>(
+            d_msc, Kp, M, (const uint8_t*)d_strand, d_off, d_len, n, d_scratch, d_out);
         CUDA_TRY(cudaGetLastError());
         CUDA_TRY(cudaDeviceSynchronize());
     }
@@ -226,7 +250,6 @@ extern "C" int ornament_gpu_msv_batch(
 
 cleanup:
     cudaFree(d_msc);
-    cudaFree(d_dsq);
     cudaFree(d_off);
     cudaFree(d_len);
     cudaFree(d_out);
@@ -234,10 +257,9 @@ cleanup:
     return rc;
 }
 
-// Reduced-precision (uint8) batch MSV. rbv: Kp*(M+1) bytes. dsq: total_res u8. out: n floats
-// (raw nats / +inf), host-side null-corrected to bits. The scale/base/bias/tbm/tec bytes come
-// from the host `ByteMsvProfile`.
-extern "C" int ornament_gpu_msv_u8_batch(
+// Reduced-precision (uint8) MSV over a resident strand. rbv: Kp*(M+1) bytes (host); scale/base/
+// bias/tbm/tec from the host `ByteMsvProfile`. out: n floats (raw nats / +inf).
+extern "C" int ornament_gpu_msv_u8_batch_resident(
     const uint8_t* rbv,
     int            Kp,
     int            M,
@@ -246,15 +268,14 @@ extern "C" int ornament_gpu_msv_u8_batch(
     int            bias_b,
     int            tbm_b,
     int            tec_b,
-    const uint8_t* dsq,
-    int            total_res,
-    const int*     offsets,
+    const void*    d_strand,
+    const int*     starts,
     const int*     lengths,
     int            n,
     float*         out)
 {
     int rc = 0;
-    uint8_t *d_rbv = nullptr, *d_dsq = nullptr, *d_scratch = nullptr;
+    uint8_t *d_rbv = nullptr, *d_scratch = nullptr;
     int     *d_off = nullptr, *d_len = nullptr;
     float   *d_out = nullptr;
 
@@ -264,15 +285,13 @@ extern "C" int ornament_gpu_msv_u8_batch(
     size_t scratch_bytes = (size_t)n * (M + 1) * sizeof(uint8_t);
 
     CUDA_TRY(cudaMalloc(&d_rbv,     rbv_bytes));
-    CUDA_TRY(cudaMalloc(&d_dsq,     (size_t)total_res * sizeof(uint8_t)));
     CUDA_TRY(cudaMalloc(&d_off,     (size_t)n * sizeof(int)));
     CUDA_TRY(cudaMalloc(&d_len,     (size_t)n * sizeof(int)));
     CUDA_TRY(cudaMalloc(&d_out,     (size_t)n * sizeof(float)));
     CUDA_TRY(cudaMalloc(&d_scratch, scratch_bytes));
 
     CUDA_TRY(cudaMemcpy(d_rbv, rbv, rbv_bytes,                   cudaMemcpyHostToDevice));
-    CUDA_TRY(cudaMemcpy(d_dsq, dsq, (size_t)total_res,           cudaMemcpyHostToDevice));
-    CUDA_TRY(cudaMemcpy(d_off, offsets, (size_t)n * sizeof(int), cudaMemcpyHostToDevice));
+    CUDA_TRY(cudaMemcpy(d_off, starts,  (size_t)n * sizeof(int), cudaMemcpyHostToDevice));
     CUDA_TRY(cudaMemcpy(d_len, lengths, (size_t)n * sizeof(int), cudaMemcpyHostToDevice));
 
     {
@@ -280,7 +299,7 @@ extern "C" int ornament_gpu_msv_u8_batch(
         int blocks  = (n + threads - 1) / threads;
         msv_u8_batch_kernel<<<blocks, threads>>>(
             d_rbv, Kp, M, scale_b, base_b, bias_b, tbm_b, tec_b,
-            d_dsq, d_off, d_len, n, d_scratch, d_out);
+            (const uint8_t*)d_strand, d_off, d_len, n, d_scratch, d_out);
         CUDA_TRY(cudaGetLastError());
         CUDA_TRY(cudaDeviceSynchronize());
     }
@@ -289,7 +308,6 @@ extern "C" int ornament_gpu_msv_u8_batch(
 
 cleanup:
     cudaFree(d_rbv);
-    cudaFree(d_dsq);
     cudaFree(d_off);
     cudaFree(d_len);
     cudaFree(d_out);
