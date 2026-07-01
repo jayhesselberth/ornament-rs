@@ -293,23 +293,45 @@ where
         .flat_map(|mi| (0..records.len()).map(move |ri| (mi, ri)))
         .collect();
 
+    // Digitize (and reverse-complement) each record ONCE, up front. Both depend only on the
+    // sequence and the alphabet — not the model — and every model parsed from a `.cm` file shares
+    // the same RNA alphabet, so the digital forms are model-independent. This used to run inside
+    // the per-(model × record) loop below: a genome scanned against thousands of Rfam models
+    // re-digitized and re-reverse-complemented each sequence thousands of times. Owned `Vec`s (no
+    // interior mutability) keep the downstream alignment DP reading plain slices. (Memory: holds
+    // both strands of every record for the scan's duration — fine for the bacterial/chunked genomes
+    // this path targets.)
+    let digital: Vec<(Vec<Dsq>, Vec<Dsq>)> = if let Some(p0) = prepared.first() {
+        let abc = &p0.cm.abc;
+        records
+            .par_iter()
+            .map(|rec| -> Result<(Vec<Dsq>, Vec<Dsq>)> {
+                let dsq = abc
+                    .digitize(&rec.seq)
+                    .map_err(|e| anyhow!("failed to digitize sequence {}: {e}", rec.name))?;
+                let mut rc = dsq.clone();
+                abc.revcomp(&mut rc)
+                    .map_err(|e| anyhow!("failed to reverse-complement {}: {e}", rec.name))?;
+                Ok((dsq, rc))
+            })
+            .collect::<Result<Vec<_>>>()?
+    } else {
+        Vec::new()
+    };
+
     pairs.par_iter().try_for_each(|&(mi, ri)| -> Result<()> {
         let p = &prepared[mi];
         let rec = &records[ri];
-        let dsq =
-            p.cm.abc
-                .digitize(&rec.seq)
-                .map_err(|e| anyhow!("failed to digitize sequence {}: {e}", rec.name))?;
+        let (dsq, rc) = &digital[ri];
 
         let (raw, _stats) = cm_pipeline_search(
             &p.cm,
-            &dsq,
+            dsq,
             p.w_max,
             REPORTING_BITS,
             PipelineParams::default(),
         )
         .map_err(|e| anyhow!("pipeline failed for model {}: {e}", p.cm.name))?;
-        let rc = maybe_revcomp(&p.cm, &dsq, &raw, &rec.name)?;
 
         let mut hits = Vec::new();
         for h in raw {
@@ -324,8 +346,8 @@ where
             };
             let (mdl_from, mdl_to) = hit_model_span(
                 &p.align_cm,
-                &dsq,
-                rc.as_deref(),
+                dsq,
+                Some(rc.as_slice()),
                 &p.emap,
                 &p.align_bands,
                 h.i,
@@ -424,6 +446,27 @@ pub fn scan_native_aligned<P: AsRef<Path>, Q: AsRef<Path>>(
         .flat_map(|mi| (0..records.len()).map(move |ri| (mi, ri)))
         .collect();
 
+    // Digitize + reverse-complement each record once, up front (see [`scan_multi_with`]): both are
+    // model-independent, so doing them per (model × record) pair re-computed each record's digital
+    // form once per model.
+    let digital: Vec<(Vec<Dsq>, Vec<Dsq>)> = if let Some(p0) = prepared.first() {
+        let abc = &p0.cm.abc;
+        records
+            .par_iter()
+            .map(|rec| -> Result<(Vec<Dsq>, Vec<Dsq>)> {
+                let dsq = abc
+                    .digitize(&rec.seq)
+                    .map_err(|e| anyhow!("failed to digitize sequence {}: {e}", rec.name))?;
+                let mut rc = dsq.clone();
+                abc.revcomp(&mut rc)
+                    .map_err(|e| anyhow!("failed to reverse-complement {}: {e}", rec.name))?;
+                Ok((dsq, rc))
+            })
+            .collect::<Result<Vec<_>>>()?
+    } else {
+        Vec::new()
+    };
+
     // Each entry: (model index, rows with their (E-value, -score) sort keys).
     type Keyed = (f64, f64, AlignedRow);
     let per_pair: Vec<(usize, Vec<Keyed>)> = pairs
@@ -431,20 +474,16 @@ pub fn scan_native_aligned<P: AsRef<Path>, Q: AsRef<Path>>(
         .map(|&(mi, ri)| -> Result<(usize, Vec<Keyed>)> {
             let p = &prepared[mi];
             let rec = &records[ri];
-            let dsq =
-                p.cm.abc
-                    .digitize(&rec.seq)
-                    .map_err(|e| anyhow!("failed to digitize sequence {}: {e}", rec.name))?;
+            let (dsq, rc) = &digital[ri];
 
             let (raw, _stats) = cm_pipeline_search(
                 &p.cm,
-                &dsq,
+                dsq,
                 p.w_max,
                 REPORTING_BITS,
                 PipelineParams::default(),
             )
             .map_err(|e| anyhow!("pipeline failed for model {}: {e}", p.cm.name))?;
-            let rc = maybe_revcomp(&p.cm, &dsq, &raw, &rec.name)?;
 
             let mut rows = Vec::new();
             for h in raw {
@@ -455,8 +494,8 @@ pub fn scan_native_aligned<P: AsRef<Path>, Q: AsRef<Path>>(
                 }
                 let (aln, seq) = align_hit_window(
                     &p.align_cm,
-                    &dsq,
-                    rc.as_deref(),
+                    dsq,
+                    Some(rc.as_slice()),
                     &p.emap,
                     &p.align_bands,
                     h.i,
