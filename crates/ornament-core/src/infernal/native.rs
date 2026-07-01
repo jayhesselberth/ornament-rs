@@ -104,43 +104,50 @@ pub fn scan_native<P: AsRef<Path>, Q: AsRef<Path>>(
             // Reverse-complement the record once if any minus-strand hit needs its model span.
             let rc = maybe_revcomp(&cm, &dsq, &raw, &rec.name)?;
 
-            let mut rec_hits = Vec::new();
-            for h in raw {
-                // Filter on E-value when the model is calibrated (mirrors `cmsearch -E`).
-                if let Some(ev) = h.evalue {
-                    if ev > e_value {
-                        continue;
+            // Each hit's model-span recovery runs an independent banded glocal traceback; on a
+            // long genome record with many hits this loop is the serial tail (the pipeline itself
+            // is already parallel). Run the per-hit alignments in parallel — nested under the
+            // per-record `par_iter`, rayon work-steals so a single big record still saturates
+            // cores. `collect` preserves `raw`'s order, so output stays thread-count-independent.
+            let rec_hits: Vec<CMHit> = raw
+                .par_iter()
+                .filter_map(|h| {
+                    // Filter on E-value when the model is calibrated (mirrors `cmsearch -E`).
+                    if let Some(ev) = h.evalue {
+                        if ev > e_value {
+                            return None;
+                        }
                     }
-                }
-                let strand = match h.strand {
-                    Strand::Plus => '+',
-                    Strand::Minus => '-',
-                };
-                let (mdl_from, mdl_to) = hit_model_span(
-                    &align_cm,
-                    &dsq,
-                    rc.as_deref(),
-                    &emap,
-                    &align_bands,
-                    h.i,
-                    h.j,
-                    h.strand,
-                );
-                rec_hits.push(CMHit {
-                    target_name: rec.name.clone(),
-                    target_start: h.i,
-                    target_end: h.j,
-                    strand,
-                    query_name: query_name.clone(),
-                    score: h.score as f64,
-                    e_value: h.evalue.unwrap_or(f64::NAN),
-                    gc_content: gc_fraction(&rec.seq, h.i, h.j),
-                    mdl_from,
-                    mdl_to,
-                    query_accession: query_acc.clone(),
-                    description: (!rec.desc.is_empty()).then(|| rec.desc.clone()),
-                });
-            }
+                    let strand = match h.strand {
+                        Strand::Plus => '+',
+                        Strand::Minus => '-',
+                    };
+                    let (mdl_from, mdl_to) = hit_model_span(
+                        &align_cm,
+                        &dsq,
+                        rc.as_deref(),
+                        &emap,
+                        &align_bands,
+                        h.i,
+                        h.j,
+                        h.strand,
+                    );
+                    Some(CMHit {
+                        target_name: rec.name.clone(),
+                        target_start: h.i,
+                        target_end: h.j,
+                        strand,
+                        query_name: query_name.clone(),
+                        score: h.score as f64,
+                        e_value: h.evalue.unwrap_or(f64::NAN),
+                        gc_content: gc_fraction(&rec.seq, h.i, h.j),
+                        mdl_from,
+                        mdl_to,
+                        query_accession: query_acc.clone(),
+                        description: (!rec.desc.is_empty()).then(|| rec.desc.clone()),
+                    })
+                })
+                .collect();
             Ok(rec_hits)
         })
         .collect::<Result<Vec<_>>>()?;
