@@ -9,14 +9,17 @@ of `(model, window)` tiles. This crate begins with the cheapest, most GPU-friend
 is a faithful f32 max-plus transcription of the scalar [`ornament_hmm::msv_nats`] oracle, so the
 device result matches the CPU to f32 rounding (verified by the `gpu_matches_cpu` parity test).
 
+See [`DESIGN.md`](DESIGN.md) for where the work is heaviest and the producer/consumer split.
+
 ## Status
 
 - [x] Batch MSV kernel (f32, one-thread-per-window) + CUDA-Runtime-API host wrappers.
 - [x] Feature-gated build (`nvcc` via `build.rs`), CPU oracle, GPU↔CPU parity test.
-- [ ] uint8 reduced-precision MSV (throughput; mirrors `ornament-hmm::msv_simd`).
+- [x] uint8 reduced-precision MSV (throughput; matches the striped `ornament-hmm::MsvProfile`).
+- [ ] Resident sequence + offset windows (kill the 2× overlap-tiling copy).
 - [ ] Viterbi + Forward kernels (rest of the cascade).
 - [ ] Wire into `ornament-scfg`'s scan pipeline as an optional backend.
-- [ ] Intra-DP parallelism / shared-memory staging for long models; multi-model batching.
+- [ ] Intra-DP (warp-per-window) for long models; multi-model batching.
 
 ## Feature gating
 

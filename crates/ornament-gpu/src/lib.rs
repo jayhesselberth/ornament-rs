@@ -67,6 +67,94 @@ impl FlatProfile {
     }
 }
 
+/// `unbiased_byteify`: round a log-prob score to a non-negative uint8 cost (`255` = -inf), the
+/// same quantization as `ornament-hmm::msv_simd`.
+fn unbiased_byteify(scale_b: f32, sc: f32) -> u8 {
+    let cost = -(scale_b * sc).round();
+    if cost > 255.0 {
+        255
+    } else {
+        cost.max(0.0) as u8
+    }
+}
+
+/// `biased_byteify`: emission score -> biased uint8 cost (`bias_b - round(scale_b·sc)`) with
+/// HMMER's two's-complement wraparound; `255` = -inf. Matches `ornament-hmm::msv_simd`.
+fn biased_byteify(scale_b: f32, bias_b: u8, sc: f32) -> u8 {
+    let cost = -(scale_b * sc).round();
+    if cost > 255.0 - bias_b as f32 {
+        255
+    } else {
+        (cost as i32 as u8).wrapping_add(bias_b)
+    }
+}
+
+/// Reduced-precision (uint8) MSV profile for the throughput kernel — the byte-quantized analogue
+/// of [`FlatProfile`], built with the same offset scheme as `ornament-hmm::MsvProfile`
+/// (`scale_b = 3/ln2`, `base_b = 190`). Emission bytes `rbv` are 4x smaller than the f32 table,
+/// which is the throughput win on the bandwidth-bound one-thread-per-window batch. The
+/// length-model byte `tjb_b` is per-window and recomputed on-device from each window's length.
+#[derive(Debug, Clone)]
+pub struct ByteMsvProfile {
+    /// Alphabet size (emission-table rows).
+    pub kp: usize,
+    /// Model length (match states).
+    pub m: usize,
+    /// Nats-per-byte scale (`3/ln2`); the device recovers raw nats and per-window `tjb_b` with it.
+    pub scale_b: f32,
+    /// Offset base byte (`190`).
+    pub base_b: u8,
+    /// Emission bias byte (from the max match log-odds).
+    pub bias_b: u8,
+    /// B->Mk entry byte (depends on `M`).
+    pub tbm_b: u8,
+    /// E->C / E->J byte (constant, multihit).
+    pub tec_b: u8,
+    /// Row-major `[Kp][M+1]` biased emission cost bytes (`255` = -inf; `k = 0` padded).
+    pub rbv: Vec<u8>,
+}
+
+impl ByteMsvProfile {
+    /// Quantize a configured [`P7Profile`] into the uint8 MSV profile.
+    pub fn new(prof: &P7Profile) -> ByteMsvProfile {
+        let (kp, m) = (prof.kp, prof.m);
+        let scale_b = 3.0 / std::f32::consts::LN_2;
+        let base_b = 190u8;
+
+        // bias from the max finite match-emission log-odds.
+        let mut max = 0.0f32;
+        for row in prof.msc.iter() {
+            for &s in row[1..=m].iter() {
+                if s.is_finite() {
+                    max = max.max(s);
+                }
+            }
+        }
+        let bias_b = unbiased_byteify(scale_b, -max);
+
+        // rbv[x*(M+1)+k]: biased emission byte; -inf cells (k = 0, non-residue rows) quantize to 255.
+        let mut rbv = vec![255u8; kp * (m + 1)];
+        for (x, row) in prof.msc.iter().enumerate() {
+            for k in 1..=m {
+                rbv[x * (m + 1) + k] = biased_byteify(scale_b, bias_b, row[k]);
+            }
+        }
+
+        let tbm_b = unbiased_byteify(scale_b, (2.0 / (m as f32 * (m as f32 + 1.0))).ln());
+        let tec_b = unbiased_byteify(scale_b, 0.5f32.ln());
+        ByteMsvProfile {
+            kp,
+            m,
+            scale_b,
+            base_b,
+            bias_b,
+            tbm_b,
+            tec_b,
+            rbv,
+        }
+    }
+}
+
 /// A batch of windows to score against one [`FlatProfile`]: every window's residue codes packed
 /// contiguously for the kernel, indexed by per-window `offsets`/`lengths`. The packed codes are
 /// **raw** digital symbols (0..Kp) with the sentinels stripped — the kernel does its own 1-based
@@ -143,6 +231,23 @@ extern "C" {
         n: i32,
         out: *mut f32,
     ) -> i32;
+    #[allow(clippy::too_many_arguments)]
+    fn ornament_gpu_msv_u8_batch(
+        rbv: *const u8,
+        kp: i32,
+        m: i32,
+        scale_b: f32,
+        base_b: i32,
+        bias_b: i32,
+        tbm_b: i32,
+        tec_b: i32,
+        dsq: *const u8,
+        total_res: i32,
+        offsets: *const i32,
+        lengths: *const i32,
+        n: i32,
+        out: *mut f32,
+    ) -> i32;
 }
 
 /// Number of visible CUDA devices, or `Err` if the runtime call fails / the crate lacks `cuda`.
@@ -197,6 +302,50 @@ pub fn msv_nats_gpu(fp: &FlatProfile, w: &Windows) -> Result<Vec<f32>, GpuError>
 /// stable signature regardless of feature state.
 #[cfg(not(feature = "cuda"))]
 pub fn msv_nats_gpu(_fp: &FlatProfile, _w: &Windows) -> Result<Vec<f32>, GpuError> {
+    Err(GpuError::NotCompiled)
+}
+
+/// Reduced-precision (uint8) batch MSV raw scores (nats) on the GPU, one per window — the
+/// throughput analogue of [`msv_nats_gpu`]. Matches `ornament-hmm::MsvProfile::score_bits` (the
+/// striped uint8 filter), not the f32 `msv_nats`: it floors weak scores and reports saturating
+/// hits as `+inf`. Convert to bits with [`nats_to_bits`].
+#[cfg(feature = "cuda")]
+pub fn msv_u8_nats_gpu(bp: &ByteMsvProfile, w: &Windows) -> Result<Vec<f32>, GpuError> {
+    let n = w.len();
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    if device_count()? == 0 {
+        return Err(GpuError::NoDevice);
+    }
+    let mut out = vec![f32::NEG_INFINITY; n];
+    let rc = unsafe {
+        ornament_gpu_msv_u8_batch(
+            bp.rbv.as_ptr(),
+            bp.kp as i32,
+            bp.m as i32,
+            bp.scale_b,
+            bp.base_b as i32,
+            bp.bias_b as i32,
+            bp.tbm_b as i32,
+            bp.tec_b as i32,
+            w.dsq.as_ptr(),
+            w.dsq.len() as i32,
+            w.offsets.as_ptr(),
+            w.lengths.as_ptr(),
+            n as i32,
+            out.as_mut_ptr(),
+        )
+    };
+    if rc != 0 {
+        return Err(GpuError::Cuda(rc));
+    }
+    Ok(out)
+}
+
+/// Stub when built without `cuda`: always [`GpuError::NotCompiled`].
+#[cfg(not(feature = "cuda"))]
+pub fn msv_u8_nats_gpu(_bp: &ByteMsvProfile, _w: &Windows) -> Result<Vec<f32>, GpuError> {
     Err(GpuError::NotCompiled)
 }
 
@@ -277,6 +426,43 @@ mod tests {
                 (g - c).abs() < 0.01,
                 "window {i} (len {}): gpu {g} vs cpu {c}",
                 refs[i].len()
+            );
+        }
+    }
+
+    /// uint8 GPU parity: the reduced-precision device kernel must match the CPU striped uint8
+    /// filter (`ornament_hmm::MsvProfile::score_bits`) — same quantization, same recurrence, just
+    /// a linear vs striped traversal of an associative max-plus DP. Compared in bit space (the
+    /// scale `msv_pvalue` expects). Skips when no `cuda` device is visible; the oracle is
+    /// x86_64-only (that's where `MsvProfile` lives), which the `compgpu` nodes are.
+    #[cfg(all(feature = "cuda", target_arch = "x86_64"))]
+    #[test]
+    fn gpu_u8_matches_striped() {
+        use ornament_hmm::MsvProfile;
+
+        let (prof, windows) = fixture();
+        let refs: Vec<&[Dsq]> = windows.iter().map(|w| w.as_slice()).collect();
+
+        match device_count() {
+            Ok(0) | Err(_) => return,
+            Ok(_) => {}
+        }
+
+        let bp = ByteMsvProfile::new(&prof);
+        let batch = Windows::from_slices(&refs);
+        let gpu_raw = msv_u8_nats_gpu(&bp, &batch).expect("gpu u8 msv");
+
+        for (i, win) in refs.iter().enumerate() {
+            let res_len = win.len() - 2; // strip sentinels for the length model
+            let mut sp = MsvProfile::new(&prof);
+            sp.set_length(res_len);
+            let cpu_bits = sp.score_bits(win);
+            let gpu_bits = nats_to_bits(gpu_raw[i], res_len);
+            // Both saturate to +inf together, or agree to f32 quantization.
+            assert!(
+                (gpu_bits - cpu_bits).abs() < 0.01
+                    || (gpu_bits.is_infinite() && cpu_bits.is_infinite()),
+                "window {i} (len {res_len}): gpu {gpu_bits} vs cpu striped {cpu_bits}"
             );
         }
     }
