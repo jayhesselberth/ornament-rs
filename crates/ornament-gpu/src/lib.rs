@@ -490,6 +490,49 @@ mod tests {
         }
     }
 
+    /// Streamed pipeline across many chunks: a batch larger than the kernel's internal chunk size
+    /// must still score every tile correctly, exercising the double-buffer slot-reclaim path (a
+    /// stream is synced + copied out before its buffers are reused). Uses the f32 path (cheap exact
+    /// oracle); the streaming helper is shared with the uint8 path. Distinct spans are cached so the
+    /// CPU oracle stays fast. Skips when no `cuda` device is visible.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn gpu_streamed_multichunk() {
+        use std::collections::HashMap;
+
+        let (prof, strand) = fixture();
+        match device_count() {
+            Ok(0) | Err(_) => return,
+            Ok(_) => {}
+        }
+
+        // > 2 internal chunks so slots are reclaimed and reused mid-stream.
+        let n = 80_000usize;
+        let spans: Vec<(usize, usize)> = (0..n)
+            .map(|i| (1 + (i * 37) % (1200 - 40), 0))
+            .map(|(s, _)| (s, s + 39))
+            .collect();
+
+        let fp = FlatProfile::new(&prof);
+        let dstrand = DeviceStrand::upload(&strand).expect("upload strand");
+        let tiles = Tiles::from_spans(&spans);
+        let gpu = msv_nats_gpu(&fp, &dstrand, &tiles).expect("gpu msv");
+        assert_eq!(gpu.len(), n);
+
+        let mut cache: HashMap<(usize, usize), f32> = HashMap::new();
+        for (i, &(s, e)) in spans.iter().enumerate() {
+            let cpu = *cache.entry((s, e)).or_insert_with(|| {
+                let win = padded_span(&strand, s, e);
+                msv_nats_cpu(&prof, &[&win])[0]
+            });
+            assert!(
+                (gpu[i] - cpu).abs() < 0.01,
+                "tile {i} span ({s},{e}): gpu {} vs cpu {cpu}",
+                gpu[i]
+            );
+        }
+    }
+
     /// uint8 GPU parity: the reduced-precision device kernel over a resident strand must match the
     /// CPU striped uint8 filter (`ornament_hmm::MsvProfile::score_bits`) per span — same
     /// quantization, same recurrence, linear vs striped traversal of an associative max-plus DP.

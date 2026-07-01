@@ -17,7 +17,9 @@ See [`DESIGN.md`](DESIGN.md) for where the work is heaviest and the producer/con
 - [x] Feature-gated build (`nvcc` via `build.rs`), CPU oracle, GPU↔CPU parity test.
 - [x] uint8 reduced-precision MSV (throughput; matches the striped `ornament-hmm::MsvProfile`).
 - [x] Resident sequence + offset windows (`DeviceStrand` + `Tiles`; kills the 2× overlap copy).
-- [ ] CUDA streams + double-buffering to overlap H2D/kernel/D2H (full Level-1 producer/consumer).
+- [x] CUDA streams + double-buffering: chunked tile batch pipelined across 2 streams with pinned
+      staging so H2D / kernel / D2H overlap (internal to the resident wrappers).
+- [ ] Profile the overlap (nsys) and tune chunk size / stream count.
 - [ ] Viterbi + Forward kernels (rest of the cascade).
 - [ ] Wire into `ornament-scfg`'s scan pipeline as an optional backend.
 - [ ] Intra-DP (warp-per-window) for long models; multi-model batching.

@@ -36,8 +36,11 @@ So the boundary is: **GPU filters the flood; CPU handles the heavy CM tail on th
 - **Producer (host):** stream FASTA → digitize + reverse-complement once (done, #43) → tile into
   windows → build the batch.
 - **Consumer (device):** the filter funnel.
-- **Overlap:** CUDA streams + double-buffered pinned host buffers. While the GPU scores batch *i*,
-  the host builds/copies batch *i+1*. Target: keep the A30 saturated, never blocked on H2D/D2H.
+- **Overlap** *(done — inside the resident MSV wrappers)*: the tile batch is split into fixed-size
+  chunks pipelined across 2 CUDA streams with pinned host staging, so chunk *i+1*'s H2D, chunk
+  *i*'s kernel, and chunk *i-1*'s D2H overlap. The emission table is uploaded once; the strand is
+  already resident. *Still to do:* profile the actual overlap (nsys) and tune chunk size / stream
+  count; extend the same pipeline across the Viterbi/Forward stages.
 
 ### Level 2 — on-device funnel (stream compaction)
 - MSV kernel writes a survivor mask → compact → Viterbi kernel consumes only survivors → compact

@@ -18,6 +18,7 @@
 // unbounded; a production kernel would stage short models through shared memory.
 
 #include <cstdint>
+#include <cstring>
 #include <math.h>
 
 #ifndef NU
@@ -206,8 +207,108 @@ extern "C" int ornament_gpu_strand_free(void* d) {
     return check(cudaFree(d));
 }
 
+// ---- Streamed, double-buffered scoring over a resident strand -------------------------------
+// The tile batch is split into fixed-size chunks and pipelined across S=2 CUDA streams so H2D
+// (chunk i+1's offsets), kernel (chunk i), and D2H (chunk i-1's scores) overlap. Per-stream device
+// + pinned host buffers are the double buffer; pinned staging is what lets cudaMemcpyAsync actually
+// run concurrently with compute. The emission table (msc/rbv) is uploaded once by the caller and
+// shared read-only by every chunk. Degrades cleanly to one chunk / one stream for small batches.
+//
+// `launch` enqueues the DP kernel for one chunk on a given stream — it captures the (already
+// resident) emission table + strand + profile scalars, so this helper is agnostic to f32 vs uint8.
+
+static const int   STREAMS = 2;
+static const int   CHUNK   = 1 << 15;   // tiles per chunk (~32k); bounds per-stream scratch
+
+template <typename Launch>
+static int msv_streamed_run(
+    int          n,
+    int          M,
+    size_t       elem_size,   // scratch bytes per DP cell (sizeof(float) or sizeof(uint8_t))
+    const int*   starts,
+    const int*   lengths,
+    float*       out,
+    Launch       launch)
+{
+    int rc = 0;
+    int chunk = (n < CHUNK) ? n : CHUNK;
+
+    cudaStream_t stream[STREAMS]  = {0};
+    int*         d_off[STREAMS]   = {0};
+    int*         d_len[STREAMS]   = {0};
+    float*       d_out[STREAMS]   = {0};
+    void*        d_scr[STREAMS]   = {0};
+    int*         h_off[STREAMS]   = {0};
+    int*         h_len[STREAMS]   = {0};
+    float*       h_out[STREAMS]   = {0};
+    int          pend_off[STREAMS];
+    int          pend_n[STREAMS];
+    bool         pend[STREAMS]    = {false};
+
+    size_t scratch_bytes = (size_t)chunk * (M + 1) * elem_size;
+    for (int s = 0; s < STREAMS; ++s) {
+        CUDA_TRY(cudaStreamCreate(&stream[s]));
+        CUDA_TRY(cudaMalloc(&d_off[s], (size_t)chunk * sizeof(int)));
+        CUDA_TRY(cudaMalloc(&d_len[s], (size_t)chunk * sizeof(int)));
+        CUDA_TRY(cudaMalloc(&d_out[s], (size_t)chunk * sizeof(float)));
+        CUDA_TRY(cudaMalloc(&d_scr[s], scratch_bytes));
+        CUDA_TRY(cudaHostAlloc(&h_off[s], (size_t)chunk * sizeof(int),   cudaHostAllocDefault));
+        CUDA_TRY(cudaHostAlloc(&h_len[s], (size_t)chunk * sizeof(int),   cudaHostAllocDefault));
+        CUDA_TRY(cudaHostAlloc(&h_out[s], (size_t)chunk * sizeof(float), cudaHostAllocDefault));
+    }
+
+    for (int off = 0; off < n; off += chunk) {
+        int s = (off / chunk) % STREAMS;
+        // Reclaim this stream slot: its previous chunk's scores are ready — copy them out.
+        if (pend[s]) {
+            CUDA_TRY(cudaStreamSynchronize(stream[s]));
+            memcpy(out + pend_off[s], h_out[s], (size_t)pend_n[s] * sizeof(float));
+            pend[s] = false;
+        }
+        int cn = (n - off < chunk) ? (n - off) : chunk;
+        memcpy(h_off[s], starts + off,  (size_t)cn * sizeof(int));
+        memcpy(h_len[s], lengths + off, (size_t)cn * sizeof(int));
+        CUDA_TRY(cudaMemcpyAsync(d_off[s], h_off[s], (size_t)cn * sizeof(int),
+                                 cudaMemcpyHostToDevice, stream[s]));
+        CUDA_TRY(cudaMemcpyAsync(d_len[s], h_len[s], (size_t)cn * sizeof(int),
+                                 cudaMemcpyHostToDevice, stream[s]));
+        int threads = 128;
+        int blocks  = (cn + threads - 1) / threads;
+        launch(stream[s], blocks, threads, d_off[s], d_len[s], cn, d_scr[s], d_out[s]);
+        CUDA_TRY(cudaGetLastError());
+        CUDA_TRY(cudaMemcpyAsync(h_out[s], d_out[s], (size_t)cn * sizeof(float),
+                                 cudaMemcpyDeviceToHost, stream[s]));
+        pend_off[s] = off;
+        pend_n[s]   = cn;
+        pend[s]     = true;
+    }
+
+    // Drain the still-in-flight chunks.
+    for (int s = 0; s < STREAMS; ++s) {
+        if (pend[s]) {
+            CUDA_TRY(cudaStreamSynchronize(stream[s]));
+            memcpy(out + pend_off[s], h_out[s], (size_t)pend_n[s] * sizeof(float));
+            pend[s] = false;
+        }
+    }
+
+cleanup:
+    for (int s = 0; s < STREAMS; ++s) {
+        if (d_off[s]) cudaFree(d_off[s]);
+        if (d_len[s]) cudaFree(d_len[s]);
+        if (d_out[s]) cudaFree(d_out[s]);
+        if (d_scr[s]) cudaFree(d_scr[s]);
+        if (h_off[s]) cudaFreeHost(h_off[s]);
+        if (h_len[s]) cudaFreeHost(h_len[s]);
+        if (h_out[s]) cudaFreeHost(h_out[s]);
+        if (stream[s]) cudaStreamDestroy(stream[s]);
+    }
+    return rc;
+}
+
 // f32 MSV over a resident strand. `d_strand` is a device pointer (from strand_upload); `starts`
-// are 0-based offsets into it and `lengths` the window lengths. msc: Kp*(M+1) floats (host).
+// are 0-based offsets into it and `lengths` the window lengths. msc: Kp*(M+1) floats (host). The
+// table is uploaded once; tiles are scored via the streamed double-buffer pipeline.
 extern "C" int ornament_gpu_msv_batch_resident(
     const float*   msc,
     int            Kp,
@@ -218,42 +319,25 @@ extern "C" int ornament_gpu_msv_batch_resident(
     int            n,
     float*         out)
 {
-    int rc = 0;
-    float *d_msc = nullptr, *d_scratch = nullptr, *d_out = nullptr;
-    int   *d_off = nullptr, *d_len = nullptr;
-
     if (n <= 0) return 0;
+    int rc = 0;
+    float* d_msc = nullptr;
+    size_t msc_bytes = (size_t)Kp * (M + 1) * sizeof(float);
 
-    size_t msc_bytes     = (size_t)Kp * (M + 1) * sizeof(float);
-    size_t scratch_bytes = (size_t)n * (M + 1) * sizeof(float);
+    CUDA_TRY(cudaMalloc(&d_msc, msc_bytes));
+    CUDA_TRY(cudaMemcpy(d_msc, msc, msc_bytes, cudaMemcpyHostToDevice));
 
-    CUDA_TRY(cudaMalloc(&d_msc,     msc_bytes));
-    CUDA_TRY(cudaMalloc(&d_off,     (size_t)n * sizeof(int)));
-    CUDA_TRY(cudaMalloc(&d_len,     (size_t)n * sizeof(int)));
-    CUDA_TRY(cudaMalloc(&d_out,     (size_t)n * sizeof(float)));
-    CUDA_TRY(cudaMalloc(&d_scratch, scratch_bytes));
-
-    CUDA_TRY(cudaMemcpy(d_msc, msc, msc_bytes,                   cudaMemcpyHostToDevice));
-    CUDA_TRY(cudaMemcpy(d_off, starts,  (size_t)n * sizeof(int), cudaMemcpyHostToDevice));
-    CUDA_TRY(cudaMemcpy(d_len, lengths, (size_t)n * sizeof(int), cudaMemcpyHostToDevice));
-
-    {
-        int threads = 128;
-        int blocks  = (n + threads - 1) / threads;
-        msv_batch_kernel<<<blocks, threads>>>(
-            d_msc, Kp, M, (const uint8_t*)d_strand, d_off, d_len, n, d_scratch, d_out);
-        CUDA_TRY(cudaGetLastError());
-        CUDA_TRY(cudaDeviceSynchronize());
-    }
-
-    CUDA_TRY(cudaMemcpy(out, d_out, (size_t)n * sizeof(float), cudaMemcpyDeviceToHost));
+    rc = msv_streamed_run(
+        n, M, sizeof(float), starts, lengths, out,
+        [=](cudaStream_t st, int blocks, int threads,
+            const int* d_off, const int* d_len, int cn, void* d_scr, float* d_out) {
+            msv_batch_kernel<<<blocks, threads, 0, st>>>(
+                d_msc, Kp, M, (const uint8_t*)d_strand, d_off, d_len, cn,
+                (float*)d_scr, d_out);
+        });
 
 cleanup:
-    cudaFree(d_msc);
-    cudaFree(d_off);
-    cudaFree(d_len);
-    cudaFree(d_out);
-    cudaFree(d_scratch);
+    if (d_msc) cudaFree(d_msc);
     return rc;
 }
 
@@ -274,43 +358,24 @@ extern "C" int ornament_gpu_msv_u8_batch_resident(
     int            n,
     float*         out)
 {
-    int rc = 0;
-    uint8_t *d_rbv = nullptr, *d_scratch = nullptr;
-    int     *d_off = nullptr, *d_len = nullptr;
-    float   *d_out = nullptr;
-
     if (n <= 0) return 0;
+    int rc = 0;
+    uint8_t* d_rbv = nullptr;
+    size_t rbv_bytes = (size_t)Kp * (M + 1) * sizeof(uint8_t);
 
-    size_t rbv_bytes     = (size_t)Kp * (M + 1) * sizeof(uint8_t);
-    size_t scratch_bytes = (size_t)n * (M + 1) * sizeof(uint8_t);
+    CUDA_TRY(cudaMalloc(&d_rbv, rbv_bytes));
+    CUDA_TRY(cudaMemcpy(d_rbv, rbv, rbv_bytes, cudaMemcpyHostToDevice));
 
-    CUDA_TRY(cudaMalloc(&d_rbv,     rbv_bytes));
-    CUDA_TRY(cudaMalloc(&d_off,     (size_t)n * sizeof(int)));
-    CUDA_TRY(cudaMalloc(&d_len,     (size_t)n * sizeof(int)));
-    CUDA_TRY(cudaMalloc(&d_out,     (size_t)n * sizeof(float)));
-    CUDA_TRY(cudaMalloc(&d_scratch, scratch_bytes));
-
-    CUDA_TRY(cudaMemcpy(d_rbv, rbv, rbv_bytes,                   cudaMemcpyHostToDevice));
-    CUDA_TRY(cudaMemcpy(d_off, starts,  (size_t)n * sizeof(int), cudaMemcpyHostToDevice));
-    CUDA_TRY(cudaMemcpy(d_len, lengths, (size_t)n * sizeof(int), cudaMemcpyHostToDevice));
-
-    {
-        int threads = 128;
-        int blocks  = (n + threads - 1) / threads;
-        msv_u8_batch_kernel<<<blocks, threads>>>(
-            d_rbv, Kp, M, scale_b, base_b, bias_b, tbm_b, tec_b,
-            (const uint8_t*)d_strand, d_off, d_len, n, d_scratch, d_out);
-        CUDA_TRY(cudaGetLastError());
-        CUDA_TRY(cudaDeviceSynchronize());
-    }
-
-    CUDA_TRY(cudaMemcpy(out, d_out, (size_t)n * sizeof(float), cudaMemcpyDeviceToHost));
+    rc = msv_streamed_run(
+        n, M, sizeof(uint8_t), starts, lengths, out,
+        [=](cudaStream_t st, int blocks, int threads,
+            const int* d_off, const int* d_len, int cn, void* d_scr, float* d_out) {
+            msv_u8_batch_kernel<<<blocks, threads, 0, st>>>(
+                d_rbv, Kp, M, scale_b, base_b, bias_b, tbm_b, tec_b,
+                (const uint8_t*)d_strand, d_off, d_len, cn, (uint8_t*)d_scr, d_out);
+        });
 
 cleanup:
-    cudaFree(d_rbv);
-    cudaFree(d_off);
-    cudaFree(d_len);
-    cudaFree(d_out);
-    cudaFree(d_scratch);
+    if (d_rbv) cudaFree(d_rbv);
     return rc;
 }
