@@ -15,8 +15,7 @@ use ornament_alphabet::Dsq;
 use ornament_scfg::model::nd;
 use ornament_scfg::{
     align_glocal_banded, calc_qdb_bands, cm_pipeline_search, configure_local, configure_scores,
-    cyk_search_banded, parse_cm_file, parse_cm_records_file, Alignment, Cm, EmitMap,
-    PipelineParams, QdbBands, Strand,
+    parse_cm_file, parse_cm_records_file, Alignment, Cm, EmitMap, PipelineParams, QdbBands, Strand,
 };
 
 use super::stockholm::{AlignedRow, ModelMsa, ResCell};
@@ -83,11 +82,10 @@ pub fn scan_native<P: AsRef<Path>, Q: AsRef<Path>>(
     // consensus-column span (`mdl from`/`mdl to`) from its glocal traceback.
     let emap = EmitMap::build(&cm);
 
-    // Query-dependent bands: computed once for the model and shared read-only across every
-    // record scan. They give identical hits to the unbanded scan at a fraction of the cost. The
-    // local-mode `bands` drive the scan; the glocal `align_bands` (from `align_cm`) bound the
-    // per-hit model-span alignment — they must match the glocal model the parse runs over.
-    let bands = calc_qdb_bands(&cm, QdbBands::DEFAULT_BETA);
+    // Query-dependent bands for the per-hit model-span alignment. The p7-filtered
+    // `cm_pipeline_search` computes its own scan bands internally; `align_bands` (from the glocal
+    // `align_cm`) bound the alignment over that glocal model — they must match the model the parse
+    // runs over.
     let align_bands = calc_qdb_bands(&align_cm, QdbBands::DEFAULT_BETA);
 
     // Records are independent scans — search them in parallel. The per-record collect is
@@ -100,7 +98,9 @@ pub fn scan_native<P: AsRef<Path>, Q: AsRef<Path>>(
                 .digitize(&rec.seq)
                 .map_err(|e| anyhow!("failed to digitize sequence {}: {e}", rec.name))?;
 
-            let raw = cyk_search_banded(&cm, &dsq, w_max, REPORTING_BITS, &bands);
+            let (raw, _stats) =
+                cm_pipeline_search(&cm, &dsq, w_max, REPORTING_BITS, PipelineParams::default())
+                    .map_err(|e| anyhow!("pipeline failed for {}: {e}", cm.name))?;
             // Reverse-complement the record once if any minus-strand hit needs its model span.
             let rc = maybe_revcomp(&cm, &dsq, &raw, &rec.name)?;
 

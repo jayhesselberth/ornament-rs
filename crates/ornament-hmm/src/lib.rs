@@ -26,6 +26,7 @@ pub mod msv_simd;
 pub mod profile;
 pub mod pvalue;
 pub mod vit;
+pub mod vit_simd;
 
 pub use fwd::{forward_bits, forward_nats, viterbi_nats};
 pub use fwd_simd::forward_odds_nats;
@@ -38,6 +39,8 @@ pub use msv_simd::MsvProfile;
 pub use profile::P7Profile;
 pub use pvalue::{forward_pvalue, msv_pvalue, viterbi_pvalue};
 pub use vit::viterbi_bits;
+#[cfg(target_arch = "x86_64")]
+pub use vit_simd::{viterbi_striped_nats, StripedVitProfile};
 
 use thiserror::Error;
 
