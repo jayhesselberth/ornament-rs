@@ -37,11 +37,19 @@ use crate::qdb::{calc_qdb_bands, QdbBands};
 use crate::search::{scan_subseq, Hit, Strand};
 use crate::InfernalError;
 
-/// Tunable thresholds for the windowing pipeline.
+/// Tunable thresholds for the windowing pipeline. Defaults are HMMER's full p7 filter cascade
+/// (`cm_pipeline.c`): MSV `F1` → Viterbi `F2` → Forward `F3`, so the native pipeline does the
+/// same filtering work as `cmsearch` out of the box.
 #[derive(Debug, Clone, Copy)]
 pub struct PipelineParams {
-    /// Forward-filter P-value threshold (HMMER's `F3`). A window survives to the CM stage
-    /// iff its Forward P-value `≤ f3`. Default `1e-5`.
+    /// MSV-filter P-value threshold (HMMER's `F1`). A tile survives to the Viterbi stage iff
+    /// its MSV P-value `≤ f1`. Default `0.02` (HMMER's default).
+    pub f1: f64,
+    /// Viterbi-filter P-value threshold (HMMER's `F2`). An MSV survivor survives to the Forward
+    /// stage iff its Viterbi P-value `≤ f2`. Default `1e-3` (HMMER's default).
+    pub f2: f64,
+    /// Forward-filter P-value threshold (HMMER's `F3`). A Viterbi survivor survives to the CM
+    /// stage iff its Forward P-value `≤ f3`. Default `1e-5`.
     pub f3: f64,
     /// Final CM stage: Inside (sum-over-parses) when `true`, CYK (best-parse) when `false`.
     pub do_inside: bool,
@@ -50,6 +58,8 @@ pub struct PipelineParams {
 impl Default for PipelineParams {
     fn default() -> Self {
         PipelineParams {
+            f1: MSV_F1,
+            f2: VIT_F2,
             f3: 1e-5,
             do_inside: false,
         }
@@ -115,6 +125,7 @@ pub fn cm_pipeline_search(
     let nj = prof.nj;
     let filt = fwdfilter::build(&prof);
     let msv = msvfilter::build(&prof); // cheap uint8 MSV prefilter (built once)
+    let vit = vitfilter::build(&prof); // striped Viterbi filter (middle cascade stage, built once)
                                        // Query-dependent bands for the CM stage, computed once and shared across every survivor
                                        // window (and both strands). A safe `beta` keeps every real hit's optimal parse in-band, so
                                        // the banded scan reports identical hits to the unbanded one — just faster.
@@ -134,7 +145,7 @@ pub fn cm_pipeline_search(
     // strands run concurrently via `rayon::join`. Output is order-independent: hits are sorted
     // below, so the result is identical regardless of thread count.
     let plus = || {
-        let (surv, nw) = strand_survivors(&msv, &filt, nj, &hmm, dsq, w, params.f3);
+        let (surv, nw) = strand_survivors(&msv, &vit, &filt, nj, &hmm, dsq, w, &params);
         let hits: Vec<Hit> = surv
             .par_iter()
             .flat_map_iter(|&(s, e)| {
@@ -153,7 +164,7 @@ pub fn cm_pipeline_search(
         (surv, nw, hits)
     };
     let minus = || {
-        let (surv, nw) = strand_survivors(&msv, &filt, nj, &hmm, &rc, w, params.f3);
+        let (surv, nw) = strand_survivors(&msv, &vit, &filt, nj, &hmm, &rc, w, &params);
         let hits: Vec<Hit> = surv
             .par_iter()
             .flat_map_iter(|&(s, e)| {
@@ -210,12 +221,6 @@ pub fn cm_pipeline_inside(
 /// HMMER's default p7 filter cascade thresholds (P-value), for the prune-rate measurement.
 const MSV_F1: f64 = 0.02; // MSV pass threshold (`--F1`)
 const VIT_F2: f64 = 1e-3; // Viterbi pass threshold (`--F2`)
-
-/// MSV threshold for the live cascade prefilter. Looser than HMMER's `0.02` to give the
-/// reduced-precision uint8 MSV a safety margin against its quantization floor — at `0.05` it
-/// keeps every tile the Forward filter would (verified: 100/100 Forward survivors on E. coli)
-/// while still pruning ~96% of tiles. Still only a prefilter; Forward + the CM make the calls.
-const MSV_CASCADE_F1: f64 = 0.05;
 
 /// Per-stage tile pass counts for the p7 filter cascade (both strands summed). A measurement
 /// used to size the value of an MSV → Viterbi → Forward cascade: at HMMER's default
@@ -324,19 +329,22 @@ fn parse_filter_hmm(cm: &Cm) -> Result<P7Hmm, InfernalError> {
     parse_p7_hmm(text).map_err(|e| InfernalError::Parse(format!("filter HMM: {e}")))
 }
 
-/// Forward-filter one strand and return the merged, W-padded survivor windows (1-based
-/// inclusive `(start, end)` in this strand's coordinates) plus the number of tiles scored.
+/// Filter one strand through the full MSV → Viterbi → Forward cascade and return the merged,
+/// W-padded survivor windows (1-based inclusive `(start, end)` in this strand's coordinates)
+/// plus the number of tiles scored.
 ///
 /// Tiling is length `2W`, step `W` (overlap `W`) so every length-`≤W` hit is contained in
 /// at least one tile. Survivors are padded by `W` and merged into maximal disjoint regions.
+#[allow(clippy::too_many_arguments)]
 fn strand_survivors(
     msv: &msvfilter::Profile,
+    vit: &vitfilter::Profile,
     filt: &fwdfilter::Profile,
     nj: f32,
     hmm: &P7Hmm,
     dsq: &[Dsq],
     w: usize,
-    f3: f64,
+    params: &PipelineParams,
 ) -> (Vec<(usize, usize)>, usize) {
     let l = dsq.len().saturating_sub(2);
     let tile = (2 * w).max(1);
@@ -354,16 +362,20 @@ fn strand_survivors(
         start += step;
     }
 
-    // Cascade each tile cheapest-first: the uint8 MSV prunes the large majority, and only its
-    // survivors pay for the (costlier) striped Forward. Each task clones the length-independent
-    // profiles and resets only their length model, so tiles run in parallel without contention;
-    // the order-preserving collect keeps the subsequent merge (assumes non-decreasing `start`)
-    // deterministic.
+    // Cascade each tile cheapest-first (HMMER's `cm_pipeline.c`): the uint8 MSV prunes the large
+    // majority, its survivors pay for the striped Viterbi, and only *those* survivors pay for the
+    // (costliest) striped Forward. Each task clones the length-independent profiles and resets
+    // only their length model, so tiles run in parallel without contention; the order-preserving
+    // collect keeps the subsequent merge (assumes non-decreasing `start`) deterministic.
+    let (f1, f2, f3) = (params.f1, params.f2, params.f3);
     let kept: Vec<Option<(usize, usize)>> = tiles
         .par_iter()
         .map(|&(s, e)| {
-            if !msvfilter::passes(msv, hmm, dsq, s, e, MSV_CASCADE_F1) {
+            if !msvfilter::passes(msv, hmm, dsq, s, e, f1) {
                 return None; // MSV prefilter pruned this tile
+            }
+            if viterbi_pvalue(hmm, vitfilter::window_bits(vit, nj, dsq, s, e)) > f2 {
+                return None; // Viterbi filter pruned this tile
             }
             if forward_pvalue(hmm, fwdfilter::window_bits(filt, nj, dsq, s, e)) <= f3 {
                 let ps = s.saturating_sub(w).max(1);
@@ -437,6 +449,64 @@ mod fwdfilter {
         let mut p = base.clone();
         p.reconfig_length(len);
         (forward_nats(&p, &sub) - null_one(len)) / std::f32::consts::LN_2
+    }
+}
+
+/// The p7 Viterbi filter (middle cascade stage), abstracted over its implementation: the
+/// striped-SIMD max-plus kernel on x86_64, the scalar log-space DP elsewhere. `build` makes the
+/// length-independent profile once; `window_bits` scores `dsq[start..=end]` (cloning + resetting
+/// only the length model so tiles run in parallel) and returns the Viterbi **bit** score,
+/// matching [`ornament_hmm::viterbi_bits`].
+#[cfg(target_arch = "x86_64")]
+mod vitfilter {
+    use super::{subseq, Dsq, P7Profile};
+    use ornament_hmm::profile::null_one;
+
+    pub(super) type Profile = ornament_hmm::StripedVitProfile;
+
+    pub(super) fn build(prof: &P7Profile) -> Profile {
+        ornament_hmm::StripedVitProfile::new(prof)
+    }
+
+    pub(super) fn window_bits(
+        base: &Profile,
+        nj: f32,
+        dsq: &[Dsq],
+        start: usize,
+        end: usize,
+    ) -> f32 {
+        let len = end - start + 1;
+        let sub = subseq(dsq, start, end);
+        let mut sp = base.clone();
+        sp.set_length(len, nj);
+        (sp.score_nats(&sub) - null_one(len)) / std::f32::consts::LN_2
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+mod vitfilter {
+    use super::{subseq, Dsq, P7Profile};
+    use ornament_hmm::profile::null_one;
+    use ornament_hmm::viterbi_nats;
+
+    pub(super) type Profile = P7Profile;
+
+    pub(super) fn build(prof: &P7Profile) -> Profile {
+        prof.clone()
+    }
+
+    pub(super) fn window_bits(
+        base: &Profile,
+        _nj: f32,
+        dsq: &[Dsq],
+        start: usize,
+        end: usize,
+    ) -> f32 {
+        let len = end - start + 1;
+        let sub = subseq(dsq, start, end);
+        let mut p = base.clone();
+        p.reconfig_length(len);
+        (viterbi_nats(&p, &sub) - null_one(len)) / std::f32::consts::LN_2
     }
 }
 

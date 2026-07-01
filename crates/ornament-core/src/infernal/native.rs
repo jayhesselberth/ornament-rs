@@ -15,8 +15,7 @@ use ornament_alphabet::Dsq;
 use ornament_scfg::model::nd;
 use ornament_scfg::{
     align_glocal_banded, calc_qdb_bands, cm_pipeline_search, configure_local, configure_scores,
-    cyk_search_banded, parse_cm_file, parse_cm_records_file, Alignment, Cm, EmitMap,
-    PipelineParams, QdbBands, Strand,
+    parse_cm_file, parse_cm_records_file, Alignment, Cm, EmitMap, PipelineParams, QdbBands, Strand,
 };
 
 use super::stockholm::{AlignedRow, ModelMsa, ResCell};
@@ -83,11 +82,10 @@ pub fn scan_native<P: AsRef<Path>, Q: AsRef<Path>>(
     // consensus-column span (`mdl from`/`mdl to`) from its glocal traceback.
     let emap = EmitMap::build(&cm);
 
-    // Query-dependent bands: computed once for the model and shared read-only across every
-    // record scan. They give identical hits to the unbanded scan at a fraction of the cost. The
-    // local-mode `bands` drive the scan; the glocal `align_bands` (from `align_cm`) bound the
-    // per-hit model-span alignment — they must match the glocal model the parse runs over.
-    let bands = calc_qdb_bands(&cm, QdbBands::DEFAULT_BETA);
+    // Query-dependent bands for the per-hit model-span alignment. The p7-filtered
+    // `cm_pipeline_search` computes its own scan bands internally; `align_bands` (from the glocal
+    // `align_cm`) bound the alignment over that glocal model — they must match the model the parse
+    // runs over.
     let align_bands = calc_qdb_bands(&align_cm, QdbBands::DEFAULT_BETA);
 
     // Records are independent scans — search them in parallel. The per-record collect is
@@ -100,47 +98,56 @@ pub fn scan_native<P: AsRef<Path>, Q: AsRef<Path>>(
                 .digitize(&rec.seq)
                 .map_err(|e| anyhow!("failed to digitize sequence {}: {e}", rec.name))?;
 
-            let raw = cyk_search_banded(&cm, &dsq, w_max, REPORTING_BITS, &bands);
+            let (raw, _stats) =
+                cm_pipeline_search(&cm, &dsq, w_max, REPORTING_BITS, PipelineParams::default())
+                    .map_err(|e| anyhow!("pipeline failed for {}: {e}", cm.name))?;
             // Reverse-complement the record once if any minus-strand hit needs its model span.
             let rc = maybe_revcomp(&cm, &dsq, &raw, &rec.name)?;
 
-            let mut rec_hits = Vec::new();
-            for h in raw {
-                // Filter on E-value when the model is calibrated (mirrors `cmsearch -E`).
-                if let Some(ev) = h.evalue {
-                    if ev > e_value {
-                        continue;
+            // Each hit's model-span recovery runs an independent banded glocal traceback; on a
+            // long genome record with many hits this loop is the serial tail (the pipeline itself
+            // is already parallel). Run the per-hit alignments in parallel — nested under the
+            // per-record `par_iter`, rayon work-steals so a single big record still saturates
+            // cores. `collect` preserves `raw`'s order, so output stays thread-count-independent.
+            let rec_hits: Vec<CMHit> = raw
+                .par_iter()
+                .filter_map(|h| {
+                    // Filter on E-value when the model is calibrated (mirrors `cmsearch -E`).
+                    if let Some(ev) = h.evalue {
+                        if ev > e_value {
+                            return None;
+                        }
                     }
-                }
-                let strand = match h.strand {
-                    Strand::Plus => '+',
-                    Strand::Minus => '-',
-                };
-                let (mdl_from, mdl_to) = hit_model_span(
-                    &align_cm,
-                    &dsq,
-                    rc.as_deref(),
-                    &emap,
-                    &align_bands,
-                    h.i,
-                    h.j,
-                    h.strand,
-                );
-                rec_hits.push(CMHit {
-                    target_name: rec.name.clone(),
-                    target_start: h.i,
-                    target_end: h.j,
-                    strand,
-                    query_name: query_name.clone(),
-                    score: h.score as f64,
-                    e_value: h.evalue.unwrap_or(f64::NAN),
-                    gc_content: gc_fraction(&rec.seq, h.i, h.j),
-                    mdl_from,
-                    mdl_to,
-                    query_accession: query_acc.clone(),
-                    description: (!rec.desc.is_empty()).then(|| rec.desc.clone()),
-                });
-            }
+                    let strand = match h.strand {
+                        Strand::Plus => '+',
+                        Strand::Minus => '-',
+                    };
+                    let (mdl_from, mdl_to) = hit_model_span(
+                        &align_cm,
+                        &dsq,
+                        rc.as_deref(),
+                        &emap,
+                        &align_bands,
+                        h.i,
+                        h.j,
+                        h.strand,
+                    );
+                    Some(CMHit {
+                        target_name: rec.name.clone(),
+                        target_start: h.i,
+                        target_end: h.j,
+                        strand,
+                        query_name: query_name.clone(),
+                        score: h.score as f64,
+                        e_value: h.evalue.unwrap_or(f64::NAN),
+                        gc_content: gc_fraction(&rec.seq, h.i, h.j),
+                        mdl_from,
+                        mdl_to,
+                        query_accession: query_acc.clone(),
+                        description: (!rec.desc.is_empty()).then(|| rec.desc.clone()),
+                    })
+                })
+                .collect();
             Ok(rec_hits)
         })
         .collect::<Result<Vec<_>>>()?;
