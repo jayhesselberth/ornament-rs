@@ -240,8 +240,8 @@ where
             let ok = estimated_scan_bytes(cm, cm.w as usize) <= MAX_SCAN_BYTES;
             if !ok {
                 n_skipped += 1;
-                eprintln!(
-                    "warning: skipping model {} (W={}, ~{:.1} GiB DP > budget); too large for the scanning matrix",
+                tracing::warn!(
+                    "skipping model {} (W={}, ~{:.1} GiB DP > budget); too large for the scanning matrix",
                     cm.name,
                     cm.w,
                     estimated_scan_bytes(cm, cm.w as usize) as f64 / (1u64 << 30) as f64,
@@ -251,10 +251,7 @@ where
         })
         .collect();
     if n_skipped > 0 {
-        eprintln!(
-            "warning: {n_skipped} of {} models skipped (too large)",
-            models.len()
-        );
+        tracing::warn!("{n_skipped} of {} models skipped (too large)", models.len());
     }
 
     // Per-model setup: a glocal-configured copy + emit map + QDB bands for the per-hit model-span
@@ -380,8 +377,8 @@ pub fn scan_native_aligned<P: AsRef<Path>, Q: AsRef<Path>>(
         .map(|cm| {
             let ok = estimated_scan_bytes(cm, cm.w as usize) <= MAX_SCAN_BYTES;
             if !ok {
-                eprintln!(
-                    "warning: skipping model {} (W={}, ~{:.1} GiB DP > budget); too large for the scanning matrix",
+                tracing::warn!(
+                    "skipping model {} (W={}, ~{:.1} GiB DP > budget); too large for the scanning matrix",
                     cm.name,
                     cm.w,
                     estimated_scan_bytes(cm, cm.w as usize) as f64 / (1u64 << 30) as f64,
@@ -502,6 +499,58 @@ pub fn scan_native_aligned<P: AsRef<Path>, Q: AsRef<Path>>(
         });
     }
     Ok(out)
+}
+
+/// Align every sequence in `fasta` to the single model in `cm_path` over its full length — the
+/// native `cmalign` analog. Unlike the scan paths this performs *no search*: each input record is
+/// assumed to be a member of the model and aligned ROOT->END on the plus strand (glocal,
+/// QDB-banded, like the per-hit alignment but spanning the whole sequence `1..=L`). Returns one
+/// [`ModelMsa`] — a single Stockholm block with one row per input sequence, in input order, plus
+/// the model's `#=GC RF` / `#=GC SS_cons` annotation.
+///
+/// Takes the first model only (`cmalign` is single-model); extra models in a collection `.cm`
+/// are ignored.
+pub fn align_sequences<P: AsRef<Path>, Q: AsRef<Path>>(cm_path: P, fasta: Q) -> Result<ModelMsa> {
+    let cm_path = cm_path.as_ref();
+    let fasta = fasta.as_ref();
+
+    let mut cm = parse_cm_file(cm_path)
+        .map_err(|e| anyhow!("failed to parse CM {}: {e}", cm_path.display()))?;
+    // Glocal scores only (no local config): a full-length member aligns ROOT->END, the same
+    // configuration `scan_native` uses for its per-hit alignment copy.
+    configure_scores(&mut cm);
+    let bands = calc_qdb_bands(&cm, QdbBands::DEFAULT_BETA);
+    let emap = EmitMap::build(&cm);
+    let (rf, ss_cons) = consensus_annotation(&cm, &emap);
+
+    let records = ornament_alphabet::read_fasta(fasta)
+        .map_err(|e| anyhow!("failed to read FASTA {}: {e}", fasta.display()))?;
+    if records.is_empty() {
+        return Err(anyhow!("no sequences to align in {}", fasta.display()));
+    }
+
+    // Each sequence aligns independently; saturate the pool over the input set.
+    let rows = records
+        .par_iter()
+        .map(|rec| -> Result<AlignedRow> {
+            let dsq = cm
+                .abc
+                .digitize(&rec.seq)
+                .map_err(|e| anyhow!("failed to digitize sequence {}: {e}", rec.name))?;
+            let l = dsq.len() - 2; // strip the index-0 / index-L+1 sentinels
+            let aln = align_glocal_banded(&cm, &dsq, 1, l, &emap, &bands);
+            let label = format!("{}/{}-{}", rec.name, 1, l);
+            Ok(aligned_row(&cm, &aln, &dsq, label))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(ModelMsa {
+        model_name: cm.name.clone(),
+        clen: cm.clen,
+        rf,
+        ss_cons,
+        rows,
+    })
 }
 
 /// Reverse-complement the (sentinel-padded) digital sequence once, but only if `raw` contains a

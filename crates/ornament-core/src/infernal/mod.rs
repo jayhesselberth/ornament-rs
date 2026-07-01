@@ -3,14 +3,17 @@
 //! Wraps the native `ornament-scfg` search engine. The `cmsearch` subprocess in
 //! `runner` remains the differential-testing oracle and runtime fallback.
 
+pub mod cmstat;
 pub mod native;
 pub mod parser;
 pub mod report;
 pub mod runner;
 pub mod stockholm;
 
+pub use cmstat::{cmstat, CmStat};
 pub use native::{
-    scan_native, scan_native_aligned, scan_native_multi, scan_native_multi_streaming,
+    align_sequences, scan_native, scan_native_aligned, scan_native_multi,
+    scan_native_multi_streaming,
 };
 pub use parser::{CMAlignment, CMHit};
 pub use report::{write_tsv, write_tsv_rows, TSV_HEADER};

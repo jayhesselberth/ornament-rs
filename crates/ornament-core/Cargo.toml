@@ -19,5 +19,8 @@ rayon = { workspace = true }
 lazy_static = { workspace = true }
 regex = { workspace = true }
 bio = { workspace = true }
+# Log facade only — status warnings are emitted as tracing events; the binary
+# (ornament-cli) installs the subscriber that renders them.
+tracing = { workspace = true }
 
 [dev-dependencies]
