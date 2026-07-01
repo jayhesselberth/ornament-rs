@@ -4,6 +4,7 @@ members = [
     "crates/ornament-alphabet",
     "crates/ornament-stats",
     "crates/ornament-hmm",
+    "crates/ornament-gpu",
     "crates/ornament-scfg",
     "crates/ornament-core",
     "crates/ornament-cli",
