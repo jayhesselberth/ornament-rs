@@ -18,6 +18,7 @@
 // unbounded; a production kernel would stage short models through shared memory.
 
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <math.h>
@@ -352,6 +353,39 @@ static int check(cudaError_t e) { return (int)e; }
 
 extern "C" int ornament_gpu_device_count(int* count) {
     return check(cudaGetDeviceCount(count));
+}
+
+// Counter-free kernel diagnostics: registers/thread, static + dynamic shared bytes, and the
+// theoretical occupancy (active blocks/SM × blockSize ÷ maxThreadsPerSM) from the CUDA occupancy
+// API. This is a substitute for Nsight Compute's Occupancy section on clusters where GPU
+// performance counters are locked (ERR_NVGPUCTRPERM). `Kp`/`M` size the u8 kernel's dynamic shared
+// as `(Kp+blockDim)*(M+1)`. Prints one line per kernel to stdout.
+static void ornament_gpu_kernel_line(const char* name, const void* fn, int block, size_t dyn_smem) {
+    cudaFuncAttributes a;
+    if (cudaFuncGetAttributes(&a, fn) != cudaSuccess) {
+        printf("  %-26s <attr query failed>\n", name);
+        cudaGetLastError();
+        return;
+    }
+    int max_blocks = 0;
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&max_blocks, fn, block, dyn_smem);
+    int dev = 0;
+    cudaGetDevice(&dev);
+    int tpm = 0;
+    cudaDeviceGetAttribute(&tpm, cudaDevAttrMaxThreadsPerMultiProcessor, dev);
+    double occ = tpm > 0 ? (double)(max_blocks * block) / (double)tpm : 0.0;
+    printf("  %-26s regs/thr=%-4d static_smem=%-6zu dyn_smem=%-7zu block=%-4d active_blk/SM=%-2d theo_occ=%.0f%%\n",
+           name, a.numRegs, (size_t)a.sharedSizeBytes, dyn_smem, block, max_blocks, occ * 100.0);
+    cudaGetLastError();
+}
+
+extern "C" void ornament_gpu_print_kernel_info(int Kp, int M) {
+    size_t u8_smem = (size_t)(Kp + 128) * (M + 1);   // (Kp+block)*(M+1), block=128
+    printf("kernel diagnostics (Kp=%d, M=%d):\n", Kp, M);
+    ornament_gpu_kernel_line("msv_u8_batch_kernel_smem", (const void*)msv_u8_batch_kernel_smem, 128, u8_smem);
+    ornament_gpu_kernel_line("msv_u8_batch_kernel",      (const void*)msv_u8_batch_kernel,      128, 0);
+    ornament_gpu_kernel_line("msv_batch_kernel(f32)",    (const void*)msv_batch_kernel,         128, 0);
+    ornament_gpu_kernel_line("viterbi_batch_kernel",     (const void*)viterbi_batch_kernel,     128, 0);
 }
 
 // ---- Resident strand ------------------------------------------------------------------------

@@ -258,6 +258,7 @@ pub fn msv_nats_cpu(prof: &P7Profile, windows: &[&[Dsq]]) -> Vec<f32> {
 #[cfg(feature = "cuda")]
 extern "C" {
     fn ornament_gpu_device_count(count: *mut i32) -> i32;
+    fn ornament_gpu_print_kernel_info(kp: i32, m: i32);
     fn ornament_gpu_strand_upload(
         dsq: *const u8,
         len: i32,
@@ -390,6 +391,14 @@ impl Drop for DeviceStrand {
             unsafe { ornament_gpu_strand_free(self.ptr) };
         }
     }
+}
+
+/// Print counter-free kernel diagnostics (registers/thread, shared usage, theoretical occupancy)
+/// for a representative model size `(kp, m)` — a substitute for Nsight Compute's Occupancy section
+/// where GPU performance counters are locked down. No-op without the `cuda` feature.
+#[cfg(feature = "cuda")]
+pub fn print_kernel_info(kp: usize, m: usize) {
+    unsafe { ornament_gpu_print_kernel_info(kp as i32, m as i32) };
 }
 
 /// Number of visible CUDA devices, or `Err` if the runtime call fails / the crate lacks `cuda`.

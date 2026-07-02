@@ -136,6 +136,42 @@ sweep (A30, reusable context):
   instead of one thread owning the whole row. Only ~10 Rfam models need it; the rest are already
   fast. (Those rRNA-scale models could also simply stay on the CPU filter.)
 
+### Profiling (A30, `examples/bench_msv.rs` with `BENCH_KERNEL`; nsys works, ncu blocked)
+
+Per-kernel throughput at 64 Mnt / 640k tiles, tRNA-scale model (M≈71):
+
+| kernel | G DP-cells/s | vs 1 CPU core | notes |
+|--------|--------------|---------------|-------|
+| MSV uint8 (shared-mem) | **436** | 61.8× | the workhorse; ≈2.6× the 24-core CPU |
+| MSV f32 (global) | 14 | 1.9× | global-mem; no shared variant (it's the exact oracle, low volume) |
+| Viterbi f32 (global) | 0.77 | **0.1×** | global-mem, memory-latency bound — *slower than one CPU core* |
+
+- **nsys** (u8, 2 streams): the batch is **kernel-bound** — 39.6 ms in kernels vs 3.2 ms in copies,
+  and the largest single copy is the *one-time* 16 MB strand upload (2.6 ms, amortized across all
+  tiles/models). So streaming correctly hides only the small per-chunk offset copies (matches the
+  1.19× A/B), and the strand-resident design already removed the dominant transfer.
+- **Viterbi is ~78–570× slower per cell than MSV** and below one CPU core. This is the predicted
+  global-memory penalty (6 DP rows hit with a serial dependency at ~400-cycle latency). **Concrete
+  consequence: do NOT wire the current global Viterbi into the pipeline — it would regress vs the
+  CPU striped Viterbi.** It needs the shared-memory / warp-per-window rewrite first.
+- **ncu (SpeedOfLight/Occupancy) is blocked by `ERR_NVGPUCTRPERM`** on this cluster (perf counters
+  are admin-locked; fix = `NVreg_RestrictProfilingToAdminUsers=0` on the GPU nodes). Until then,
+  `print_kernel_info` (`BENCH_INFO=1`) reports registers/thread + theoretical occupancy via the
+  counter-free CUDA occupancy API as a substitute (tRNA M=71, block=128):
+
+  | kernel | regs/thr | dyn smem | active blk/SM | theoretical occ |
+  |--------|----------|----------|---------------|-----------------|
+  | msv_u8 shared-mem | 32 | 10.5 KB | 14 | **88%** |
+  | msv_u8 global | 36 | 0 | 12 | 75% |
+  | msv f32 global | 56 | 0 | 9 | 56% |
+  | viterbi f32 global | 63 | 0 | 8 | 50% |
+
+  The MSV shared kernel is well-occupied (88%) and fast (436 G cells/s) — near its roofline.
+  Crucially, **Viterbi has a healthy 50% theoretical occupancy yet runs at 0.1× a CPU core**, so it
+  is *not* occupancy/register-limited — it's memory-latency-bound on the global DP rows. That
+  pinpoints the fix as **moving the DP rows to shared memory** (cut ~400-cycle global to ~30-cycle
+  shared), not adding threads — the same lever that gave MSV its 22× jump.
+
 ### Level 2 — on-device funnel (stream compaction)
 - MSV kernel writes a survivor mask → compact → Viterbi kernel consumes only survivors → compact
   → Forward. Compaction between kernels keeps later, costlier kernels dense (no warps full of

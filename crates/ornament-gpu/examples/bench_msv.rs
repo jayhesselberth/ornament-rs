@@ -24,7 +24,8 @@ fn env_usize(name: &str, def: usize) -> usize {
 fn main() {
     use ornament_alphabet::Alphabet;
     use ornament_gpu::{
-        msv_u8_nats_gpu, nats_to_bits, ByteMsvProfile, DeviceStrand, GpuError, Tiles,
+        nats_to_bits, ByteMsvProfile, DeviceStrand, FlatProfile, GpuContext, GpuError, Tiles,
+        VitFlatProfile,
     };
     use ornament_hmm::profile::{bg_freqs, P7Profile};
     use std::time::Instant;
@@ -32,6 +33,8 @@ fn main() {
     let strand_len = env_usize("BENCH_STRAND", 64_000_000);
     let w = env_usize("BENCH_W", 100);
     let reps = env_usize("BENCH_REPS", 8);
+    // Which kernel to bench: "u8" (default, reduced-precision MSV), "f32" (MSV), or "vit" (Viterbi).
+    let kernel = std::env::var("BENCH_KERNEL").unwrap_or_else(|_| "u8".into());
     let streams = std::env::var("ORNAMENT_GPU_STREAMS").unwrap_or_else(|_| "2 (default)".into());
     let chunk = std::env::var("ORNAMENT_GPU_CHUNK").unwrap_or_else(|_| "32768 (default)".into());
 
@@ -46,6 +49,8 @@ fn main() {
     let bg = bg_freqs(hmm.k);
     let prof = P7Profile::config_local(&hmm, &abc, &bg, 100);
     let bp = ByteMsvProfile::new(&prof);
+    let fp = FlatProfile::new(&prof);
+    let vp = VitFlatProfile::new(&prof);
 
     // Random strand.
     let mut s: u64 = 0x9E3779B97F4A7C15;
@@ -85,18 +90,34 @@ fn main() {
     println!(
         "strand={strand_len} residues  W={w}  tiles={n}  streams={streams}  chunk={chunk}  reps={reps}"
     );
+    // Counter-free occupancy/register report (ncu Occupancy substitute where perf counters are
+    // locked). BENCH_INFO=1 prints it for this model's (Kp, M).
+    if std::env::var("BENCH_INFO").as_deref() == Ok("1") {
+        ornament_gpu::print_kernel_info(prof.kp, prof.m);
+    }
 
     let dstrand = DeviceStrand::upload(&strand).expect("upload strand");
+    // Reusable context (created once) — realistic many-batch perf and a stable target for nsys/ncu.
+    let ctx = GpuContext::new().expect("gpu context");
 
-    // Warm up (kernel JIT / allocations) and sanity-check the result is finite-or-inf.
-    let warm = msv_u8_nats_gpu(&bp, &dstrand, &tiles).expect("gpu msv");
+    // One scoring call for the selected kernel.
+    let score = |ctx: &GpuContext| -> Result<Vec<f32>, GpuError> {
+        match kernel.as_str() {
+            "f32" => ctx.msv_nats(&fp, &dstrand, &tiles),
+            "vit" => ctx.vit_nats(&vp, &dstrand, &tiles),
+            _ => ctx.msv_u8_nats(&bp, &dstrand, &tiles),
+        }
+    };
+
+    // Warm up (kernel JIT / first-touch allocations) and sanity-check the result is finite-or-inf.
+    let warm = score(&ctx).expect("gpu warmup");
     let _ = nats_to_bits(warm[0], spans[0].1 - spans[0].0 + 1);
 
     let mut best = f64::INFINITY;
     let mut sum = 0.0f64;
     for _ in 0..reps {
         let t0 = Instant::now();
-        let out = msv_u8_nats_gpu(&bp, &dstrand, &tiles).unwrap_or_else(|e: GpuError| {
+        let out = score(&ctx).unwrap_or_else(|e: GpuError| {
             eprintln!("gpu error: {e}");
             std::process::exit(1);
         });
@@ -109,7 +130,7 @@ fn main() {
     let tiles_per_s = n as f64 / best;
     let cells = n as f64 * (2 * w) as f64 * prof.m as f64; // DP cells scored (tiles × L × M)
 
-    println!("GPU u8 MSV:");
+    println!("GPU kernel={kernel}:");
     println!("  best {:.4}s   avg {:.4}s", best, avg);
     println!(
         "  {:.2} M tiles/s   {:.2} G DP-cells/s",
