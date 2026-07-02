@@ -18,6 +18,7 @@
 // unbounded; a production kernel would stage short models through shared memory.
 
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <math.h>
 
@@ -217,8 +218,22 @@ extern "C" int ornament_gpu_strand_free(void* d) {
 // `launch` enqueues the DP kernel for one chunk on a given stream — it captures the (already
 // resident) emission table + strand + profile scalars, so this helper is agnostic to f32 vs uint8.
 
-static const int   STREAMS = 2;
-static const int   CHUNK   = 1 << 15;   // tiles per chunk (~32k); bounds per-stream scratch
+#define MAX_STREAMS      8
+static const int DEFAULT_STREAMS = 2;
+static const int DEFAULT_CHUNK   = 1 << 16;   // tiles/chunk (~64k); measured sweet spot on A30
+                                              // (8k adds launch overhead; >=64k saturates)
+
+// Read an int env var, clamped to [lo,hi]; `def` if unset/unparseable. Lets a benchmark A/B the
+// stream count (ORNAMENT_GPU_STREAMS) and chunk size (ORNAMENT_GPU_CHUNK) without recompiling —
+// STREAMS=1 is the no-overlap baseline, STREAMS>=2 is the double-buffered pipeline.
+static int env_int(const char* name, int def, int lo, int hi) {
+    const char* v = getenv(name);
+    if (!v || !*v) return def;
+    int x = atoi(v);
+    if (x < lo) x = lo;
+    if (x > hi) x = hi;
+    return x;
+}
 
 template <typename Launch>
 static int msv_streamed_run(
@@ -231,22 +246,24 @@ static int msv_streamed_run(
     Launch       launch)
 {
     int rc = 0;
-    int chunk = (n < CHUNK) ? n : CHUNK;
+    int streams   = env_int("ORNAMENT_GPU_STREAMS", DEFAULT_STREAMS, 1, MAX_STREAMS);
+    int chunk_env = env_int("ORNAMENT_GPU_CHUNK", DEFAULT_CHUNK, 1, 1 << 24);
+    int chunk = (n < chunk_env) ? n : chunk_env;
 
-    cudaStream_t stream[STREAMS]  = {0};
-    int*         d_off[STREAMS]   = {0};
-    int*         d_len[STREAMS]   = {0};
-    float*       d_out[STREAMS]   = {0};
-    void*        d_scr[STREAMS]   = {0};
-    int*         h_off[STREAMS]   = {0};
-    int*         h_len[STREAMS]   = {0};
-    float*       h_out[STREAMS]   = {0};
-    int          pend_off[STREAMS];
-    int          pend_n[STREAMS];
-    bool         pend[STREAMS]    = {false};
+    cudaStream_t stream[MAX_STREAMS]  = {0};
+    int*         d_off[MAX_STREAMS]   = {0};
+    int*         d_len[MAX_STREAMS]   = {0};
+    float*       d_out[MAX_STREAMS]   = {0};
+    void*        d_scr[MAX_STREAMS]   = {0};
+    int*         h_off[MAX_STREAMS]   = {0};
+    int*         h_len[MAX_STREAMS]   = {0};
+    float*       h_out[MAX_STREAMS]   = {0};
+    int          pend_off[MAX_STREAMS];
+    int          pend_n[MAX_STREAMS];
+    bool         pend[MAX_STREAMS]    = {false};
 
     size_t scratch_bytes = (size_t)chunk * (M + 1) * elem_size;
-    for (int s = 0; s < STREAMS; ++s) {
+    for (int s = 0; s < streams; ++s) {
         CUDA_TRY(cudaStreamCreate(&stream[s]));
         CUDA_TRY(cudaMalloc(&d_off[s], (size_t)chunk * sizeof(int)));
         CUDA_TRY(cudaMalloc(&d_len[s], (size_t)chunk * sizeof(int)));
@@ -258,7 +275,7 @@ static int msv_streamed_run(
     }
 
     for (int off = 0; off < n; off += chunk) {
-        int s = (off / chunk) % STREAMS;
+        int s = (off / chunk) % streams;
         // Reclaim this stream slot: its previous chunk's scores are ready — copy them out.
         if (pend[s]) {
             CUDA_TRY(cudaStreamSynchronize(stream[s]));
@@ -284,7 +301,7 @@ static int msv_streamed_run(
     }
 
     // Drain the still-in-flight chunks.
-    for (int s = 0; s < STREAMS; ++s) {
+    for (int s = 0; s < streams; ++s) {
         if (pend[s]) {
             CUDA_TRY(cudaStreamSynchronize(stream[s]));
             memcpy(out + pend_off[s], h_out[s], (size_t)pend_n[s] * sizeof(float));
@@ -293,7 +310,7 @@ static int msv_streamed_run(
     }
 
 cleanup:
-    for (int s = 0; s < STREAMS; ++s) {
+    for (int s = 0; s < MAX_STREAMS; ++s) {
         if (d_off[s]) cudaFree(d_off[s]);
         if (d_len[s]) cudaFree(d_len[s]);
         if (d_out[s]) cudaFree(d_out[s]);

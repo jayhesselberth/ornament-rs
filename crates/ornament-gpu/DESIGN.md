@@ -39,8 +39,29 @@ So the boundary is: **GPU filters the flood; CPU handles the heavy CM tail on th
 - **Overlap** *(done — inside the resident MSV wrappers)*: the tile batch is split into fixed-size
   chunks pipelined across 2 CUDA streams with pinned host staging, so chunk *i+1*'s H2D, chunk
   *i*'s kernel, and chunk *i-1*'s D2H overlap. The emission table is uploaded once; the strand is
-  already resident. *Still to do:* profile the actual overlap (nsys) and tune chunk size / stream
-  count; extend the same pipeline across the Viterbi/Forward stages.
+  already resident. *Still to do:* extend the same pipeline across the Viterbi/Forward stages.
+
+## Measured (A30, uint8 MSV, tRNA M≈71, 64 Mnt strand → 640k tiles; `examples/bench_msv.rs`)
+
+Stream A/B (chunk 32k) and chunk sweep (2 streams):
+
+| config | best time | throughput |
+|--------|-----------|------------|
+| 1 stream (no overlap) | 0.585 s | 1.09 M tiles/s |
+| **2 streams** (double-buffered) | 0.492 s | 1.30 M tiles/s |
+| 4 streams | 0.489 s | 1.31 M tiles/s |
+| 2 streams, chunk 8k | 0.602 s | 1.06 M tiles/s |
+| 2 streams, chunk 64k | 0.486 s | 1.32 M tiles/s |
+
+- **Streaming speedup ≈ 1.19×** (2 vs 1 stream). Real but modest — the copies it hides are only
+  ~15% of wall time, so the batch is **kernel-bound, not transfer-bound**. Beyond 2 streams is
+  noise; chunk 64k is the sweet spot (8k adds launch/sync overhead) — now the default.
+- **GPU is only ~2.6× a single CPU core** (striped-SIMD uint8 MSV). The production pipeline runs
+  that CPU filter under rayon across ~24 cores, so **this kernel is currently *slower* than the
+  multicore CPU it aims to replace.** At ~18.7 G DP-cells/s on a ~933 GB/s A30 it is far from
+  bandwidth limits — the bottleneck is the per-thread DP row living in *global* memory, hit
+  M×L times with a serial dependency. Streaming was the right structural step but is not the lever
+  that makes GPU win; **the kernel is (fix #4 below: shared-memory DP row / warp-per-window).**
 
 ### Level 2 — on-device funnel (stream compaction)
 - MSV kernel writes a survivor mask → compact → Viterbi kernel consumes only survivors → compact
@@ -56,13 +77,15 @@ So the boundary is: **GPU filters the flood; CPU handles the heavy CM tail on th
    double-buffering so H2D upload / kernel / D2H overlap (the full Level-1 producer/consumer).
 2. **uint8 MSV** *(done — `msv_u8_batch_kernel`)*: 4× smaller emission table → better bandwidth on
    the memory-bound one-thread-per-window batch.
-3. **Batch across models and sequences.** A single small model (tRNA, M≈71) underutilizes the GPU.
+3. **Shared-memory DP row / warp-per-window** *(now the top lever — see Measured)*. The per-thread
+   DP row `mmx[0..=M]` currently lives in global memory and is touched M×L times with a serial
+   dependency, which is what caps the kernel at ~2.6× one CPU core. Stage the row (and the emission
+   table) in shared memory; for large M go one-**warp**-per-window and dispatch on M. This is the
+   change that decides whether GPU beats the multicore CPU at all.
+4. **Batch across models and sequences.** A single small model (tRNA, M≈71) underutilizes the GPU.
    - *Many-genomes, one model:* one resident emission table + a huge window batch. Current design.
    - *All-model, one genome (~4000 Rfam):* iterate models but keep emission tables resident/cached
      and pack small models together (per-window model-id index into resident tables).
-4. **Kernel shape by model length.** One-thread-per-window is ideal for short models but spills
-   scratch for long M. Endgame: one-**warp**-per-window with a shared-memory DP row for large M;
-   dispatch on M.
 
 ## Parity discipline
 

@@ -19,7 +19,10 @@ See [`DESIGN.md`](DESIGN.md) for where the work is heaviest and the producer/con
 - [x] Resident sequence + offset windows (`DeviceStrand` + `Tiles`; kills the 2× overlap copy).
 - [x] CUDA streams + double-buffering: chunked tile batch pipelined across 2 streams with pinned
       staging so H2D / kernel / D2H overlap (internal to the resident wrappers).
-- [ ] Profile the overlap (nsys) and tune chunk size / stream count.
+- [x] Benchmark (`examples/bench_msv.rs`) + measured the streaming speedup (~1.19×) — see DESIGN.md.
+      Finding: the batch is kernel-bound, and the kernel is only ~2.6× one CPU core.
+- [ ] **Shared-memory DP row / warp-per-window** — the measured bottleneck; the lever that decides
+      whether GPU beats the multicore CPU.
 - [ ] Viterbi + Forward kernels (rest of the cascade).
 - [ ] Wire into `ornament-scfg`'s scan pipeline as an optional backend.
 - [ ] Intra-DP (warp-per-window) for long models; multi-model batching.
