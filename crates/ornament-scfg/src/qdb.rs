@@ -15,11 +15,13 @@
 //! the optimal parse of any real hit lies entirely within the bands, so a banded scan reports
 //! exactly the same hits as the unbanded one (verified by the parity tests).
 
+use serde::{Deserialize, Serialize};
+
 use crate::config::IMPOSSIBLE;
 use crate::model::{n_emit, st, Cm};
 
 /// Per-state length bands plus the overall max hit width.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QdbBands {
     /// `dmin[v]` = minimum subsequence length allowed for state `v`.
     pub dmin: Vec<usize>,

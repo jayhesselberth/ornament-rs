@@ -5,7 +5,7 @@ use clap::Args;
 
 use ornament_core::infernal::{scan_native, scan_native_aligned, write_stockholm, InfernalRunner};
 
-use super::{render_hits, require_file, Engine, Format, E_VALUE};
+use super::{render_hits, require_file, resolve_model_path, Engine, Format, E_VALUE};
 use crate::io::emit;
 use crate::{progress, style};
 
@@ -30,11 +30,22 @@ pub struct SearchArgs {
     /// Search engine: native (pure Rust, default) or cmsearch (subprocess)
     #[arg(long, value_enum, default_value_t = Engine::Native)]
     pub engine: Engine,
+
+    /// Ignore any pressed `<cm>.orm` sidecar and parse the `.cm` directly
+    #[arg(long)]
+    pub no_pressed: bool,
 }
 
 pub fn run(args: SearchArgs) -> Result<()> {
     require_file(&args.input, "Input file")?;
     require_file(&args.cm, "CM file")?;
+
+    // Prefer a pressed `<cm>.orm` sidecar for the native engine; cmsearch reads the `.cm` directly.
+    let cm = if args.engine == Engine::Native {
+        resolve_model_path(&args.cm, !args.no_pressed)
+    } else {
+        args.cm.clone()
+    };
 
     if args.format == Format::Stockholm {
         if args.engine != Engine::Native {
@@ -49,7 +60,7 @@ pub fn run(args: SearchArgs) -> Result<()> {
             style::path(&args.input),
             style::path(&args.cm),
         );
-        let msas = scan_native_aligned(&args.cm, &args.input, E_VALUE)?;
+        let msas = scan_native_aligned(&cm, &args.input, E_VALUE)?;
         let n_hits: usize = msas.iter().map(|m| m.rows.len()).sum();
         tracing::info!("Found {} hits", style::count(n_hits));
         return emit(args.output.as_deref(), &write_stockholm(&msas));
@@ -64,7 +75,7 @@ pub fn run(args: SearchArgs) -> Result<()> {
                 style::path(&args.input),
                 style::path(&args.cm),
             );
-            scan_native(&args.cm, &args.input, E_VALUE)?
+            scan_native(&cm, &args.input, E_VALUE)?
         }
         Engine::Cmsearch => {
             tracing::info!(

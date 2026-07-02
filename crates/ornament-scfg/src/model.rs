@@ -8,6 +8,7 @@
 use std::sync::Arc;
 
 use ornament_alphabet::Alphabet;
+use serde::{Deserialize, Serialize};
 
 /// Maximum number of state-to-state connections per state (`MAXCONNECT`).
 pub const MAXCONNECT: usize = 6;
@@ -154,7 +155,7 @@ pub fn emits_right(sttype: u8) -> bool {
 
 /// Exponential-tail fit describing the random-score distribution for one search mode
 /// (`ExpInfo_t`). Read from the `.cm` `ECM*` lines; used for CM E-values.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct ExpInfo {
     pub lambda: f64,
     pub mu_extrap: f64,
@@ -181,7 +182,7 @@ impl Default for ExpInfo {
 
 /// A covariance model. Probabilities (`t`, `e`) are the canonical stored form, parsed via
 /// `2^score · null`; log-odds scores (`tsc`, `esc`) are computed by `config`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Cm {
     // Annotation / metadata.
     pub name: String,
@@ -254,11 +255,21 @@ pub struct Cm {
     pub fp7_text: Option<String>,
 
     pub flags: CmFlags,
+    /// The alphabet. Not serialized (it is fully reconstructible from an
+    /// [`ornament_alphabet::AlphabetDescriptor`], which the pressed format stores once for the
+    /// whole collection and reattaches on load); a plain RNA placeholder is used until reattached.
+    #[serde(skip, default = "default_abc")]
     pub abc: Arc<Alphabet>,
 }
 
+/// Placeholder alphabet for a freshly-deserialized [`Cm`] before its real (shared) alphabet is
+/// reattached from the pressed file's [`ornament_alphabet::AlphabetDescriptor`]. See [`Cm::abc`].
+fn default_abc() -> Arc<Alphabet> {
+    Arc::new(Alphabet::rna())
+}
+
 /// Header status flags (subset of Infernal's `CMH_*`).
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct CmFlags {
     pub rf: bool,
     pub cons: bool,
@@ -271,7 +282,7 @@ pub struct CmFlags {
 /// Per-node annotation columns from the `.cm` node lines (alignment-column map,
 /// consensus residues, and reference characters for the left/right positions). Retained
 /// so the consensus / emit-map can be assembled when alignment lands (Phase 4).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct NodeAnnot {
     pub lmap: Option<i32>,
     pub rmap: Option<i32>,

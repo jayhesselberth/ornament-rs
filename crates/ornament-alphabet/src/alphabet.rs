@@ -28,6 +28,8 @@
 
 use std::collections::HashMap;
 
+use serde::{Deserialize, Serialize};
+
 use crate::AlphabetError;
 
 /// A digital sequence residue code (`ESL_DSQ`).
@@ -41,7 +43,7 @@ pub const ILLEGAL: Dsq = 254;
 pub const SMALLX1: f64 = 5e-9;
 
 /// Standard alphabet kind.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AlphabetType {
     Rna,
     Dna,
@@ -60,7 +62,7 @@ pub struct ModSymbol {
 }
 
 /// Specification for registering a modified base into an extended alphabet.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModSpec {
     /// Single-character sequence-text code for the modified base.
     pub symbol: char,
@@ -68,6 +70,33 @@ pub struct ModSpec {
     pub parent: char,
     /// Short name (MODOMICS).
     pub name: String,
+}
+
+/// A compact, serializable recipe for reconstructing an [`Alphabet`]: its kind plus any
+/// registered modified bases. Persisting this — rather than the full expanded symbol / degeneracy
+/// / input-map tables — keeps a pressed model's alphabet tiny and lets a single shared `Alphabet`
+/// be rebuilt once on load and reattached to every model.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AlphabetDescriptor {
+    pub atype: AlphabetType,
+    pub mods: Vec<ModSpec>,
+}
+
+impl AlphabetDescriptor {
+    /// Rebuild the alphabet this descriptor describes. Mirrors the constructors an `.cm` parser
+    /// would use, so the reconstructed alphabet is byte-for-byte identical to the original.
+    pub fn build(&self) -> Result<Alphabet, AlphabetError> {
+        match self.atype {
+            AlphabetType::Rna => Alphabet::rna_with_modifications(&self.mods),
+            AlphabetType::Dna if self.mods.is_empty() => Ok(Alphabet::dna()),
+            AlphabetType::Dna => Err(AlphabetError::Alphabet(
+                "DNA alphabets with modified bases are not supported by the pressed format".into(),
+            )),
+            AlphabetType::Custom => Err(AlphabetError::Alphabet(
+                "custom alphabets cannot be reconstructed from a descriptor".into(),
+            )),
+        }
+    }
 }
 
 /// A biosequence alphabet (`ESL_ALPHABET`), possibly extended with modified bases.
@@ -96,6 +125,26 @@ impl Alphabet {
     /// Standard RNA alphabet, faithful to Easel `create_rna()` (K=4, Kp=18).
     pub fn rna() -> Self {
         Self::nucleic(AlphabetType::Rna, &[])
+    }
+
+    /// Extract this alphabet's reconstruction recipe (kind + registered modified bases) for
+    /// serialization. The inverse of [`AlphabetDescriptor::build`]: `abc.descriptor().build()`
+    /// reproduces `abc`. Modified-base parents are reported as their canonical characters.
+    pub fn descriptor(&self) -> AlphabetDescriptor {
+        let mods = self
+            .modinfo
+            .iter()
+            .flatten()
+            .map(|m| ModSpec {
+                symbol: m.symbol,
+                parent: self.sym[m.parent as usize] as char,
+                name: m.name.clone(),
+            })
+            .collect();
+        AlphabetDescriptor {
+            atype: self.atype,
+            mods,
+        }
     }
 
     /// Standard DNA alphabet, faithful to Easel `create_dna()` (K=4, Kp=18).

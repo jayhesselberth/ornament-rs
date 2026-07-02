@@ -15,7 +15,7 @@ mod io;
 mod progress;
 mod style;
 
-use commands::{align, scan, search, stat, trna};
+use commands::{align, press, scan, search, stat, trna};
 
 /// clap help palette (mirrors the runtime status palette): bold-yellow headers/usage,
 /// bold-green literals, cyan placeholders.
@@ -97,6 +97,16 @@ Examples:
   ornament stat -c model.cm -f tsv")]
     Stat(stat::StatArgs),
 
+    /// Prebuild a covariance-model database, precomputing bands (cmpress analog)
+    #[command(after_help = "\
+Examples:
+  ornament press -c Rfam.cm.gz            Writes Rfam.cm.gz.orm alongside the model
+  ornament press -c model.cm -f           Overwrite an existing pressed database
+
+`scan`/`search` auto-detect the `<cm>.orm` sidecar and skip re-parsing + re-banding each run.
+Pass `--no-pressed` to those commands to ignore a sidecar.")]
+    Press(press::PressArgs),
+
     /// tRNA-modification analysis application (analyze, compare, mods)
     Trna {
         #[command(subcommand)]
@@ -142,6 +152,7 @@ fn main() -> Result<()> {
         Commands::Scan(args) => scan::run(args),
         Commands::Align(args) => align::run(args),
         Commands::Stat(args) => stat::run(args),
+        Commands::Press(args) => press::run(args),
         Commands::Trna { command } => trna::run(command),
 
         // Deprecated top-level aliases — dispatch to the `trna` namespace with a notice.
