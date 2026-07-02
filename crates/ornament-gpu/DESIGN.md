@@ -136,6 +136,30 @@ sweep (A30, reusable context):
   instead of one thread owning the whole row. Only ~10 Rfam models need it; the rest are already
   fast. (Those rRNA-scale models could also simply stay on the CPU filter.)
 
+### Shared-memory Viterbi (the profile-driven fix — measured A30, 8 Mnt / 80k tiles)
+
+The profile showed the global Viterbi was L2-latency-bound (2.8% compute). `viterbi_batch_kernel_smem`
+moves the DP state into shared memory. Naive Viterbi needs 6 rows (M/I/D × prev/cur) of f32 — too
+big for shared — so it's cut to **3 in-place rows** with a 2-pass scheme: a *descending-k* pass does
+M and I (single row per state doubles as prev at k-1 / cur at k, reading the old value before
+overwrite), then an *ascending-k* pass does D (which needs the current row's M[k-1]/D[k-1]); D holds
+the previous row through pass 1, exactly where the M recurrence reads Dprev. Tables staged in shared
+too; DP rows interleaved to avoid bank conflicts; blockDim dispatched {128/64/32} to fit the opt-in.
+
+| | global | shared-mem |
+|---|--------|-----------|
+| throughput | 0.86 G cells/s | **49.4 G cells/s** |
+| vs 1 CPU core | 0.1× | **7.0×** |
+
+- **57× faster kernel** — same lever and magnitude as MSV's 22×, confirming the profile diagnosis.
+  Parity unchanged (`gpu_viterbi_matches_scalar` now runs the shared path).
+- **Honest scope:** 7× *one* core ≈ 0.3× the 24-core CPU at this batch, and it climbs with batch
+  size (GPU underfill again). But in the live pipeline Viterbi runs only on MSV *survivors* (~1% of
+  tiles) — a small batch that underfills the GPU — so GPU Viterbi pays off mainly (a) on
+  low-specificity models / repetitive genomes with many survivors, or (b) as part of an on-device
+  funnel (MSV→compact→Viterbi→Forward all on GPU) that avoids host round-trips. It is no longer a
+  *regression* vs CPU (was 0.1×), which is what unblocks wiring it in.
+
 ### Profiling (A30, `examples/bench_msv.rs` with `BENCH_KERNEL`; nsys works, ncu blocked)
 
 Per-kernel throughput at 64 Mnt / 640k tiles, tRNA-scale model (M≈71):

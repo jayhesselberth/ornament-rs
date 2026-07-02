@@ -39,7 +39,9 @@ See [`DESIGN.md`](DESIGN.md) for where the work is heaviest and the producer/con
       Vit/Fwd/CYK on survivors, hits identical. `gpu_msv_pipeline_matches_cpu` passes on A30.
 - [x] Viterbi kernel (`viterbi_batch_kernel`): f32 max-plus M/I/D DP, one thread/window, global
       scratch (6 rows/thread); parity vs scalar `viterbi_nats` (`gpu_viterbi_matches_scalar`).
-- [ ] Shared-memory / warp-per-window Viterbi (6× MSV's footprint; currently global-mem).
+- [x] **Shared-memory Viterbi** (`viterbi_batch_kernel_smem`): 3 in-place DP rows (2-pass:
+      descending M/I, ascending D) + tables in shared; blockDim dispatch {128/64/32}. **57× the
+      global kernel** (0.86→49.4 G cells/s), 0.1×→**7.0× one CPU core**; same parity test. See DESIGN.md.
 - [ ] Forward kernel (last cascade stage; odds-space log-sum-exp, needs rescaling).
 - [ ] Warp-per-window MSV — scoped to the ~10 M≥1000 models; or leave those on the CPU filter.
 - [ ] Wire GPU Viterbi into the pipeline (after MSV survivors) once shared-mem Viterbi lands.

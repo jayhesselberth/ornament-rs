@@ -342,6 +342,108 @@ extern "C" __global__ void viterbi_batch_kernel(
     out[j] = xC + nmove;   // + C->move; L == 0 ⇒ xC = -inf
 }
 
+// Shared-memory Viterbi. Same recurrence/result as `viterbi_batch_kernel`, but the per-thread DP
+// state and the (block-shared) transition + emission tables live in shared memory. Profiling showed
+// the global version is L2-latency-bound (2.8% compute, 42% L2, 167× slower than shared-mem MSV);
+// this moves the hot dependent-load traffic into ~30-cycle shared memory.
+//
+// Two tricks keep the footprint down to **3** rows/thread (not the naive 6 = M/I/D × prev/cur):
+//   * scan M,I **descending** in k so a single row per state doubles as prev (k-1, not yet
+//     overwritten) and cur (k, written after reading the prev value at index k) — the MSV trick,
+//     extended to I by reading M[k]/I[k] *before* overwriting them;
+//   * compute D in a **second, ascending** pass (D(i,k) needs the current row's M[k-1]/D[k-1]),
+//     after M/I are done — D stays at the previous row's values through pass 1 (where the M
+//     recurrence reads Dprev[k-1]), then pass 2 overwrites it in place.
+// So M/I/D are three single (M+1) rows updated in place; no per-row swap, and cur automatically
+// becomes prev for the next row. Dynamic shared layout (floats):
+//   [0 .. 8*S)              tsc          (S = M+1)
+//   [8*S .. 8*S+Kp*S)       msc
+//   [rest]                  dp, interleaved dp[(state*S + k)*blockDim + tid]  (conflict-free)
+extern "C" __global__ void viterbi_batch_kernel_smem(
+    const float* __restrict__ tsc,
+    const float* __restrict__ msc_g,
+    int                        Kp,
+    int                        M,
+    float                      nj,
+    const uint8_t* __restrict__ dsq,
+    const int*     __restrict__ offsets,
+    const int*     __restrict__ lengths,
+    int                         n,
+    float*         __restrict__ out)
+{
+    extern __shared__ float sh[];
+    int S   = M + 1;
+    int bd  = blockDim.x;
+    int tid = threadIdx.x;
+    float* s_tsc = sh;
+    float* s_msc = s_tsc + (size_t)S * 8;
+    float* s_dp  = s_msc + (size_t)Kp * S;   // bd*3*S, interleaved
+
+    for (int idx = tid; idx < S * 8; idx += bd) s_tsc[idx] = tsc[idx];
+    for (int idx = tid; idx < Kp * S; idx += bd) s_msc[idx] = msc_g[idx];
+    __syncthreads();
+
+    int j = blockIdx.x * bd + tid;
+    if (j >= n) return;
+
+#define VM_(k) s_dp[((0 * S) + (k)) * bd + tid]
+#define VI_(k) s_dp[((1 * S) + (k)) * bd + tid]
+#define VD_(k) s_dp[((2 * S) + (k)) * bd + tid]
+
+    int   L    = lengths[j];
+    int   base = offsets[j];
+    float pmove = (2.0f + nj) / ((float)L + 2.0f + nj);
+    float nloop = logf(1.0f - pmove);
+    float nmove = logf(pmove);
+    float emove = logf(0.5f);
+    float eloop = emove;
+
+    for (int k = 0; k <= M; ++k) { VM_(k) = NINF; VI_(k) = NINF; VD_(k) = NINF; }  // row 0
+    float xN = 0.0f, xJ = NINF, xC = NINF, xB = nmove;
+
+    for (int i = 1; i <= L; ++i) {
+        int          x  = (int)dsq[base + (i - 1)];
+        const float* ms = s_msc + (size_t)x * S;
+        float        xE = NINF;
+
+        // Pass 1 (descending): cur M, I in place; D still holds the previous row (Dprev).
+        for (int k = M; k >= 1; --k) {
+            const float* t = s_tsc + (size_t)(k - 1) * 8;   // MM,IM,DM,BM by k-1
+            float mv = vmax(vmax(VM_(k - 1) + t[0], VI_(k - 1) + t[1]),
+                            vmax(xB + t[3], VD_(k - 1) + t[2]));
+            mv += ms[k];
+            float iv = NINF;
+            if (k < M) {
+                const float* tk = s_tsc + (size_t)k * 8;    // MI,II by k
+                iv = vmax(VM_(k) + tk[6], VI_(k) + tk[7]);  // reads Mprev[k]/Iprev[k] before write
+            }
+            VM_(k) = mv;
+            VI_(k) = iv;
+            xE = vmax(xE, mv);
+        }
+
+        // Pass 2 (ascending): cur D in place. D(i,k) = max(Mcur[k-1]+MD, Dcur[k-1]+DD).
+        VD_(0) = NINF;
+        for (int k = 1; k <= M; ++k) {
+            const float* t = s_tsc + (size_t)(k - 1) * 8;
+            float dv = vmax(VM_(k - 1) + t[4], VD_(k - 1) + t[5]);
+            VD_(k) = dv;
+            xE = vmax(xE, dv);
+        }
+
+        float xJn = vmax(xJ + nloop, xE + eloop);
+        float xCn = vmax(xC + nloop, xE + emove);
+        float xNn = xN + nloop;
+        float xBn = vmax(xNn + nmove, xJn + nmove);
+        xJ = xJn; xC = xCn; xN = xNn; xB = xBn;
+    }
+
+    out[j] = xC + nmove;
+#undef VM_
+#undef VI_
+#undef VD_
+}
+
 // ---- Host wrappers (CUDA Runtime API) -------------------------------------------------------
 // Thin, synchronous launch helpers callable over FFI. They own the device allocations for one
 // batch call: upload inputs, launch, copy scores back, free. Return 0 on success, or the
@@ -533,6 +635,9 @@ extern "C" int ornament_gpu_ctx_create(int streams, int chunk, void** out) {
                                     cudaFuncAttributeMaxDynamicSharedMemorySize, attr)
                    == cudaSuccess) {
             optin = attr;
+            // Same opt-in for the shared-memory Viterbi kernel (best-effort).
+            cudaFuncSetAttribute((const void*)viterbi_batch_kernel_smem,
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize, attr);
         } else {
             cudaGetLastError(); // clear any sticky error from the probe
         }
@@ -661,6 +766,18 @@ static int pick_u8_threads(int Kp, int M, size_t smem_limit) {
     return 0;
 }
 
+// Block size for the shared-memory Viterbi kernel: largest of {128,64,32} whose dynamic-shared
+// footprint `(8 + Kp + 3*bd)*(M+1)` floats fits the opted-in limit (tsc + msc + 3 DP rows/thread).
+// Viterbi's f32 3-row state is 12× the u8 MSV's 1-byte row, so it fits fewer/shorter models than
+// MSV; 0 ⇒ fall back to the global Viterbi kernel.
+static int pick_vit_threads(int Kp, int M, size_t smem_limit) {
+    for (int bd = 128; bd >= 32; bd >>= 1) {
+        size_t bytes = (size_t)(8 + Kp + 3 * bd) * (M + 1) * sizeof(float);
+        if (bytes <= smem_limit) return bd;
+    }
+    return 0;
+}
+
 // Reduced-precision (uint8) MSV over a resident strand, using a reusable context. rbv: Kp*(M+1)
 // bytes (host). Prefers the shared-memory kernel when it fits (ORNAMENT_GPU_SMEM=0 forces global).
 extern "C" int ornament_gpu_ctx_msv_u8(
@@ -771,13 +888,27 @@ extern "C" int ornament_gpu_ctx_vit_f32(
     const float* d_tsc = (const float*)ctx->d_tsc;
     const float* d_msc = (const float*)ctx->d_emit;
 
+    // Prefer the shared-memory kernel when its footprint fits; else the global-scratch kernel.
+    // ORNAMENT_GPU_SMEM=0 forces global (for A/B). Global path needs 6*(M+1) floats of scratch per
+    // tile; the shared path needs none (elem_size 0 ⇒ ctx_stream_run skips scratch alloc).
+    int use_smem = env_int("ORNAMENT_GPU_SMEM", 1, 0, 1);
+    int vit_threads = use_smem ? pick_vit_threads(Kp, M, (size_t)ctx->smem_optin) : 0;
+    int threads = vit_threads ? vit_threads : 128;
+    size_t elem = vit_threads ? 0 : 6 * sizeof(float);
+
     return ctx_stream_run(
-        ctx, n, M, 6 * sizeof(float), 128, starts, lengths, out,
-        [=](cudaStream_t st, int blocks, int threads,
+        ctx, n, M, elem, threads, starts, lengths, out,
+        [=](cudaStream_t st, int blocks, int th,
             const int* d_off, const int* d_len, int cn, void* d_scr, float* d_out) {
-            viterbi_batch_kernel<<<blocks, threads, 0, st>>>(
-                d_tsc, d_msc, Kp, M, nj, (const uint8_t*)d_strand, d_off, d_len, cn,
-                (float*)d_scr, d_out);
+            if (vit_threads) {
+                size_t shmem = (size_t)(8 + Kp + 3 * th) * (M + 1) * sizeof(float);
+                viterbi_batch_kernel_smem<<<blocks, th, shmem, st>>>(
+                    d_tsc, d_msc, Kp, M, nj, (const uint8_t*)d_strand, d_off, d_len, cn, d_out);
+            } else {
+                viterbi_batch_kernel<<<blocks, th, 0, st>>>(
+                    d_tsc, d_msc, Kp, M, nj, (const uint8_t*)d_strand, d_off, d_len, cn,
+                    (float*)d_scr, d_out);
+            }
         });
 }
 
