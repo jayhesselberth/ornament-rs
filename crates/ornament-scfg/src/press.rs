@@ -72,7 +72,7 @@ impl PressedModel {
     /// Rebuild this model's [`PreparedFilters`] (striped p7 profiles + the stored scan bands),
     /// skipping the fp7 parse and the QDB band computation those inputs already cover.
     pub fn prepared_filters(&self) -> Result<PreparedFilters, InfernalError> {
-        PreparedFilters::from_parts(&self.cm, self.fp7.clone(), self.scan_bands.clone())
+        PreparedFilters::from_parts(&self.cm, self.fp7.clone(), Some(self.scan_bands.clone()))
     }
 }
 

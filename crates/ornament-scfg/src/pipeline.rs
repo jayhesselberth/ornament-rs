@@ -102,31 +102,34 @@ pub struct PreparedFilters {
     vit: vitfilter::Profile,
     filt: fwdfilter::Profile,
     nj: f32,
-    bands: QdbBands,
+    /// Query-dependent CM scan bands. Computed **lazily** on the first survivor window (via
+    /// [`cm_pipeline_search_prepared`]) so a model the p7 cascade prunes to zero survivors never
+    /// pays the O(#B·W²) band DP — the dominant per-model cost in an all-Rfam scan. A pressed DB
+    /// supplies its precomputed bands up front through [`PreparedFilters::from_parts`], which
+    /// pre-fills this cell so the pressed path skips the calc entirely.
+    bands: std::sync::OnceLock<QdbBands>,
 }
 
 impl PreparedFilters {
-    /// Build the p7 filter cascade + CM QDB bands for `cm` from scratch: parse the embedded filter
-    /// HMM and compute the query-dependent bands (`beta = QdbBands::DEFAULT_BETA`), then stripe the
-    /// filter profiles. Use [`PreparedFilters::from_parts`] when the HMM and bands are already
-    /// available (e.g. loaded from a pressed DB) to skip the fp7 parse and the O(#B·W²) band calc.
+    /// Build the p7 filter cascade for `cm` from scratch: parse the embedded filter HMM and stripe
+    /// the filter profiles. The CM QDB bands are left unset — they are computed lazily on the first
+    /// survivor window (see the `bands` field). Use [`PreparedFilters::from_parts`] when the HMM
+    /// (and optionally precomputed bands) are already available (e.g. loaded from a pressed DB) to
+    /// skip the fp7 parse and, for the bands, the O(#B·W²) band calc.
     pub fn build(cm: &Cm) -> Result<PreparedFilters, InfernalError> {
         let hmm = parse_filter_hmm(cm)?;
-        // Query-dependent bands for the CM stage, computed once and shared across every survivor
-        // window (and both strands). A safe `beta` keeps every real hit's optimal parse in-band, so
-        // the banded scan reports identical hits to the unbanded one — just faster.
-        let bands = calc_qdb_bands(cm, QdbBands::DEFAULT_BETA);
-        PreparedFilters::from_parts(cm, hmm, bands)
+        PreparedFilters::from_parts(cm, hmm, None)
     }
 
-    /// Build the striped filter profiles for `cm` from an already-parsed filter `hmm` and
-    /// precomputed CM `bands`. The SIMD-striped layout is target-CPU-dependent (so it is rebuilt
-    /// here rather than persisted), but the two expensive, portable inputs — the parsed HMM and the
-    /// QDB bands — are supplied by the caller, letting a pressed DB skip recomputing them per run.
+    /// Build the striped filter profiles for `cm` from an already-parsed filter `hmm`, optionally
+    /// seeding the CM scan `bands`. The SIMD-striped layout is target-CPU-dependent (so it is
+    /// rebuilt here rather than persisted), but the expensive, portable inputs — the parsed HMM and
+    /// (when supplied) the QDB bands — come from the caller, letting a pressed DB skip recomputing
+    /// them per run. Pass `None` for the bands to defer them to the lazy per-scan computation.
     pub fn from_parts(
         cm: &Cm,
         hmm: P7Hmm,
-        bands: QdbBands,
+        bands: Option<QdbBands>,
     ) -> Result<PreparedFilters, InfernalError> {
         // Configure the p7 Forward filter once. The per-tile sweep clones each profile cheaply and
         // resets only its length model, so the length-independent base is shared read-only.
@@ -138,13 +141,17 @@ impl PreparedFilters {
         let filt = fwdfilter::build(&prof);
         let msv = msvfilter::build(&prof); // cheap uint8 MSV prefilter (built once)
         let vit = vitfilter::build(&prof); // striped Viterbi filter (middle cascade stage, built once)
+        let band_cell = std::sync::OnceLock::new();
+        if let Some(b) = bands {
+            let _ = band_cell.set(b); // pressed DB: use the precomputed bands, never recompute
+        }
         Ok(PreparedFilters {
             hmm,
             msv,
             vit,
             filt,
             nj,
-            bands,
+            bands: band_cell,
         })
     }
 }
@@ -219,28 +226,29 @@ pub fn cm_pipeline_search_prepared(
             w,
             &params,
         );
-        let hits: Vec<Hit> = surv
-            .par_iter()
-            .flat_map_iter(|&(s, e)| {
-                let sub = subseq(dsq, s, e);
-                scan_subseq(
-                    cm,
-                    &sub,
-                    w_max,
-                    cutoff_bits,
-                    do_inside,
-                    Some(&prepared.bands),
-                )
-                .into_iter()
-                .map(move |(score, i, j)| Hit {
-                    score,
-                    evalue: evalue(cm, mode, score, searched),
-                    i: i + s - 1,
-                    j: j + s - 1,
-                    strand: Strand::Plus,
+        let hits: Vec<Hit> = if surv.is_empty() {
+            Vec::new() // no CM work ⇒ never compute the QDB bands for this model
+        } else {
+            // Lazily compute (or reuse the pressed DB's precomputed) scan bands, once per model
+            // across both strands and every record — `get_or_init` is thread-safe.
+            let b = prepared
+                .bands
+                .get_or_init(|| calc_qdb_bands(cm, QdbBands::DEFAULT_BETA));
+            surv.par_iter()
+                .flat_map_iter(|&(s, e)| {
+                    let sub = subseq(dsq, s, e);
+                    scan_subseq(cm, &sub, w_max, cutoff_bits, do_inside, Some(b))
+                        .into_iter()
+                        .map(move |(score, i, j)| Hit {
+                            score,
+                            evalue: evalue(cm, mode, score, searched),
+                            i: i + s - 1,
+                            j: j + s - 1,
+                            strand: Strand::Plus,
+                        })
                 })
-            })
-            .collect();
+                .collect()
+        };
         (surv, nw, hits)
     };
     let minus = || {
@@ -254,28 +262,27 @@ pub fn cm_pipeline_search_prepared(
             w,
             &params,
         );
-        let hits: Vec<Hit> = surv
-            .par_iter()
-            .flat_map_iter(|&(s, e)| {
-                let sub = subseq(&rc, s, e);
-                scan_subseq(
-                    cm,
-                    &sub,
-                    w_max,
-                    cutoff_bits,
-                    do_inside,
-                    Some(&prepared.bands),
-                )
-                .into_iter()
-                .map(move |(score, i, j)| Hit {
-                    score,
-                    evalue: evalue(cm, mode, score, searched),
-                    i: l - (i + s - 1) + 1,
-                    j: l - (j + s - 1) + 1,
-                    strand: Strand::Minus,
+        let hits: Vec<Hit> = if surv.is_empty() {
+            Vec::new() // no CM work ⇒ never compute the QDB bands for this model
+        } else {
+            let b = prepared
+                .bands
+                .get_or_init(|| calc_qdb_bands(cm, QdbBands::DEFAULT_BETA));
+            surv.par_iter()
+                .flat_map_iter(|&(s, e)| {
+                    let sub = subseq(&rc, s, e);
+                    scan_subseq(cm, &sub, w_max, cutoff_bits, do_inside, Some(b))
+                        .into_iter()
+                        .map(move |(score, i, j)| Hit {
+                            score,
+                            evalue: evalue(cm, mode, score, searched),
+                            i: l - (i + s - 1) + 1,
+                            j: l - (j + s - 1) + 1,
+                            strand: Strand::Minus,
+                        })
                 })
-            })
-            .collect();
+                .collect()
+        };
         (surv, nw, hits)
     };
     let ((fsurv, fnw, fhits), (rsurv, rnw, rhits)) = rayon::join(plus, minus);

@@ -273,14 +273,18 @@ where
 }
 
 /// Per-model setup shared by the multi-model scan path: the local scan model, a glocal alignment
-/// model + its bands, the emit map, and the record-independent p7 filter cascade + CM scan bands.
-/// `filters` is `None` for models the memory guard skipped (never scanned, so never built — which
-/// also avoids paying their oversized QDB-band cost).
+/// model, the emit map, and the record-independent p7 filter cascade + CM scan bands. `filters` is
+/// `None` for models the memory guard skipped (never scanned, so never built — which also avoids
+/// paying their oversized QDB-band cost).
 struct Prepared {
     cm: Cm,
     /// Glocal-configured copy used only for per-hit alignment (see `scan_native`).
     align_cm: Cm,
-    align_bands: QdbBands,
+    /// QDB bands for the per-hit model-span alignment over `align_cm`. `Some` only when a pressed DB
+    /// supplied them precomputed; `None` on the parsed path, where almost every model produces zero
+    /// hits — the bands are then computed lazily, once per model that actually hits (see the scan
+    /// loops), so the O(M·W·band) DP is never paid for the ~all that never hit.
+    align_bands: Option<QdbBands>,
     w_max: usize,
     emap: EmitMap,
     filters: Option<PreparedFilters>,
@@ -322,7 +326,9 @@ fn build_prepared_models(path: &Path) -> Result<Vec<Prepared>> {
 }
 
 /// Parse a `.cm(.gz)` and prepare every model from scratch (glocal align copy + local scan config +
-/// both bands + emit map + p7 filter cascade), in parallel across models.
+/// emit map + p7 filter cascade), in parallel across models. The alignment bands are left unset
+/// (`align_bands: None`) and computed lazily per hitting model in the scan loops — eager banding for
+/// all ~4227 models was the dominant setup cost, wasted for the ~all that never hit.
 fn prepared_from_cm_file(cm_path: &Path) -> Result<Vec<Prepared>> {
     let models = parse_cm_records_file(cm_path)
         .map_err(|e| anyhow!("failed to parse CM file {}: {e}", cm_path.display()))?;
@@ -333,7 +339,6 @@ fn prepared_from_cm_file(cm_path: &Path) -> Result<Vec<Prepared>> {
             let mut align_cm = cm.clone();
             configure_scores(&mut align_cm);
             configure_local(&mut cm); // cmsearch/cmscan default (local mode)
-            let align_bands = calc_qdb_bands(&align_cm, QdbBands::DEFAULT_BETA);
             let w_max = cm.w as usize;
             let emap = EmitMap::build(&cm);
             let filters =
@@ -347,7 +352,7 @@ fn prepared_from_cm_file(cm_path: &Path) -> Result<Vec<Prepared>> {
             Ok(Prepared {
                 cm,
                 align_cm,
-                align_bands,
+                align_bands: None,
                 w_max,
                 emap,
                 filters,
@@ -380,7 +385,7 @@ fn prepared_from_pressed(path: &Path) -> Result<Vec<Prepared>> {
             Ok(Prepared {
                 cm: pm.cm,
                 align_cm: pm.align_cm,
-                align_bands: pm.align_bands,
+                align_bands: Some(pm.align_bands), // pressed DB precomputed these — reuse, don't recompute
                 w_max: pm.w_max,
                 emap,
                 filters,
@@ -463,6 +468,9 @@ where
         .map_err(|e| anyhow!("pipeline failed for model {}: {e}", p.cm.name))?;
 
         let mut hits = Vec::new();
+        // Alignment bands: use the pressed DB's precomputed set when present, else compute lazily on
+        // the first reportable hit (see `Prepared::align_bands`) so no-hit models never pay for them.
+        let mut lazy_align_bands: Option<QdbBands> = None;
         for h in raw {
             if let Some(ev) = h.evalue {
                 if ev > e_value {
@@ -473,12 +481,17 @@ where
                 Strand::Plus => '+',
                 Strand::Minus => '-',
             };
+            let ab = match &p.align_bands {
+                Some(b) => b,
+                None => lazy_align_bands
+                    .get_or_insert_with(|| calc_qdb_bands(&p.align_cm, QdbBands::DEFAULT_BETA)),
+            };
             let (mdl_from, mdl_to) = hit_model_span(
                 &p.align_cm,
                 dsq,
                 Some(rc.as_slice()),
                 &p.emap,
-                &p.align_bands,
+                ab,
                 h.i,
                 h.j,
                 h.strand,
@@ -590,18 +603,27 @@ pub fn scan_native_aligned<P: AsRef<Path>, Q: AsRef<Path>>(
             .map_err(|e| anyhow!("pipeline failed for model {}: {e}", p.base.cm.name))?;
 
             let mut rows = Vec::new();
+            // Alignment bands: use the pressed DB's precomputed set when present, else compute lazily
+            // on the first reportable hit (see `Prepared::align_bands`) so no-hit models never pay.
+            let mut lazy_align_bands: Option<QdbBands> = None;
             for h in raw {
                 if let Some(ev) = h.evalue {
                     if ev > e_value {
                         continue;
                     }
                 }
+                let ab = match &p.base.align_bands {
+                    Some(b) => b,
+                    None => lazy_align_bands.get_or_insert_with(|| {
+                        calc_qdb_bands(&p.base.align_cm, QdbBands::DEFAULT_BETA)
+                    }),
+                };
                 let (aln, seq) = align_hit_window(
                     &p.base.align_cm,
                     dsq,
                     Some(rc.as_slice()),
                     &p.base.emap,
-                    &p.base.align_bands,
+                    ab,
                     h.i,
                     h.j,
                     h.strand,
