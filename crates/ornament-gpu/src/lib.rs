@@ -252,6 +252,37 @@ extern "C" {
         n: i32,
         out: *mut f32,
     ) -> i32;
+    fn ornament_gpu_ctx_create(streams: i32, chunk: i32, out: *mut *mut core::ffi::c_void) -> i32;
+    fn ornament_gpu_ctx_destroy(ctx: *mut core::ffi::c_void) -> i32;
+    #[allow(clippy::too_many_arguments)]
+    fn ornament_gpu_ctx_msv_f32(
+        ctx: *mut core::ffi::c_void,
+        msc: *const f32,
+        kp: i32,
+        m: i32,
+        d_strand: *const core::ffi::c_void,
+        starts: *const i32,
+        lengths: *const i32,
+        n: i32,
+        out: *mut f32,
+    ) -> i32;
+    #[allow(clippy::too_many_arguments)]
+    fn ornament_gpu_ctx_msv_u8(
+        ctx: *mut core::ffi::c_void,
+        rbv: *const u8,
+        kp: i32,
+        m: i32,
+        scale_b: f32,
+        base_b: i32,
+        bias_b: i32,
+        tbm_b: i32,
+        tec_b: i32,
+        d_strand: *const core::ffi::c_void,
+        starts: *const i32,
+        lengths: *const i32,
+        n: i32,
+        out: *mut f32,
+    ) -> i32;
 }
 
 /// A strand's residues uploaded to the device **once**, reusable across every window batch and
@@ -393,6 +424,118 @@ pub fn msv_u8_nats_gpu(
         return Err(GpuError::Cuda(rc));
     }
     Ok(out)
+}
+
+/// A reusable GPU context: owns the CUDA streams + per-stream device/pinned buffers + a growable
+/// emission-table buffer, created once and reused across many scoring calls. This is what makes an
+/// all-model scan efficient — the free functions ([`msv_nats_gpu`], [`msv_u8_nats_gpu`]) spin up
+/// and tear down all of that *per call*, which is negligible once but dominates when scoring
+/// thousands of Rfam models. Score with [`GpuContext::msv_nats`] / [`GpuContext::msv_u8_nats`],
+/// reusing one context (and one [`DeviceStrand`]) across every model. RAII: freed on drop.
+#[cfg(feature = "cuda")]
+pub struct GpuContext {
+    ptr: *mut core::ffi::c_void,
+}
+
+#[cfg(feature = "cuda")]
+impl GpuContext {
+    /// Create a context with the default stream count / chunk size (honoring `ORNAMENT_GPU_STREAMS`
+    /// / `ORNAMENT_GPU_CHUNK`). Requires a visible CUDA device.
+    pub fn new() -> Result<GpuContext, GpuError> {
+        Self::with_config(0, 0)
+    }
+
+    /// Create a context with an explicit stream count and chunk size (tiles/chunk). Pass `0` for
+    /// either to fall back to the env var / built-in default.
+    pub fn with_config(streams: usize, chunk: usize) -> Result<GpuContext, GpuError> {
+        if device_count()? == 0 {
+            return Err(GpuError::NoDevice);
+        }
+        let mut ptr: *mut core::ffi::c_void = core::ptr::null_mut();
+        let rc = unsafe { ornament_gpu_ctx_create(streams as i32, chunk as i32, &mut ptr) };
+        if rc != 0 {
+            return Err(GpuError::Cuda(rc));
+        }
+        Ok(GpuContext { ptr })
+    }
+
+    /// f32 MSV raw scores (nats) for `tiles` against a resident `strand`, reusing this context's
+    /// streams/buffers. Same result as [`msv_nats_gpu`], without the per-call setup.
+    pub fn msv_nats(
+        &self,
+        fp: &FlatProfile,
+        strand: &DeviceStrand,
+        tiles: &Tiles,
+    ) -> Result<Vec<f32>, GpuError> {
+        let n = tiles.len();
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        let mut out = vec![f32::NEG_INFINITY; n];
+        let rc = unsafe {
+            ornament_gpu_ctx_msv_f32(
+                self.ptr,
+                fp.msc.as_ptr(),
+                fp.kp as i32,
+                fp.m as i32,
+                strand.ptr,
+                tiles.starts.as_ptr(),
+                tiles.lengths.as_ptr(),
+                n as i32,
+                out.as_mut_ptr(),
+            )
+        };
+        if rc != 0 {
+            return Err(GpuError::Cuda(rc));
+        }
+        Ok(out)
+    }
+
+    /// Reduced-precision (uint8) MSV raw scores (nats), reusing this context. Same result as
+    /// [`msv_u8_nats_gpu`], without the per-call setup.
+    pub fn msv_u8_nats(
+        &self,
+        bp: &ByteMsvProfile,
+        strand: &DeviceStrand,
+        tiles: &Tiles,
+    ) -> Result<Vec<f32>, GpuError> {
+        let n = tiles.len();
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        let mut out = vec![f32::NEG_INFINITY; n];
+        let rc = unsafe {
+            ornament_gpu_ctx_msv_u8(
+                self.ptr,
+                bp.rbv.as_ptr(),
+                bp.kp as i32,
+                bp.m as i32,
+                bp.scale_b,
+                bp.base_b as i32,
+                bp.bias_b as i32,
+                bp.tbm_b as i32,
+                bp.tec_b as i32,
+                strand.ptr,
+                tiles.starts.as_ptr(),
+                tiles.lengths.as_ptr(),
+                n as i32,
+                out.as_mut_ptr(),
+            )
+        };
+        if rc != 0 {
+            return Err(GpuError::Cuda(rc));
+        }
+        Ok(out)
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl Drop for GpuContext {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            unsafe { ornament_gpu_ctx_destroy(self.ptr) };
+        }
+    }
 }
 
 #[cfg(test)]
@@ -566,6 +709,47 @@ mod tests {
                     || (gpu_bits.is_infinite() && cpu_bits.is_infinite()),
                 "span {i} ({s},{e}): gpu {gpu_bits} vs cpu striped {cpu_bits}"
             );
+        }
+    }
+
+    /// A reused [`GpuContext`] must produce the same scores as the per-call free functions, across
+    /// *multiple* scoring calls on one context (exercises buffer reuse + the emission-buffer regrow
+    /// path when a second call has a different M). Skips when no `cuda` device is visible.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn gpu_context_matches_freefn() {
+        let (prof, strand) = fixture();
+        match device_count() {
+            Ok(0) | Err(_) => return,
+            Ok(_) => {}
+        }
+
+        let fp = FlatProfile::new(&prof);
+        let bp = ByteMsvProfile::new(&prof);
+        let dstrand = DeviceStrand::upload(&strand).expect("upload strand");
+        let tiles = Tiles::from_spans(SPANS);
+
+        let ctx = GpuContext::new().expect("ctx");
+        // Two calls on the same context: f32 then u8 (regrows the shared emission buffer),
+        // then f32 again (reuses it) — all must match the per-call free functions.
+        let ctx_f32_a = ctx.msv_nats(&fp, &dstrand, &tiles).expect("ctx f32");
+        let ctx_u8 = ctx.msv_u8_nats(&bp, &dstrand, &tiles).expect("ctx u8");
+        let ctx_f32_b = ctx.msv_nats(&fp, &dstrand, &tiles).expect("ctx f32 again");
+        let free_f32 = msv_nats_gpu(&fp, &dstrand, &tiles).expect("free f32");
+        let free_u8 = msv_u8_nats_gpu(&bp, &dstrand, &tiles).expect("free u8");
+
+        for i in 0..SPANS.len() {
+            assert_eq!(
+                ctx_f32_a[i].to_bits(),
+                free_f32[i].to_bits(),
+                "f32 span {i}"
+            );
+            assert_eq!(
+                ctx_f32_b[i].to_bits(),
+                free_f32[i].to_bits(),
+                "f32(reuse) span {i}"
+            );
+            assert_eq!(ctx_u8[i].to_bits(), free_u8[i].to_bits(), "u8 span {i}");
         }
     }
 }

@@ -310,98 +310,161 @@ static int env_int(const char* name, int def, int lo, int hi) {
     return x;
 }
 
+// A reusable device context: streams + per-stream device/pinned buffers + a growable emission-
+// table buffer, created ONCE and reused across many scoring calls (many models, many strands).
+// A per-call scan (the old wrappers) re-created all of this every call — cheap once, but on an
+// all-model scan (4k Rfam models) the stream/pinned setup dominated. The context hoists it out.
+// off/len/out buffers are sized to `chunk` at creation; the scratch (global-kernel fallback) and
+// emission buffers grow on demand as larger models appear.
+struct GpuCtx {
+    int          streams;
+    int          chunk;
+    cudaStream_t stream[MAX_STREAMS];
+    int*         d_off[MAX_STREAMS];
+    int*         d_len[MAX_STREAMS];
+    float*       d_out[MAX_STREAMS];
+    void*        d_scr[MAX_STREAMS];
+    size_t       scr_cap[MAX_STREAMS];   // bytes
+    int*         h_off[MAX_STREAMS];
+    int*         h_len[MAX_STREAMS];
+    float*       h_out[MAX_STREAMS];
+    void*        d_emit;                 // reusable emission table (msc/rbv), grows on demand
+    size_t       emit_cap;               // bytes
+};
+
+// Grow a device buffer to at least `need` bytes (free + realloc only when it must grow).
+static int ensure_dev(void** p, size_t* cap, size_t need) {
+    if (*cap >= need) return 0;
+    if (*p) cudaFree(*p);
+    *p = nullptr;
+    *cap = 0;
+    cudaError_t e = cudaMalloc(p, need);
+    if (e != cudaSuccess) return (int)e;
+    *cap = need;
+    return 0;
+}
+
+static void ctx_free_internal(GpuCtx* c) {
+    if (!c) return;
+    for (int s = 0; s < MAX_STREAMS; ++s) {
+        if (c->d_off[s]) cudaFree(c->d_off[s]);
+        if (c->d_len[s]) cudaFree(c->d_len[s]);
+        if (c->d_out[s]) cudaFree(c->d_out[s]);
+        if (c->d_scr[s]) cudaFree(c->d_scr[s]);
+        if (c->h_off[s]) cudaFreeHost(c->h_off[s]);
+        if (c->h_len[s]) cudaFreeHost(c->h_len[s]);
+        if (c->h_out[s]) cudaFreeHost(c->h_out[s]);
+        if (c->stream[s]) cudaStreamDestroy(c->stream[s]);
+    }
+    if (c->d_emit) cudaFree(c->d_emit);
+    free(c);
+}
+
+// Create a context. streams/chunk <= 0 fall back to ORNAMENT_GPU_STREAMS/CHUNK (else defaults).
+extern "C" int ornament_gpu_ctx_create(int streams, int chunk, void** out) {
+    *out = nullptr;
+    if (streams <= 0) streams = env_int("ORNAMENT_GPU_STREAMS", DEFAULT_STREAMS, 1, MAX_STREAMS);
+    if (streams > MAX_STREAMS) streams = MAX_STREAMS;
+    if (chunk <= 0) chunk = env_int("ORNAMENT_GPU_CHUNK", DEFAULT_CHUNK, 1, 1 << 24);
+
+    GpuCtx* c = (GpuCtx*)calloc(1, sizeof(GpuCtx));
+    if (!c) return (int)cudaErrorMemoryAllocation;
+    c->streams = streams;
+    c->chunk = chunk;
+
+    int rc = 0;
+    for (int s = 0; s < streams; ++s) {
+        if ((rc = (int)cudaStreamCreate(&c->stream[s]))) goto fail;
+        if ((rc = (int)cudaMalloc(&c->d_off[s], (size_t)chunk * sizeof(int)))) goto fail;
+        if ((rc = (int)cudaMalloc(&c->d_len[s], (size_t)chunk * sizeof(int)))) goto fail;
+        if ((rc = (int)cudaMalloc(&c->d_out[s], (size_t)chunk * sizeof(float)))) goto fail;
+        if ((rc = (int)cudaHostAlloc(&c->h_off[s], (size_t)chunk * sizeof(int), cudaHostAllocDefault))) goto fail;
+        if ((rc = (int)cudaHostAlloc(&c->h_len[s], (size_t)chunk * sizeof(int), cudaHostAllocDefault))) goto fail;
+        if ((rc = (int)cudaHostAlloc(&c->h_out[s], (size_t)chunk * sizeof(float), cudaHostAllocDefault))) goto fail;
+    }
+    *out = c;
+    return 0;
+fail:
+    ctx_free_internal(c);
+    return rc;
+}
+
+extern "C" int ornament_gpu_ctx_destroy(void* ctx) {
+    ctx_free_internal((GpuCtx*)ctx);
+    return 0;
+}
+
+// Streamed, double-buffered scoring using a context's buffers (no per-call alloc/free). The tile
+// batch is chunked and round-robined across the context's streams so chunk i+1's H2D, chunk i's
+// kernel, and chunk i-1's D2H overlap. `launch` enqueues the DP kernel for one chunk (agnostic to
+// f32 vs uint8; it captures the resident strand + emission table + profile scalars).
 template <typename Launch>
-static int msv_streamed_run(
+static int ctx_stream_run(
+    GpuCtx*      ctx,
     int          n,
     int          M,
-    size_t       elem_size,   // scratch bytes per DP cell (sizeof(float) or sizeof(uint8_t))
+    size_t       elem_size,   // scratch bytes per DP cell (global-kernel fallback only)
     const int*   starts,
     const int*   lengths,
     float*       out,
     Launch       launch)
 {
-    int rc = 0;
-    int streams   = env_int("ORNAMENT_GPU_STREAMS", DEFAULT_STREAMS, 1, MAX_STREAMS);
-    int chunk_env = env_int("ORNAMENT_GPU_CHUNK", DEFAULT_CHUNK, 1, 1 << 24);
-    int chunk = (n < chunk_env) ? n : chunk_env;
-
-    cudaStream_t stream[MAX_STREAMS]  = {0};
-    int*         d_off[MAX_STREAMS]   = {0};
-    int*         d_len[MAX_STREAMS]   = {0};
-    float*       d_out[MAX_STREAMS]   = {0};
-    void*        d_scr[MAX_STREAMS]   = {0};
-    int*         h_off[MAX_STREAMS]   = {0};
-    int*         h_len[MAX_STREAMS]   = {0};
-    float*       h_out[MAX_STREAMS]   = {0};
-    int          pend_off[MAX_STREAMS];
-    int          pend_n[MAX_STREAMS];
-    bool         pend[MAX_STREAMS]    = {false};
+    int streams = ctx->streams;
+    int chunk = (n < ctx->chunk) ? n : ctx->chunk;
 
     size_t scratch_bytes = (size_t)chunk * (M + 1) * elem_size;
     for (int s = 0; s < streams; ++s) {
-        CUDA_TRY(cudaStreamCreate(&stream[s]));
-        CUDA_TRY(cudaMalloc(&d_off[s], (size_t)chunk * sizeof(int)));
-        CUDA_TRY(cudaMalloc(&d_len[s], (size_t)chunk * sizeof(int)));
-        CUDA_TRY(cudaMalloc(&d_out[s], (size_t)chunk * sizeof(float)));
-        CUDA_TRY(cudaMalloc(&d_scr[s], scratch_bytes));
-        CUDA_TRY(cudaHostAlloc(&h_off[s], (size_t)chunk * sizeof(int),   cudaHostAllocDefault));
-        CUDA_TRY(cudaHostAlloc(&h_len[s], (size_t)chunk * sizeof(int),   cudaHostAllocDefault));
-        CUDA_TRY(cudaHostAlloc(&h_out[s], (size_t)chunk * sizeof(float), cudaHostAllocDefault));
+        int rc = ensure_dev(&ctx->d_scr[s], &ctx->scr_cap[s], scratch_bytes);
+        if (rc) return rc;
     }
+
+    int  pend_off[MAX_STREAMS];
+    int  pend_n[MAX_STREAMS];
+    bool pend[MAX_STREAMS] = {false};
 
     for (int off = 0; off < n; off += chunk) {
         int s = (off / chunk) % streams;
-        // Reclaim this stream slot: its previous chunk's scores are ready — copy them out.
         if (pend[s]) {
-            CUDA_TRY(cudaStreamSynchronize(stream[s]));
-            memcpy(out + pend_off[s], h_out[s], (size_t)pend_n[s] * sizeof(float));
+            cudaError_t e = cudaStreamSynchronize(ctx->stream[s]);
+            if (e != cudaSuccess) return (int)e;
+            memcpy(out + pend_off[s], ctx->h_out[s], (size_t)pend_n[s] * sizeof(float));
             pend[s] = false;
         }
         int cn = (n - off < chunk) ? (n - off) : chunk;
-        memcpy(h_off[s], starts + off,  (size_t)cn * sizeof(int));
-        memcpy(h_len[s], lengths + off, (size_t)cn * sizeof(int));
-        CUDA_TRY(cudaMemcpyAsync(d_off[s], h_off[s], (size_t)cn * sizeof(int),
-                                 cudaMemcpyHostToDevice, stream[s]));
-        CUDA_TRY(cudaMemcpyAsync(d_len[s], h_len[s], (size_t)cn * sizeof(int),
-                                 cudaMemcpyHostToDevice, stream[s]));
+        memcpy(ctx->h_off[s], starts + off,  (size_t)cn * sizeof(int));
+        memcpy(ctx->h_len[s], lengths + off, (size_t)cn * sizeof(int));
+        cudaError_t e;
+        if ((e = cudaMemcpyAsync(ctx->d_off[s], ctx->h_off[s], (size_t)cn * sizeof(int),
+                                 cudaMemcpyHostToDevice, ctx->stream[s]))) return (int)e;
+        if ((e = cudaMemcpyAsync(ctx->d_len[s], ctx->h_len[s], (size_t)cn * sizeof(int),
+                                 cudaMemcpyHostToDevice, ctx->stream[s]))) return (int)e;
         int threads = 128;
         int blocks  = (cn + threads - 1) / threads;
-        launch(stream[s], blocks, threads, d_off[s], d_len[s], cn, d_scr[s], d_out[s]);
-        CUDA_TRY(cudaGetLastError());
-        CUDA_TRY(cudaMemcpyAsync(h_out[s], d_out[s], (size_t)cn * sizeof(float),
-                                 cudaMemcpyDeviceToHost, stream[s]));
+        launch(ctx->stream[s], blocks, threads, ctx->d_off[s], ctx->d_len[s], cn,
+               ctx->d_scr[s], ctx->d_out[s]);
+        if ((e = cudaGetLastError())) return (int)e;
+        if ((e = cudaMemcpyAsync(ctx->h_out[s], ctx->d_out[s], (size_t)cn * sizeof(float),
+                                 cudaMemcpyDeviceToHost, ctx->stream[s]))) return (int)e;
         pend_off[s] = off;
         pend_n[s]   = cn;
         pend[s]     = true;
     }
 
-    // Drain the still-in-flight chunks.
     for (int s = 0; s < streams; ++s) {
         if (pend[s]) {
-            CUDA_TRY(cudaStreamSynchronize(stream[s]));
-            memcpy(out + pend_off[s], h_out[s], (size_t)pend_n[s] * sizeof(float));
-            pend[s] = false;
+            cudaError_t e = cudaStreamSynchronize(ctx->stream[s]);
+            if (e != cudaSuccess) return (int)e;
+            memcpy(out + pend_off[s], ctx->h_out[s], (size_t)pend_n[s] * sizeof(float));
         }
     }
-
-cleanup:
-    for (int s = 0; s < MAX_STREAMS; ++s) {
-        if (d_off[s]) cudaFree(d_off[s]);
-        if (d_len[s]) cudaFree(d_len[s]);
-        if (d_out[s]) cudaFree(d_out[s]);
-        if (d_scr[s]) cudaFree(d_scr[s]);
-        if (h_off[s]) cudaFreeHost(h_off[s]);
-        if (h_len[s]) cudaFreeHost(h_len[s]);
-        if (h_out[s]) cudaFreeHost(h_out[s]);
-        if (stream[s]) cudaStreamDestroy(stream[s]);
-    }
-    return rc;
+    return 0;
 }
 
-// f32 MSV over a resident strand. `d_strand` is a device pointer (from strand_upload); `starts`
-// are 0-based offsets into it and `lengths` the window lengths. msc: Kp*(M+1) floats (host). The
-// table is uploaded once; tiles are scored via the streamed double-buffer pipeline.
-extern "C" int ornament_gpu_msv_batch_resident(
+// f32 MSV over a resident strand, using a reusable context. msc: Kp*(M+1) floats (host); uploaded
+// into the context's growable emission buffer. `starts` are 0-based strand offsets, `lengths` the
+// window lengths.
+extern "C" int ornament_gpu_ctx_msv_f32(
+    void*          ctx_,
     const float*   msc,
     int            Kp,
     int            M,
@@ -412,30 +475,28 @@ extern "C" int ornament_gpu_msv_batch_resident(
     float*         out)
 {
     if (n <= 0) return 0;
-    int rc = 0;
-    float* d_msc = nullptr;
+    GpuCtx* ctx = (GpuCtx*)ctx_;
     size_t msc_bytes = (size_t)Kp * (M + 1) * sizeof(float);
+    int rc = ensure_dev(&ctx->d_emit, &ctx->emit_cap, msc_bytes);
+    if (rc) return rc;
+    cudaError_t e = cudaMemcpy(ctx->d_emit, msc, msc_bytes, cudaMemcpyHostToDevice);
+    if (e != cudaSuccess) return (int)e;
+    const float* d_msc = (const float*)ctx->d_emit;
 
-    CUDA_TRY(cudaMalloc(&d_msc, msc_bytes));
-    CUDA_TRY(cudaMemcpy(d_msc, msc, msc_bytes, cudaMemcpyHostToDevice));
-
-    rc = msv_streamed_run(
-        n, M, sizeof(float), starts, lengths, out,
+    return ctx_stream_run(
+        ctx, n, M, sizeof(float), starts, lengths, out,
         [=](cudaStream_t st, int blocks, int threads,
             const int* d_off, const int* d_len, int cn, void* d_scr, float* d_out) {
             msv_batch_kernel<<<blocks, threads, 0, st>>>(
                 d_msc, Kp, M, (const uint8_t*)d_strand, d_off, d_len, cn,
                 (float*)d_scr, d_out);
         });
-
-cleanup:
-    if (d_msc) cudaFree(d_msc);
-    return rc;
 }
 
-// Reduced-precision (uint8) MSV over a resident strand. rbv: Kp*(M+1) bytes (host); scale/base/
-// bias/tbm/tec from the host `ByteMsvProfile`. out: n floats (raw nats / +inf).
-extern "C" int ornament_gpu_msv_u8_batch_resident(
+// Reduced-precision (uint8) MSV over a resident strand, using a reusable context. rbv: Kp*(M+1)
+// bytes (host). Prefers the shared-memory kernel when it fits (ORNAMENT_GPU_SMEM=0 forces global).
+extern "C" int ornament_gpu_ctx_msv_u8(
+    void*          ctx_,
     const uint8_t* rbv,
     int            Kp,
     int            M,
@@ -451,21 +512,19 @@ extern "C" int ornament_gpu_msv_u8_batch_resident(
     float*         out)
 {
     if (n <= 0) return 0;
-    int rc = 0;
-    uint8_t* d_rbv = nullptr;
-    size_t rbv_bytes = (size_t)Kp * (M + 1) * sizeof(uint8_t);
+    GpuCtx* ctx = (GpuCtx*)ctx_;
+    size_t rbv_bytes = (size_t)Kp * (M + 1);
+    int rc = ensure_dev(&ctx->d_emit, &ctx->emit_cap, rbv_bytes);
+    if (rc) return rc;
+    cudaError_t e = cudaMemcpy(ctx->d_emit, rbv, rbv_bytes, cudaMemcpyHostToDevice);
+    if (e != cudaSuccess) return (int)e;
+    const uint8_t* d_rbv = (const uint8_t*)ctx->d_emit;
 
-    // Prefer the shared-memory kernel when its footprint fits (small/medium models); fall back to
-    // the global-scratch kernel for very long models. ORNAMENT_GPU_SMEM=0 forces global (for A/B).
-    // Declared before the first CUDA_TRY so the `goto cleanup` never bypasses their init.
     int use_smem = env_int("ORNAMENT_GPU_SMEM", 1, 0, 1);
     const size_t SMEM_LIMIT = 48 * 1024;   // sm_80 default per-block shared without opt-in
 
-    CUDA_TRY(cudaMalloc(&d_rbv, rbv_bytes));
-    CUDA_TRY(cudaMemcpy(d_rbv, rbv, rbv_bytes, cudaMemcpyHostToDevice));
-
-    rc = msv_streamed_run(
-        n, M, sizeof(uint8_t), starts, lengths, out,
+    return ctx_stream_run(
+        ctx, n, M, sizeof(uint8_t), starts, lengths, out,
         [=](cudaStream_t st, int blocks, int threads,
             const int* d_off, const int* d_len, int cn, void* d_scr, float* d_out) {
             size_t shmem = (size_t)(Kp + threads) * (M + 1);
@@ -479,8 +538,33 @@ extern "C" int ornament_gpu_msv_u8_batch_resident(
                     (const uint8_t*)d_strand, d_off, d_len, cn, (uint8_t*)d_scr, d_out);
             }
         });
+}
 
-cleanup:
-    if (d_rbv) cudaFree(d_rbv);
+// Per-call wrappers (no persistent context): spin up a temporary context, score, tear it down.
+// Kept for the simple one-shot API and the parity tests; a many-model scan should reuse a context.
+extern "C" int ornament_gpu_msv_batch_resident(
+    const float* msc, int Kp, int M, const void* d_strand,
+    const int* starts, const int* lengths, int n, float* out)
+{
+    if (n <= 0) return 0;
+    void* ctx = nullptr;
+    int rc = ornament_gpu_ctx_create(0, 0, &ctx);
+    if (rc) return rc;
+    rc = ornament_gpu_ctx_msv_f32(ctx, msc, Kp, M, d_strand, starts, lengths, n, out);
+    ornament_gpu_ctx_destroy(ctx);
+    return rc;
+}
+
+extern "C" int ornament_gpu_msv_u8_batch_resident(
+    const uint8_t* rbv, int Kp, int M, float scale_b, int base_b, int bias_b, int tbm_b, int tec_b,
+    const void* d_strand, const int* starts, const int* lengths, int n, float* out)
+{
+    if (n <= 0) return 0;
+    void* ctx = nullptr;
+    int rc = ornament_gpu_ctx_create(0, 0, &ctx);
+    if (rc) return rc;
+    rc = ornament_gpu_ctx_msv_u8(ctx, rbv, Kp, M, scale_b, base_b, bias_b, tbm_b, tec_b,
+                                 d_strand, starts, lengths, n, out);
+    ornament_gpu_ctx_destroy(ctx);
     return rc;
 }

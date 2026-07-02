@@ -28,10 +28,13 @@ See [`DESIGN.md`](DESIGN.md) for where the work is heaviest and the producer/con
 - [x] **Validated across the full Rfam CM collection** (`examples/sweep_rfam.rs`): 4227/4227 models
       scored, 0 parity failures (max M=3401); 4124 (97.6%) fit shared-mem, 103 (M>336) fall to
       global — and those 103 eat ~70% of kernel time. See DESIGN.md.
-- [ ] Warp-per-window for long models — the 103 fallback models are the measured bottleneck.
-- [ ] Reusable device context — hoist stream/pinned-buffer setup out of the per-call path so
-      many-model scans don't pay allocation per model.
+- [x] Reusable device context (`GpuContext`): streams + buffers created once, reused across models
+      — ~2× the shared-mem buckets in the Rfam sweep (M<100: 11→27 M tiles/s, ≈ single-model
+      ceiling). Old per-call `*_batch_resident` are now thin temp-context shims. See DESIGN.md.
+- [ ] **Warp-per-window for long models** — with setup removed, the 103 M>336 fallback models now
+      eat 82% of sweep kernel time. THE remaining bottleneck.
 - [ ] Viterbi + Forward kernels (rest of the cascade).
+- [ ] Wire `GpuContext` into the `ornament-scfg` scan pipeline as an optional backend.
 - [ ] Wire into `ornament-scfg`'s scan pipeline as an optional backend.
 - [ ] Intra-DP (warp-per-window) for long models; multi-model batching.
 

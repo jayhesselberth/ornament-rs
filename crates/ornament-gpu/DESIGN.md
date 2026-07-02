@@ -89,11 +89,26 @@ Stream A/B (chunk 32k) and chunk sweep (2 streams):
   0.13 / 0.03 M tiles/s, ~50–100× slower than the shared-mem buckets. This is the concrete,
   data-driven case for **warp-per-window** (fix #3 extension): make large models use shared memory
   cooperatively instead of the global fallback.
-- *Caveat:* per-bucket tiles/s here are **setup-dominated** — the sweep scores a small (20k-tile)
-  batch per model and each call re-allocates its streams + pinned buffers, which doesn't amortize.
-  The kernel's true ceiling is `bench_msv`'s 418 G cells/s. Next infra step: hoist the stream/
-  pinned-buffer setup out of the per-call path (a reusable device context) so many-model scans
-  don't pay it per model.
+### Reusable device context (`GpuContext`) — removes per-model setup
+
+The first sweep's per-model throughput was setup-dominated (each scoring call created + destroyed
+its streams/pinned buffers). `GpuContext` creates them once and reuses them across all models.
+Re-running the sweep with one shared context (A30, same 4227 models):
+
+| bucket (M) | per-call tiles/s | reusable-context tiles/s |
+|-----------|------------------|--------------------------|
+| M<100 | 11.3 M | **27.0 M** |
+| M100-199 | 8.5 M | **16.2 M** |
+| M200-335 | 6.1 M | **9.2 M** |
+| M336-999 (global) | 0.13 M | 0.14 M |
+| M≥1000 (global) | 0.03 M | 0.03 M |
+
+- The shared-mem buckets ≈ **2× faster** with the context, and M<100 (27 M tiles/s) is now close to
+  `bench_msv`'s 29 M tiles/s single-model ceiling — i.e. setup overhead is gone and we're seeing the
+  real kernel throughput. This is the path many-model scans (and pipeline integration) must use.
+- **The 103 global-fallback models (M>336) now consume 82% of total kernel time (19.5 s of 23.6 s).**
+  With setup removed, the long-model fallback is unambiguously *the* remaining bottleneck →
+  warp-per-window (fix #3).
 
 ### Level 2 — on-device funnel (stream compaction)
 - MSV kernel writes a survivor mask → compact → Viterbi kernel consumes only survivors → compact

@@ -29,7 +29,7 @@ fn env_usize(name: &str, def: usize) -> usize {
 fn main() {
     use ornament_alphabet::Alphabet;
     use ornament_gpu::{
-        msv_u8_nats_gpu, nats_to_bits, ByteMsvProfile, DeviceStrand, FlatProfile, Tiles,
+        nats_to_bits, ByteMsvProfile, DeviceStrand, FlatProfile, GpuContext, Tiles,
     };
     use ornament_hmm::profile::{bg_freqs, P7Profile};
     use ornament_hmm::MsvProfile;
@@ -76,6 +76,9 @@ fn main() {
         .collect();
     let strand = abc.digitize(&seq).expect("digitize");
     let dstrand = DeviceStrand::upload(&strand).expect("upload strand");
+    // One reusable context for every model — hoists the stream/pinned-buffer setup out of the
+    // per-model path (that setup dominated the earlier per-call sweep).
+    let ctx = GpuContext::new().expect("gpu context");
 
     // Tile the strand once (length 2W, step W) — reused for every model.
     let tile = (2 * w).max(1);
@@ -142,7 +145,7 @@ fn main() {
         // One timed batch per model (the per-call stream/pinned setup makes extra reps costly at
         // 4k models); the first model's call also warms up the kernel JIT.
         let t0 = Instant::now();
-        let gpu = match msv_u8_nats_gpu(&bp, &dstrand, &tiles) {
+        let gpu = match ctx.msv_u8_nats(&bp, &dstrand, &tiles) {
             Ok(o) => o,
             Err(e) => {
                 eprintln!("model {} ({}): gpu error {e}", mi, cm.name);
