@@ -154,10 +154,34 @@ Per-kernel throughput at 64 Mnt / 640k tiles, tRNA-scale model (M≈71):
   global-memory penalty (6 DP rows hit with a serial dependency at ~400-cycle latency). **Concrete
   consequence: do NOT wire the current global Viterbi into the pipeline — it would regress vs the
   CPU striped Viterbi.** It needs the shared-memory / warp-per-window rewrite first.
-- **ncu (SpeedOfLight/Occupancy) is blocked by `ERR_NVGPUCTRPERM`** on this cluster (perf counters
-  are admin-locked; fix = `NVreg_RestrictProfilingToAdminUsers=0` on the GPU nodes). Until then,
-  `print_kernel_info` (`BENCH_INFO=1`) reports registers/thread + theoretical occupancy via the
-  counter-free CUDA occupancy API as a substitute (tRNA M=71, block=128):
+**ncu SpeedOfLight (A30, counters unlocked via `NVreg_RestrictProfilingToAdminUsers=0`; 20k-tile
+batch, one launch, tRNA M=71).** Both kernels profiled at the *same* grid, so the contrast is
+apples-to-apples:
+
+| metric | MSV uint8 (shared-mem) | Viterbi f32 (global) |
+|--------|------------------------|----------------------|
+| Duration | **1.03 ms** | **171.7 ms** (167×) |
+| Compute (SM) throughput | 50% | **2.8%** (SMs stalled) |
+| Memory-pipe throughput | 52% | 42% |
+| DRAM throughput | **0.23%** | 8.0% |
+| L2 throughput | 5.9% | **42%** |
+
+- **MSV shared-mem is exactly what we wanted:** ~0.23% DRAM means it touches global memory almost
+  *not at all* — the DP row + emission table really do live in shared memory — and it's balanced
+  ~50/50 compute vs shared-pipe. It's near its algorithmic roofline; no cheap win left.
+- **Viterbi is quantitatively confirmed memory-latency-bound:** 2.8% compute (SMs idle, waiting),
+  42% L2 throughput (its 6 global DP rows are serviced from L2 but the *dependent-load latency*
+  stalls the SMs), 167× slower than MSV for identical work. The fix is unambiguous — **move the DP
+  rows into shared memory** (make Viterbi look like MSV: high compute, ~0 DRAM/L2). This is the
+  same lever that gave MSV its speed.
+- **New actionable finding — the batch underfills the GPU.** ncu flags both kernels: *"grid too
+  small to fill the device"* — 20k tiles = only **157 blocks / 0.2–0.4 waves** on the A30's 56 SMs,
+  so achieved occupancy is 17% purely from starvation (this is why 20k tiles gives 197 G cells/s but
+  640k gives 436). **Implication for the all-model scan:** don't launch a tiny per-(small-model,
+  short-strand) batch — aggregate tiles across models/strands per launch to fill the device.
+
+`print_kernel_info` (`BENCH_INFO=1`) also reports registers/thread + theoretical occupancy via the
+counter-free CUDA occupancy API (works even when counters are locked), tRNA M=71, block=128:
 
   | kernel | regs/thr | dyn smem | active blk/SM | theoretical occ |
   |--------|----------|----------|---------------|-----------------|
