@@ -264,11 +264,14 @@ where
     // Per-model setup: a glocal-configured copy + emit map + QDB bands for the per-hit model-span
     // alignment. (The p7 pipeline computes its own scan bands internally; `align_bands` are the
     // glocal bands that bound the alignment over `align_cm`.)
+    // `align_bands` is NOT precomputed here: it's only needed to align a model's *hits*, and on a
+    // given genome almost every model produces zero hits. Computing QDB bands (an O(M·W·band) DP)
+    // eagerly for all ~4227 models was the dominant per-model setup cost; it's now computed lazily,
+    // once per model that actually produces a hit (see the scan loop below).
     struct Prepared {
         cm: Cm,
         /// Glocal-configured copy used only for per-hit alignment (see `scan_native`).
         align_cm: Cm,
-        align_bands: QdbBands,
         w_max: usize,
         emap: EmitMap,
     }
@@ -278,13 +281,11 @@ where
             let mut align_cm = cm.clone();
             configure_scores(&mut align_cm);
             configure_local(&mut cm); // cmsearch/cmscan default (local mode)
-            let align_bands = calc_qdb_bands(&align_cm, QdbBands::DEFAULT_BETA);
             let w_max = cm.w as usize;
             let emap = EmitMap::build(&cm);
             Prepared {
                 cm,
                 align_cm,
-                align_bands,
                 w_max,
                 emap,
             }
@@ -341,6 +342,8 @@ where
         .map_err(|e| anyhow!("pipeline failed for model {}: {e}", p.cm.name))?;
 
         let mut hits = Vec::new();
+        // Lazily compute this model's alignment bands on the first reportable hit (see Prepared).
+        let mut align_bands: Option<QdbBands> = None;
         for h in raw {
             if let Some(ev) = h.evalue {
                 if ev > e_value {
@@ -351,12 +354,14 @@ where
                 Strand::Plus => '+',
                 Strand::Minus => '-',
             };
+            let ab = align_bands
+                .get_or_insert_with(|| calc_qdb_bands(&p.align_cm, QdbBands::DEFAULT_BETA));
             let (mdl_from, mdl_to) = hit_model_span(
                 &p.align_cm,
                 dsq,
                 Some(rc.as_slice()),
                 &p.emap,
-                &p.align_bands,
+                ab,
                 h.i,
                 h.j,
                 h.strand,
@@ -417,10 +422,11 @@ pub fn scan_native_aligned<P: AsRef<Path>, Q: AsRef<Path>>(
         })
         .collect();
 
+    // `align_bands` is computed lazily per hitting model (see the batch variant); eager QDB banding
+    // for all ~4227 models was the dominant setup cost and is wasted for the ~all that never hit.
     struct Prepared {
         cm: Cm,
         align_cm: Cm,
-        align_bands: QdbBands,
         w_max: usize,
         emap: EmitMap,
         rf: Vec<char>,
@@ -432,14 +438,12 @@ pub fn scan_native_aligned<P: AsRef<Path>, Q: AsRef<Path>>(
             let mut align_cm = cm.clone();
             configure_scores(&mut align_cm);
             configure_local(&mut cm);
-            let align_bands = calc_qdb_bands(&align_cm, QdbBands::DEFAULT_BETA);
             let w_max = cm.w as usize;
             let emap = EmitMap::build(&cm);
             let (rf, ss_cons) = consensus_annotation(&cm, &emap);
             Prepared {
                 cm,
                 align_cm,
-                align_bands,
                 w_max,
                 emap,
                 rf,
@@ -493,18 +497,22 @@ pub fn scan_native_aligned<P: AsRef<Path>, Q: AsRef<Path>>(
             .map_err(|e| anyhow!("pipeline failed for model {}: {e}", p.cm.name))?;
 
             let mut rows = Vec::new();
+            // Lazily compute this model's alignment bands on the first reportable hit (see Prepared).
+            let mut align_bands: Option<QdbBands> = None;
             for h in raw {
                 if let Some(ev) = h.evalue {
                     if ev > e_value {
                         continue;
                     }
                 }
+                let ab = align_bands
+                    .get_or_insert_with(|| calc_qdb_bands(&p.align_cm, QdbBands::DEFAULT_BETA));
                 let (aln, seq) = align_hit_window(
                     &p.align_cm,
                     dsq,
                     Some(rc.as_slice()),
                     &p.emap,
-                    &p.align_bands,
+                    ab,
                     h.i,
                     h.j,
                     h.strand,
