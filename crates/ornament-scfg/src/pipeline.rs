@@ -90,11 +90,89 @@ impl PipelineStats {
     }
 }
 
+/// Precomputed, record-independent search state for one CM: the p7 filter cascade profiles
+/// (MSV / Viterbi / Forward) and the query-dependent CM bands. All of these depend only on the
+/// model (and its window `W`) — never on the target sequence — so building them once and reusing
+/// across every record and both strands removes the per-(model × record) rebuild that otherwise
+/// dominates a many-model scan's setup. [`cm_pipeline_search`] builds one internally per call;
+/// [`cm_pipeline_search_prepared`] consumes a shared one so a scan can hoist the build to per-model.
+pub struct PreparedFilters {
+    hmm: P7Hmm,
+    msv: msvfilter::Profile,
+    vit: vitfilter::Profile,
+    filt: fwdfilter::Profile,
+    nj: f32,
+    bands: QdbBands,
+}
+
+impl PreparedFilters {
+    /// Build the p7 filter cascade + CM QDB bands for `cm` from scratch: parse the embedded filter
+    /// HMM and compute the query-dependent bands (`beta = QdbBands::DEFAULT_BETA`), then stripe the
+    /// filter profiles. Use [`PreparedFilters::from_parts`] when the HMM and bands are already
+    /// available (e.g. loaded from a pressed DB) to skip the fp7 parse and the O(#B·W²) band calc.
+    pub fn build(cm: &Cm) -> Result<PreparedFilters, InfernalError> {
+        let hmm = parse_filter_hmm(cm)?;
+        // Query-dependent bands for the CM stage, computed once and shared across every survivor
+        // window (and both strands). A safe `beta` keeps every real hit's optimal parse in-band, so
+        // the banded scan reports identical hits to the unbanded one — just faster.
+        let bands = calc_qdb_bands(cm, QdbBands::DEFAULT_BETA);
+        PreparedFilters::from_parts(cm, hmm, bands)
+    }
+
+    /// Build the striped filter profiles for `cm` from an already-parsed filter `hmm` and
+    /// precomputed CM `bands`. The SIMD-striped layout is target-CPU-dependent (so it is rebuilt
+    /// here rather than persisted), but the two expensive, portable inputs — the parsed HMM and the
+    /// QDB bands — are supplied by the caller, letting a pressed DB skip recomputing them per run.
+    pub fn from_parts(
+        cm: &Cm,
+        hmm: P7Hmm,
+        bands: QdbBands,
+    ) -> Result<PreparedFilters, InfernalError> {
+        // Configure the p7 Forward filter once. The per-tile sweep clones each profile cheaply and
+        // resets only its length model, so the length-independent base is shared read-only.
+        let bg = bg_freqs(hmm.k);
+        // Nominal length 1: the striped profiles' length model is overwritten per tile, so this
+        // value is never scored against — the base profile is length-independent by construction.
+        let prof = P7Profile::config_local(&hmm, cm.abc.as_ref(), &bg, 1);
+        let nj = prof.nj;
+        let filt = fwdfilter::build(&prof);
+        let msv = msvfilter::build(&prof); // cheap uint8 MSV prefilter (built once)
+        let vit = vitfilter::build(&prof); // striped Viterbi filter (middle cascade stage, built once)
+        Ok(PreparedFilters {
+            hmm,
+            msv,
+            vit,
+            filt,
+            nj,
+            bands,
+        })
+    }
+}
+
 /// Accelerated CYK search via the Forward-filter windowing pipeline. Drop-in for
 /// [`crate::search::cyk_search`] (set `params.do_inside = false`), returning the same hits
 /// above `cutoff_bits` plus a [`PipelineStats`] summary. Honours the CM's glocal/local mode.
+///
+/// This builds the model's [`PreparedFilters`] on every call; a scan over many records should
+/// build them once with [`PreparedFilters::build`] and call [`cm_pipeline_search_prepared`].
 pub fn cm_pipeline_search(
     cm: &Cm,
+    dsq: &[Dsq],
+    w_max: usize,
+    cutoff_bits: f32,
+    params: PipelineParams,
+) -> Result<(Vec<Hit>, PipelineStats), InfernalError> {
+    let prepared = PreparedFilters::build(cm)?;
+    cm_pipeline_search_prepared(cm, &prepared, dsq, w_max, cutoff_bits, params)
+}
+
+/// [`cm_pipeline_search`] with the record-independent [`PreparedFilters`] supplied by the caller,
+/// so a many-record scan builds the p7 filter cascade + CM bands once per model instead of once
+/// per (model × record) pair. Behaviour is identical to [`cm_pipeline_search`] given the matching
+/// `prepared = PreparedFilters::build(cm)`.
+pub fn cm_pipeline_search_prepared(
+    cm: &Cm,
+    prepared: &PreparedFilters,
     dsq: &[Dsq],
     w_max: usize,
     cutoff_bits: f32,
@@ -116,20 +194,6 @@ pub fn cm_pipeline_search(
         return Ok((Vec::new(), stats));
     }
 
-    // Configure the p7 Forward filter once. On x86_64 this builds the striped-SSE odds-space
-    // profile (the per-tile sweep clones it cheaply and resets only the length model); the
-    // length-independent base is shared read-only across both strands.
-    let hmm = parse_filter_hmm(cm)?;
-    let bg = bg_freqs(hmm.k);
-    let prof = P7Profile::config_local(&hmm, cm.abc.as_ref(), &bg, l);
-    let nj = prof.nj;
-    let filt = fwdfilter::build(&prof);
-    let msv = msvfilter::build(&prof); // cheap uint8 MSV prefilter (built once)
-    let vit = vitfilter::build(&prof); // striped Viterbi filter (middle cascade stage, built once)
-                                       // Query-dependent bands for the CM stage, computed once and shared across every survivor
-                                       // window (and both strands). A safe `beta` keeps every real hit's optimal parse in-band, so
-                                       // the banded scan reports identical hits to the unbanded one — just faster.
-    let bands = calc_qdb_bands(cm, QdbBands::DEFAULT_BETA);
     let w = w_max.min(l).max(1);
     let searched = 2.0 * l as f64;
     let do_inside = params.do_inside;
@@ -145,39 +209,71 @@ pub fn cm_pipeline_search(
     // strands run concurrently via `rayon::join`. Output is order-independent: hits are sorted
     // below, so the result is identical regardless of thread count.
     let plus = || {
-        let (surv, nw) = strand_survivors(&msv, &vit, &filt, nj, &hmm, dsq, w, &params);
+        let (surv, nw) = strand_survivors(
+            &prepared.msv,
+            &prepared.vit,
+            &prepared.filt,
+            prepared.nj,
+            &prepared.hmm,
+            dsq,
+            w,
+            &params,
+        );
         let hits: Vec<Hit> = surv
             .par_iter()
             .flat_map_iter(|&(s, e)| {
                 let sub = subseq(dsq, s, e);
-                scan_subseq(cm, &sub, w_max, cutoff_bits, do_inside, Some(&bands))
-                    .into_iter()
-                    .map(move |(score, i, j)| Hit {
-                        score,
-                        evalue: evalue(cm, mode, score, searched),
-                        i: i + s - 1,
-                        j: j + s - 1,
-                        strand: Strand::Plus,
-                    })
+                scan_subseq(
+                    cm,
+                    &sub,
+                    w_max,
+                    cutoff_bits,
+                    do_inside,
+                    Some(&prepared.bands),
+                )
+                .into_iter()
+                .map(move |(score, i, j)| Hit {
+                    score,
+                    evalue: evalue(cm, mode, score, searched),
+                    i: i + s - 1,
+                    j: j + s - 1,
+                    strand: Strand::Plus,
+                })
             })
             .collect();
         (surv, nw, hits)
     };
     let minus = || {
-        let (surv, nw) = strand_survivors(&msv, &vit, &filt, nj, &hmm, &rc, w, &params);
+        let (surv, nw) = strand_survivors(
+            &prepared.msv,
+            &prepared.vit,
+            &prepared.filt,
+            prepared.nj,
+            &prepared.hmm,
+            &rc,
+            w,
+            &params,
+        );
         let hits: Vec<Hit> = surv
             .par_iter()
             .flat_map_iter(|&(s, e)| {
                 let sub = subseq(&rc, s, e);
-                scan_subseq(cm, &sub, w_max, cutoff_bits, do_inside, Some(&bands))
-                    .into_iter()
-                    .map(move |(score, i, j)| Hit {
-                        score,
-                        evalue: evalue(cm, mode, score, searched),
-                        i: l - (i + s - 1) + 1,
-                        j: l - (j + s - 1) + 1,
-                        strand: Strand::Minus,
-                    })
+                scan_subseq(
+                    cm,
+                    &sub,
+                    w_max,
+                    cutoff_bits,
+                    do_inside,
+                    Some(&prepared.bands),
+                )
+                .into_iter()
+                .map(move |(score, i, j)| Hit {
+                    score,
+                    evalue: evalue(cm, mode, score, searched),
+                    i: l - (i + s - 1) + 1,
+                    j: l - (j + s - 1) + 1,
+                    strand: Strand::Minus,
+                })
             })
             .collect();
         (surv, nw, hits)
@@ -321,7 +417,7 @@ fn measure_strand(
 }
 
 /// Parse the CM's embedded HMMER3/f filter HMM (`fp7`), erroring if it is absent.
-fn parse_filter_hmm(cm: &Cm) -> Result<P7Hmm, InfernalError> {
+pub(crate) fn parse_filter_hmm(cm: &Cm) -> Result<P7Hmm, InfernalError> {
     let text = cm
         .fp7_text
         .as_deref()

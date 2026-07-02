@@ -17,6 +17,7 @@ pub mod emitmap;
 pub mod evalues;
 pub mod model;
 pub mod pipeline;
+pub mod press;
 pub mod qdb;
 pub mod search;
 
@@ -27,8 +28,12 @@ pub use emitmap::EmitMap;
 pub use evalues::{evalue, score_to_evalue, SearchMode};
 pub use model::{Cm, ExpInfo};
 pub use pipeline::{
-    cm_pipeline_inside, cm_pipeline_search, measure_filter_prune_rates, FilterPruneStats,
-    PipelineParams, PipelineStats,
+    cm_pipeline_inside, cm_pipeline_search, cm_pipeline_search_prepared,
+    measure_filter_prune_rates, FilterPruneStats, PipelineParams, PipelineStats, PreparedFilters,
+};
+pub use press::{
+    default_press_path, load_pressed, peek_header, press_cm_file, PressHeader, PressedDb,
+    PressedModel, PRESS_EXT,
 };
 pub use qdb::{calc_qdb_bands, QdbBands};
 pub use search::{

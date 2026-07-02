@@ -14,7 +14,7 @@
 pub mod alphabet;
 pub mod sq;
 
-pub use alphabet::{Alphabet, AlphabetType, Dsq, ModSpec, ModSymbol};
+pub use alphabet::{Alphabet, AlphabetDescriptor, AlphabetType, Dsq, ModSpec, ModSymbol};
 pub use sq::{read_fasta, read_fasta_from, Sequence};
 
 use thiserror::Error;

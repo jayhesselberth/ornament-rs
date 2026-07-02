@@ -15,6 +15,7 @@ bench = false
 ornament-alphabet = { workspace = true }
 ornament-stats = { workspace = true }
 thiserror = { workspace = true }
+serde = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }

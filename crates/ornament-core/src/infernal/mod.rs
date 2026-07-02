@@ -12,7 +12,7 @@ pub mod stockholm;
 
 pub use cmstat::{cmstat, CmStat};
 pub use native::{
-    align_sequences, scan_native, scan_native_aligned, scan_native_multi,
+    align_sequences, press_cm, scan_native, scan_native_aligned, scan_native_multi,
     scan_native_multi_streaming,
 };
 pub use parser::{CMAlignment, CMHit};

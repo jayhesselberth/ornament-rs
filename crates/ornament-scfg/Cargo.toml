@@ -17,9 +17,12 @@ ornament-hmm = { workspace = true }
 thiserror = { workspace = true }
 rayon = { workspace = true }
 flate2 = { workspace = true }
+serde = { workspace = true }
+postcard = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
+tempfile = { workspace = true }
 
 [[bench]]
 name = "cm_search"

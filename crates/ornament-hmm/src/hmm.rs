@@ -6,6 +6,8 @@
 //! insert-emission line, and a 7-value transition line
 //! (`m→m m→i m→d i→m i→i d→m d→d`), preceded by a COMPO line and the node-0 (begin) block.
 
+use serde::{Deserialize, Serialize};
+
 use crate::HmmerError;
 
 /// Transition indices into the 7-value per-node transition array.
@@ -20,14 +22,14 @@ pub mod tr {
 }
 
 /// Gumbel/exponential calibration for a filter stage (`mu`, `lambda`).
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct EvParam {
     pub mu: f64,
     pub lambda: f64,
 }
 
 /// A Plan7 profile HMM (`P7_HMM`), parameters in probability space.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct P7Hmm {
     pub name: String,
     pub acc: Option<String>,

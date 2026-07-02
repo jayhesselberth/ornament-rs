@@ -9,5 +9,6 @@ authors.workspace = true
 [dependencies]
 thiserror = { workspace = true }
 noodles-fasta = { workspace = true }
+serde = { workspace = true }
 
 [dev-dependencies]

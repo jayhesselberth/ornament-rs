@@ -14,8 +14,10 @@ use std::path::Path;
 use ornament_alphabet::Dsq;
 use ornament_scfg::model::nd;
 use ornament_scfg::{
-    align_glocal_banded, calc_qdb_bands, cm_pipeline_search, configure_local, configure_scores,
-    parse_cm_file, parse_cm_records_file, Alignment, Cm, EmitMap, PipelineParams, QdbBands, Strand,
+    align_glocal_banded, calc_qdb_bands, cm_pipeline_search_prepared, configure_local,
+    configure_scores, default_press_path, load_pressed, parse_cm_file, parse_cm_records_file,
+    peek_header, press_cm_file, Alignment, Cm, EmitMap, PipelineParams, PreparedFilters, QdbBands,
+    Strand,
 };
 
 use super::stockholm::{AlignedRow, ModelMsa, ResCell};
@@ -49,6 +51,24 @@ fn estimated_scan_bytes(cm: &ornament_scfg::Cm, w_max: usize) -> usize {
     cells.saturating_mul(4)
 }
 
+/// Build a pressed CM database ("press", the `cmpress` analog) for `cm_path`: parse and fully
+/// prepare every model once (configure + QDB bands + filter HMM) and serialize it to `out_path`,
+/// defaulting to `<cm_path>.orm`. Returns the model count and the path written. `scan`/`search`
+/// then load the sidecar and skip that per-run preparation. Refuses to overwrite unless `force`.
+pub fn press_cm<P: AsRef<Path>>(
+    cm_path: P,
+    out_path: Option<&Path>,
+    force: bool,
+) -> Result<(usize, std::path::PathBuf)> {
+    let cm_path = cm_path.as_ref();
+    let out = out_path
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| default_press_path(cm_path));
+    let n = press_cm_file(cm_path, &out, force)
+        .map_err(|e| anyhow!("failed to press {}: {e}", cm_path.display()))?;
+    Ok((n, out))
+}
+
 /// Scan a FASTA file for CM hits using the native `ornament-scfg` engine.
 ///
 /// `e_value` is the maximum E-value reported (mirrors `cmsearch -E`); hits from
@@ -62,31 +82,57 @@ pub fn scan_native<P: AsRef<Path>, Q: AsRef<Path>>(
     let cm_path = cm_path.as_ref();
     let fasta = fasta.as_ref();
 
-    let mut cm = parse_cm_file(cm_path)
-        .map_err(|e| anyhow!("failed to parse CM {}: {e}", cm_path.display()))?;
-    // Glocal copy for per-hit alignment: `align_glocal` traces ROOT->END and needs an
-    // un-localized model. The local model zeroes ROOT transitions (entry only via local
-    // begins), so a glocal traceback over it would emit an all-insert parse (no match columns).
-    let mut align_cm = cm.clone();
-    configure_scores(&mut align_cm);
-    configure_local(&mut cm); // cmsearch default (local mode)
+    // Prepare the single model, from a pressed DB when `cm_path` is one (skipping parse + configure
+    // + QDB band computation) or by parsing the `.cm` otherwise. `search` is single-model, so the
+    // first model is used (a warning fires if a pressed collection holds more).
+    //
+    // `cm` is the local scan model; `align_cm` is the glocal copy for per-hit model-span recovery
+    // (`align_glocal` traces ROOT->END and needs an un-localized model — the local model zeroes
+    // ROOT transitions). `align_bands` bound the alignment over `align_cm`; `emap` recovers each
+    // hit's consensus-column span; `prepared` is the record-independent p7 filter cascade + scan
+    // bands, built once and shared across every record's `cm_pipeline_search_prepared` call.
+    let (cm, align_cm, align_bands, emap, w_max, prepared) = if peek_header(cm_path).is_some() {
+        tracing::debug!("using pressed CM database {}", cm_path.display());
+        let mut db = load_pressed(cm_path)
+            .map_err(|e| anyhow!("failed to load pressed DB {}: {e}", cm_path.display()))?;
+        if db.models.is_empty() {
+            return Err(anyhow!(
+                "pressed DB {} contains no models",
+                cm_path.display()
+            ));
+        }
+        if db.models.len() > 1 {
+            tracing::warn!(
+                "pressed DB {} has {} models; search uses the first",
+                cm_path.display(),
+                db.models.len()
+            );
+        }
+        let pm = db.models.swap_remove(0);
+        let filters = pm
+            .prepared_filters()
+            .map_err(|e| anyhow!("failed to prepare filters for {}: {e}", pm.cm.name))?;
+        let emap = EmitMap::build(&pm.cm);
+        (pm.cm, pm.align_cm, pm.align_bands, emap, pm.w_max, filters)
+    } else {
+        let mut cm = parse_cm_file(cm_path)
+            .map_err(|e| anyhow!("failed to parse CM {}: {e}", cm_path.display()))?;
+        let mut align_cm = cm.clone();
+        configure_scores(&mut align_cm);
+        configure_local(&mut cm); // cmsearch default (local mode)
+        let w_max = cm.w as usize;
+        let emap = EmitMap::build(&cm);
+        let align_bands = calc_qdb_bands(&align_cm, QdbBands::DEFAULT_BETA);
+        let filters = PreparedFilters::build(&cm)
+            .map_err(|e| anyhow!("failed to prepare filters for {}: {e}", cm.name))?;
+        (cm, align_cm, align_bands, emap, w_max, filters)
+    };
 
     let records = ornament_alphabet::read_fasta(fasta)
         .map_err(|e| anyhow!("failed to read FASTA {}: {e}", fasta.display()))?;
 
-    let w_max = cm.w as usize;
     let query_name = cm.name.clone();
     let query_acc = cm.acc.clone();
-
-    // Emit map (node -> consensus column): built once, used to recover each hit's matched
-    // consensus-column span (`mdl from`/`mdl to`) from its glocal traceback.
-    let emap = EmitMap::build(&cm);
-
-    // Query-dependent bands for the per-hit model-span alignment. The p7-filtered
-    // `cm_pipeline_search` computes its own scan bands internally; `align_bands` (from the glocal
-    // `align_cm`) bound the alignment over that glocal model — they must match the model the parse
-    // runs over.
-    let align_bands = calc_qdb_bands(&align_cm, QdbBands::DEFAULT_BETA);
 
     // Records are independent scans — search them in parallel. The per-record collect is
     // order-preserving, so the flattened result is identical regardless of thread count.
@@ -98,9 +144,15 @@ pub fn scan_native<P: AsRef<Path>, Q: AsRef<Path>>(
                 .digitize(&rec.seq)
                 .map_err(|e| anyhow!("failed to digitize sequence {}: {e}", rec.name))?;
 
-            let (raw, _stats) =
-                cm_pipeline_search(&cm, &dsq, w_max, REPORTING_BITS, PipelineParams::default())
-                    .map_err(|e| anyhow!("pipeline failed for {}: {e}", cm.name))?;
+            let (raw, _stats) = cm_pipeline_search_prepared(
+                &cm,
+                &prepared,
+                &dsq,
+                w_max,
+                REPORTING_BITS,
+                PipelineParams::default(),
+            )
+            .map_err(|e| anyhow!("pipeline failed for {}: {e}", cm.name))?;
             // Reverse-complement the record once if any minus-strand hit needs its model span.
             let rc = maybe_revcomp(&cm, &dsq, &raw, &rec.name)?;
 
@@ -220,10 +272,128 @@ where
     Ok(count.load(Ordering::Relaxed))
 }
 
-/// Shared core: parse every model + memory-guard + per-model prep, then scan the feasible
-/// model × record product in parallel, handing each pair's hits to `sink` as it completes. `sink`
-/// is called once per scanned pair (possibly with an empty vec filtered by the callers) and must be
-/// thread-safe.
+/// Per-model setup shared by the multi-model scan path: the local scan model, a glocal alignment
+/// model + its bands, the emit map, and the record-independent p7 filter cascade + CM scan bands.
+/// `filters` is `None` for models the memory guard skipped (never scanned, so never built — which
+/// also avoids paying their oversized QDB-band cost).
+struct Prepared {
+    cm: Cm,
+    /// Glocal-configured copy used only for per-hit alignment (see `scan_native`).
+    align_cm: Cm,
+    align_bands: QdbBands,
+    w_max: usize,
+    emap: EmitMap,
+    filters: Option<PreparedFilters>,
+}
+
+/// Whether `cm` fits the scanning-DP memory budget; warns (naming the model) when it does not, so a
+/// single pathological rRNA can't OOM a whole collection scan.
+fn feasible_to_scan(cm: &Cm) -> bool {
+    let ok = estimated_scan_bytes(cm, cm.w as usize) <= MAX_SCAN_BYTES;
+    if !ok {
+        tracing::warn!(
+            "skipping model {} (W={}, ~{:.1} GiB DP > budget); too large for the scanning matrix",
+            cm.name,
+            cm.w,
+            estimated_scan_bytes(cm, cm.w as usize) as f64 / (1u64 << 30) as f64,
+        );
+    }
+    ok
+}
+
+fn log_skipped(prepared: &[Prepared], total: usize) {
+    let n_skipped = prepared.iter().filter(|p| p.filters.is_none()).count();
+    if n_skipped > 0 {
+        tracing::warn!("{n_skipped} of {total} models skipped (too large)");
+    }
+}
+
+/// Load + prepare every model for a multi-model scan, auto-detecting a pressed DB: if `path` is a
+/// pressed file it is loaded directly (skipping parse + configure + QDB band computation);
+/// otherwise the `.cm(.gz)` is parsed and prepared from scratch. Callers resolve `path` (e.g. a
+/// `.cm` vs its `.cm.orm` sidecar) upstream.
+fn build_prepared_models(path: &Path) -> Result<Vec<Prepared>> {
+    if peek_header(path).is_some() {
+        tracing::debug!("using pressed CM database {}", path.display());
+        prepared_from_pressed(path)
+    } else {
+        prepared_from_cm_file(path)
+    }
+}
+
+/// Parse a `.cm(.gz)` and prepare every model from scratch (glocal align copy + local scan config +
+/// both bands + emit map + p7 filter cascade), in parallel across models.
+fn prepared_from_cm_file(cm_path: &Path) -> Result<Vec<Prepared>> {
+    let models = parse_cm_records_file(cm_path)
+        .map_err(|e| anyhow!("failed to parse CM file {}: {e}", cm_path.display()))?;
+    let total = models.len();
+    let prepared: Vec<Prepared> = models
+        .into_par_iter()
+        .map(|mut cm| -> Result<Prepared> {
+            let mut align_cm = cm.clone();
+            configure_scores(&mut align_cm);
+            configure_local(&mut cm); // cmsearch/cmscan default (local mode)
+            let align_bands = calc_qdb_bands(&align_cm, QdbBands::DEFAULT_BETA);
+            let w_max = cm.w as usize;
+            let emap = EmitMap::build(&cm);
+            let filters =
+                if feasible_to_scan(&cm) {
+                    Some(PreparedFilters::build(&cm).map_err(|e| {
+                        anyhow!("failed to prepare filters for model {}: {e}", cm.name)
+                    })?)
+                } else {
+                    None
+                };
+            Ok(Prepared {
+                cm,
+                align_cm,
+                align_bands,
+                w_max,
+                emap,
+                filters,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    log_skipped(&prepared, total);
+    Ok(prepared)
+}
+
+/// Load a pressed DB and adapt each prepared model into the scan's [`Prepared`] shape: the model,
+/// bands, and parsed filter HMM come straight from the file (no parse/configure/QDB); only the emit
+/// map and the (target-CPU-specific) striped filter profiles are rebuilt.
+fn prepared_from_pressed(path: &Path) -> Result<Vec<Prepared>> {
+    let db = load_pressed(path)
+        .map_err(|e| anyhow!("failed to load pressed DB {}: {e}", path.display()))?;
+    let total = db.models.len();
+    let prepared: Vec<Prepared> = db
+        .models
+        .into_par_iter()
+        .map(|pm| -> Result<Prepared> {
+            let emap = EmitMap::build(&pm.cm);
+            let filters = if feasible_to_scan(&pm.cm) {
+                Some(pm.prepared_filters().map_err(|e| {
+                    anyhow!("failed to prepare filters for model {}: {e}", pm.cm.name)
+                })?)
+            } else {
+                None
+            };
+            Ok(Prepared {
+                cm: pm.cm,
+                align_cm: pm.align_cm,
+                align_bands: pm.align_bands,
+                w_max: pm.w_max,
+                emap,
+                filters,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    log_skipped(&prepared, total);
+    Ok(prepared)
+}
+
+/// Shared core: prepare every model (parsing a `.cm` or loading a pressed DB) + memory-guard, then
+/// scan the feasible model × record product in parallel, handing each pair's hits to `sink` as it
+/// completes. `sink` is called once per scanned pair and must be thread-safe.
 fn scan_multi_with<P, Q, S>(cm_path: P, fasta: Q, e_value: f64, sink: S) -> Result<()>
 where
     P: AsRef<Path>,
@@ -233,70 +403,17 @@ where
     let cm_path = cm_path.as_ref();
     let fasta = fasta.as_ref();
 
-    let models = parse_cm_records_file(cm_path)
-        .map_err(|e| anyhow!("failed to parse CM file {}: {e}", cm_path.display()))?;
+    let prepared = build_prepared_models(cm_path)?;
     let records = ornament_alphabet::read_fasta(fasta)
         .map_err(|e| anyhow!("failed to read FASTA {}: {e}", fasta.display()))?;
-
-    // Memory guard: skip models whose scanning DP would exceed the budget (huge rRNAs etc.) so one
-    // pathological model can't OOM the whole collection scan. Reported, not silent.
-    let mut n_skipped = 0usize;
-    let feasible: Vec<bool> = models
-        .iter()
-        .map(|cm| {
-            let ok = estimated_scan_bytes(cm, cm.w as usize) <= MAX_SCAN_BYTES;
-            if !ok {
-                n_skipped += 1;
-                tracing::warn!(
-                    "skipping model {} (W={}, ~{:.1} GiB DP > budget); too large for the scanning matrix",
-                    cm.name,
-                    cm.w,
-                    estimated_scan_bytes(cm, cm.w as usize) as f64 / (1u64 << 30) as f64,
-                );
-            }
-            ok
-        })
-        .collect();
-    if n_skipped > 0 {
-        tracing::warn!("{n_skipped} of {} models skipped (too large)", models.len());
-    }
-
-    // Per-model setup: a glocal-configured copy + emit map + QDB bands for the per-hit model-span
-    // alignment. (The p7 pipeline computes its own scan bands internally; `align_bands` are the
-    // glocal bands that bound the alignment over `align_cm`.)
-    struct Prepared {
-        cm: Cm,
-        /// Glocal-configured copy used only for per-hit alignment (see `scan_native`).
-        align_cm: Cm,
-        align_bands: QdbBands,
-        w_max: usize,
-        emap: EmitMap,
-    }
-    let prepared: Vec<Prepared> = models
-        .into_par_iter()
-        .map(|mut cm| {
-            let mut align_cm = cm.clone();
-            configure_scores(&mut align_cm);
-            configure_local(&mut cm); // cmsearch/cmscan default (local mode)
-            let align_bands = calc_qdb_bands(&align_cm, QdbBands::DEFAULT_BETA);
-            let w_max = cm.w as usize;
-            let emap = EmitMap::build(&cm);
-            Prepared {
-                cm,
-                align_cm,
-                align_bands,
-                w_max,
-                emap,
-            }
-        })
-        .collect();
 
     // Parallelize across the feasible model × record product: every (model, record) scan is
     // independent, so the whole collection saturates the thread pool regardless of how many
     // models or sequences there are. Each scan uses the p7-filtered pipeline (the brute QDB scan
-    // is infeasible at genome scale), which prunes the genome cheaply before the CM DP.
+    // is infeasible at genome scale), which prunes the genome cheaply before the CM DP. Models the
+    // memory guard skipped have `filters == None` and are excluded here.
     let pairs: Vec<(usize, usize)> = (0..prepared.len())
-        .filter(|&mi| feasible[mi])
+        .filter(|&mi| prepared[mi].filters.is_some())
         .flat_map(|mi| (0..records.len()).map(move |ri| (mi, ri)))
         .collect();
 
@@ -331,8 +448,13 @@ where
         let rec = &records[ri];
         let (dsq, rc) = &digital[ri];
 
-        let (raw, _stats) = cm_pipeline_search(
+        let filters = p
+            .filters
+            .as_ref()
+            .expect("feasible models (the only ones in `pairs`) always have prepared filters");
+        let (raw, _stats) = cm_pipeline_search_prepared(
             &p.cm,
+            filters,
             dsq,
             p.w_max,
             REPORTING_BITS,
@@ -395,53 +517,23 @@ pub fn scan_native_aligned<P: AsRef<Path>, Q: AsRef<Path>>(
     let cm_path = cm_path.as_ref();
     let fasta = fasta.as_ref();
 
-    let models = parse_cm_records_file(cm_path)
-        .map_err(|e| anyhow!("failed to parse CM file {}: {e}", cm_path.display()))?;
+    let base = build_prepared_models(cm_path)?;
     let records = ornament_alphabet::read_fasta(fasta)
         .map_err(|e| anyhow!("failed to read FASTA {}: {e}", fasta.display()))?;
 
-    // Memory guard: skip models whose scanning DP would exceed the budget (see scan_native_multi).
-    let feasible: Vec<bool> = models
-        .iter()
-        .map(|cm| {
-            let ok = estimated_scan_bytes(cm, cm.w as usize) <= MAX_SCAN_BYTES;
-            if !ok {
-                tracing::warn!(
-                    "skipping model {} (W={}, ~{:.1} GiB DP > budget); too large for the scanning matrix",
-                    cm.name,
-                    cm.w,
-                    estimated_scan_bytes(cm, cm.w as usize) as f64 / (1u64 << 30) as f64,
-                );
-            }
-            ok
-        })
-        .collect();
-
-    struct Prepared {
-        cm: Cm,
-        align_cm: Cm,
-        align_bands: QdbBands,
-        w_max: usize,
-        emap: EmitMap,
+    // Stockholm output additionally needs each model's consensus RF / SS_cons annotation rows, so
+    // wrap the shared prepared model with them (cheap; derived from the already-built emit map).
+    struct PreparedAligned {
+        base: Prepared,
         rf: Vec<char>,
         ss_cons: Vec<char>,
     }
-    let prepared: Vec<Prepared> = models
+    let prepared: Vec<PreparedAligned> = base
         .into_par_iter()
-        .map(|mut cm| {
-            let mut align_cm = cm.clone();
-            configure_scores(&mut align_cm);
-            configure_local(&mut cm);
-            let align_bands = calc_qdb_bands(&align_cm, QdbBands::DEFAULT_BETA);
-            let w_max = cm.w as usize;
-            let emap = EmitMap::build(&cm);
-            let (rf, ss_cons) = consensus_annotation(&cm, &emap);
-            Prepared {
-                cm,
-                align_cm,
-                align_bands,
-                w_max,
-                emap,
+        .map(|p| {
+            let (rf, ss_cons) = consensus_annotation(&p.cm, &p.emap);
+            PreparedAligned {
+                base: p,
                 rf,
                 ss_cons,
             }
@@ -449,7 +541,7 @@ pub fn scan_native_aligned<P: AsRef<Path>, Q: AsRef<Path>>(
         .collect();
 
     let pairs: Vec<(usize, usize)> = (0..prepared.len())
-        .filter(|&mi| feasible[mi])
+        .filter(|&mi| prepared[mi].base.filters.is_some())
         .flat_map(|mi| (0..records.len()).map(move |ri| (mi, ri)))
         .collect();
 
@@ -457,7 +549,7 @@ pub fn scan_native_aligned<P: AsRef<Path>, Q: AsRef<Path>>(
     // model-independent, so doing them per (model × record) pair re-computed each record's digital
     // form once per model.
     let digital: Vec<(Vec<Dsq>, Vec<Dsq>)> = if let Some(p0) = prepared.first() {
-        let abc = &p0.cm.abc;
+        let abc = &p0.base.cm.abc;
         records
             .par_iter()
             .map(|rec| -> Result<(Vec<Dsq>, Vec<Dsq>)> {
@@ -483,14 +575,19 @@ pub fn scan_native_aligned<P: AsRef<Path>, Q: AsRef<Path>>(
             let rec = &records[ri];
             let (dsq, rc) = &digital[ri];
 
-            let (raw, _stats) = cm_pipeline_search(
-                &p.cm,
+            let filters =
+                p.base.filters.as_ref().expect(
+                    "feasible models (the only ones in `pairs`) always have prepared filters",
+                );
+            let (raw, _stats) = cm_pipeline_search_prepared(
+                &p.base.cm,
+                filters,
                 dsq,
-                p.w_max,
+                p.base.w_max,
                 REPORTING_BITS,
                 PipelineParams::default(),
             )
-            .map_err(|e| anyhow!("pipeline failed for model {}: {e}", p.cm.name))?;
+            .map_err(|e| anyhow!("pipeline failed for model {}: {e}", p.base.cm.name))?;
 
             let mut rows = Vec::new();
             for h in raw {
@@ -500,17 +597,17 @@ pub fn scan_native_aligned<P: AsRef<Path>, Q: AsRef<Path>>(
                     }
                 }
                 let (aln, seq) = align_hit_window(
-                    &p.align_cm,
+                    &p.base.align_cm,
                     dsq,
                     Some(rc.as_slice()),
-                    &p.emap,
-                    &p.align_bands,
+                    &p.base.emap,
+                    &p.base.align_bands,
                     h.i,
                     h.j,
                     h.strand,
                 );
                 let label = format!("{}/{}-{}", rec.name, h.i, h.j);
-                let row = aligned_row(&p.align_cm, &aln, seq, label);
+                let row = aligned_row(&p.base.align_cm, &aln, seq, label);
                 let evkey = h.evalue.unwrap_or(f64::INFINITY);
                 rows.push((evkey, -(h.score as f64), row));
             }
@@ -537,8 +634,8 @@ pub fn scan_native_aligned<P: AsRef<Path>, Q: AsRef<Path>>(
         });
         let p = &prepared[mi];
         out.push(ModelMsa {
-            model_name: p.cm.name.clone(),
-            clen: p.cm.clen,
+            model_name: p.base.cm.name.clone(),
+            clen: p.base.cm.clen,
             rf: p.rf.clone(),
             ss_cons: p.ss_cons.clone(),
             rows: rows.into_iter().map(|(_, _, r)| r).collect(),

@@ -15,7 +15,7 @@ use ornament_core::infernal::{
     write_tsv_rows, InfernalRunner, TSV_HEADER,
 };
 
-use super::{render_hits, require_file, Engine, Format, E_VALUE};
+use super::{render_hits, require_file, resolve_model_path, Engine, Format, E_VALUE};
 use crate::io::{emit, output_is_gz};
 use crate::{progress, style};
 
@@ -40,11 +40,23 @@ pub struct ScanArgs {
     /// Search engine: native (pure Rust, default) or cmsearch (subprocess)
     #[arg(long, value_enum, default_value_t = Engine::Native)]
     pub engine: Engine,
+
+    /// Ignore any pressed `<cm>.orm` sidecar and parse the `.cm` directly
+    #[arg(long)]
+    pub no_pressed: bool,
 }
 
 pub fn run(args: ScanArgs) -> Result<()> {
     require_file(&args.input, "Input file")?;
     require_file(&args.cm, "CM file")?;
+
+    // Prefer a pressed `<cm>.orm` sidecar for the native engine (skips per-run parse + banding); the
+    // cmsearch subprocess always reads the `.cm` text directly.
+    let cm = if args.engine == Engine::Native {
+        resolve_model_path(&args.cm, !args.no_pressed)
+    } else {
+        args.cm.clone()
+    };
 
     // Streaming fast path: native engine + TSV to stdout or a plain file. Hits are written as each
     // model finishes, so a long genome-vs-Rfam run shows progress, survives a crash, and never
@@ -54,7 +66,7 @@ pub fn run(args: ScanArgs) -> Result<()> {
         && args.format == Format::Tsv
         && !output_is_gz(args.output.as_deref());
     if can_stream {
-        return run_streaming(&args);
+        return run_streaming(&args, &cm);
     }
 
     if args.format == Format::Stockholm {
@@ -71,7 +83,7 @@ pub fn run(args: ScanArgs) -> Result<()> {
             style::path(&args.cm),
         );
         let spinner = progress::create_spinner("Scanning")?;
-        let msas = scan_native_aligned(&args.cm, &args.input, E_VALUE)?;
+        let msas = scan_native_aligned(&cm, &args.input, E_VALUE)?;
         spinner.finish_and_clear();
         let n_hits: usize = msas.iter().map(|m| m.rows.len()).sum();
         tracing::info!(
@@ -91,7 +103,7 @@ pub fn run(args: ScanArgs) -> Result<()> {
                 style::path(&args.input),
                 style::path(&args.cm),
             );
-            scan_native_multi(&args.cm, &args.input, E_VALUE)?
+            scan_native_multi(&cm, &args.input, E_VALUE)?
         }
         Engine::Cmsearch => {
             tracing::info!(
@@ -112,8 +124,9 @@ pub fn run(args: ScanArgs) -> Result<()> {
     emit(args.output.as_deref(), &render_hits(args.format, &hits)?)
 }
 
-/// Native + TSV streaming path: write each model's hits as it completes.
-fn run_streaming(args: &ScanArgs) -> Result<()> {
+/// Native + TSV streaming path: write each model's hits as it completes. `cm` is the resolved model
+/// path (a pressed `.orm` sidecar when one is current, else the `.cm`).
+fn run_streaming(args: &ScanArgs, cm: &str) -> Result<()> {
     tracing::info!(
         "{} {} with {} (native engine, all models, streaming)",
         style::action("Scanning"),
@@ -131,7 +144,7 @@ fn run_streaming(args: &ScanArgs) -> Result<()> {
     let spinner = progress::create_spinner("Scanning")?;
     let total = AtomicUsize::new(0);
 
-    let n = scan_native_multi_streaming(&args.cm, &args.input, E_VALUE, |hits| {
+    let n = scan_native_multi_streaming(cm, &args.input, E_VALUE, |hits| {
         let mut s = String::new();
         write_tsv_rows(&mut s, hits);
         {
