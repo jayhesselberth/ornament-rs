@@ -21,8 +21,13 @@ See [`DESIGN.md`](DESIGN.md) for where the work is heaviest and the producer/con
       staging so H2D / kernel / D2H overlap (internal to the resident wrappers).
 - [x] Benchmark (`examples/bench_msv.rs`) + measured the streaming speedup (~1.19×) — see DESIGN.md.
       Finding: the batch is kernel-bound, and the kernel is only ~2.6× one CPU core.
-- [ ] **Shared-memory DP row / warp-per-window** — the measured bottleneck; the lever that decides
-      whether GPU beats the multicore CPU.
+- [x] **Shared-memory DP row** (`msv_u8_batch_kernel_smem`): ~22× faster than the global-scratch
+      kernel (18.7 → 418 G DP-cells/s on an A30), ≈2.4× the full 24-core CPU. Default when it fits
+      in 48 KB shared (M ≲ 336 @ blockDim 128); falls back to the global kernel for very long models.
+      `ORNAMENT_GPU_SMEM=0` forces global for A/B.
+- [ ] **Validate across the full Rfam CM collection** — sweep the real M distribution (many models
+      are large), confirm the shared/global crossover and parity at scale on a real genome.
+- [ ] Warp-per-window for long models (extend shared-mem past the 48 KB / M≈336 fallback).
 - [ ] Viterbi + Forward kernels (rest of the cascade).
 - [ ] Wire into `ornament-scfg`'s scan pipeline as an optional backend.
 - [ ] Intra-DP (warp-per-window) for long models; multi-model batching.

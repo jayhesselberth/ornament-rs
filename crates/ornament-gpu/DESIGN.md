@@ -56,12 +56,27 @@ Stream A/B (chunk 32k) and chunk sweep (2 streams):
 - **Streaming speedup ≈ 1.19×** (2 vs 1 stream). Real but modest — the copies it hides are only
   ~15% of wall time, so the batch is **kernel-bound, not transfer-bound**. Beyond 2 streams is
   noise; chunk 64k is the sweet spot (8k adds launch/sync overhead) — now the default.
-- **GPU is only ~2.6× a single CPU core** (striped-SIMD uint8 MSV). The production pipeline runs
-  that CPU filter under rayon across ~24 cores, so **this kernel is currently *slower* than the
-  multicore CPU it aims to replace.** At ~18.7 G DP-cells/s on a ~933 GB/s A30 it is far from
-  bandwidth limits — the bottleneck is the per-thread DP row living in *global* memory, hit
-  M×L times with a serial dependency. Streaming was the right structural step but is not the lever
-  that makes GPU win; **the kernel is (fix #4 below: shared-memory DP row / warp-per-window).**
+- **Streaming alone left the GPU only ~2.6× a single CPU core** (global-scratch kernel), i.e.
+  *slower* than the ~24-core rayon CPU. At ~18.7 G DP-cells/s on a ~933 GB/s A30 it was nowhere
+  near bandwidth limits — the bottleneck was the per-thread DP row in *global* memory, hit M×L
+  times over a serial dependency.
+
+### Shared-memory DP row (the fix — measured A30, same 640k-tile workload)
+
+| kernel | best time | throughput | vs 1 CPU core |
+|--------|-----------|------------|---------------|
+| global-scratch DP row (`ORNAMENT_GPU_SMEM=0`) | 0.487 s | 18.7 G cells/s | 2.6× |
+| **shared-memory DP row** (`ORNAMENT_GPU_SMEM=1`, default) | **0.022 s** | **418 G cells/s** | **57.6×** |
+
+- **~22× faster kernel** from moving the DP row (and the small emission table) into shared memory.
+  The recurrence is unchanged; only the memory it lives in changed (~400-cycle global → ~30-cycle
+  shared), which is the whole story for a latency-bound serial-dependency DP.
+- **57.6× one CPU core ⇒ ≈2.4× the full 24-core rayon CPU.** The GPU now genuinely beats the
+  multicore CPU on this workload (tRNA-sized model). This is the result that makes offload viable.
+- Requires `(Kp + blockDim)*(M+1)` bytes of shared memory; the host launches the shared kernel only
+  when that fits in 48 KB (M ≲ 336 at blockDim 128 — covers most Rfam models) and falls back to the
+  global kernel for very long models. **Still to validate:** the full Rfam M distribution (many
+  models run larger; confirm the crossover and parity at scale — see README TODO).
 
 ### Level 2 — on-device funnel (stream compaction)
 - MSV kernel writes a survivor mask → compact → Viterbi kernel consumes only survivors → compact

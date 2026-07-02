@@ -169,6 +169,81 @@ extern "C" __global__ void msv_u8_batch_kernel(
     out[j] = (((float)xJ - (float)tjb) - (float)base_b) / scale_b - 3.0f;
 }
 
+// Shared-memory uint8 MSV. Identical recurrence to `msv_u8_batch_kernel`, but the per-thread DP
+// row and the (small) emission table live in **shared** memory instead of global. That's the whole
+// game: the global-scratch kernel is latency-bound because it hits the DP row M*L times over a
+// serial dependency at ~400-cycle global latency; shared memory is ~30 cycles, so the same DP runs
+// far faster. Requires (Kp + blockDim)*(M+1) bytes of dynamic shared memory — the host launches
+// this only when that fits (small/medium models, the common Rfam case) and falls back to the
+// global kernel for very long models.
+//
+// Layout of dynamic shared `smem`:
+//   [0 .. Kp*(M+1))                    emission table, loaded cooperatively, shared by all threads
+//   [Kp*(M+1) ..)                      DP rows, **interleaved** as dp[k*blockDim + tid] so a warp's
+//                                      threads touch consecutive addresses for a fixed k (avoids
+//                                      the bank conflicts a per-thread contiguous row would cause).
+extern "C" __global__ void msv_u8_batch_kernel_smem(
+    const uint8_t* __restrict__ rbv,
+    int                          Kp,
+    int                          M,
+    float                        scale_b,
+    int                          base_b,
+    int                          bias_b,
+    int                          tbm_b,
+    int                          tec_b,
+    const uint8_t* __restrict__ dsq,
+    const int*     __restrict__ offsets,
+    const int*     __restrict__ lengths,
+    int                          n,
+    float*         __restrict__ out)
+{
+    extern __shared__ uint8_t smem[];
+    uint8_t* s_rbv = smem;                          // Kp*(M+1)
+    uint8_t* s_dp  = smem + (size_t)Kp * (M + 1);   // blockDim.x*(M+1), interleaved
+    int      tid   = threadIdx.x;
+    int      bd    = blockDim.x;
+    int      j     = blockIdx.x * bd + tid;
+
+    // Cooperatively stage the emission table (all threads, incl. out-of-range, participate).
+    for (int idx = tid; idx < Kp * (M + 1); idx += bd) s_rbv[idx] = rbv[idx];
+    __syncthreads();
+    if (j >= n) return;   // no __syncthreads after this point, so early exit is safe
+
+    int L    = lengths[j];
+    int base = offsets[j];
+    int tjb  = tjb_byte(scale_b, L);
+    int tjbm = (tjb + tbm_b) & 0xff;
+
+    for (int k = 0; k <= M; ++k) s_dp[k * bd + tid] = 0;
+
+    int xJ = 0;
+    int xB = ssub_u8(base_b, tjbm);
+
+    for (int i = 1; i <= L; ++i) {
+        int            x   = (int)dsq[base + (i - 1)];
+        const uint8_t* row = s_rbv + (size_t)x * (M + 1);
+        int            xE  = 0;
+
+        for (int k = M; k >= 1; --k) {
+            int prev = s_dp[(k - 1) * bd + tid];    // previous row's k-1 (not yet overwritten)
+            int sv   = prev > xB ? prev : xB;
+            sv = sadd_u8(sv, bias_b);
+            sv = ssub_u8(sv, (int)row[k]);
+            s_dp[k * bd + tid] = (uint8_t)sv;
+            if (sv > xE) xE = sv;
+        }
+
+        if (sadd_u8(xE, bias_b) == 255) { out[j] = INFINITY; return; }
+
+        int xJn = ssub_u8(xE, tec_b);
+        if (xJn > xJ) xJ = xJn;
+        int bmax = base_b > xJ ? base_b : xJ;
+        xB = ssub_u8(bmax, tjbm);
+    }
+
+    out[j] = (((float)xJ - (float)tjb) - (float)base_b) / scale_b - 3.0f;
+}
+
 // ---- Host wrappers (CUDA Runtime API) -------------------------------------------------------
 // Thin, synchronous launch helpers callable over FFI. They own the device allocations for one
 // batch call: upload inputs, launch, copy scores back, free. Return 0 on success, or the
@@ -380,6 +455,12 @@ extern "C" int ornament_gpu_msv_u8_batch_resident(
     uint8_t* d_rbv = nullptr;
     size_t rbv_bytes = (size_t)Kp * (M + 1) * sizeof(uint8_t);
 
+    // Prefer the shared-memory kernel when its footprint fits (small/medium models); fall back to
+    // the global-scratch kernel for very long models. ORNAMENT_GPU_SMEM=0 forces global (for A/B).
+    // Declared before the first CUDA_TRY so the `goto cleanup` never bypasses their init.
+    int use_smem = env_int("ORNAMENT_GPU_SMEM", 1, 0, 1);
+    const size_t SMEM_LIMIT = 48 * 1024;   // sm_80 default per-block shared without opt-in
+
     CUDA_TRY(cudaMalloc(&d_rbv, rbv_bytes));
     CUDA_TRY(cudaMemcpy(d_rbv, rbv, rbv_bytes, cudaMemcpyHostToDevice));
 
@@ -387,9 +468,16 @@ extern "C" int ornament_gpu_msv_u8_batch_resident(
         n, M, sizeof(uint8_t), starts, lengths, out,
         [=](cudaStream_t st, int blocks, int threads,
             const int* d_off, const int* d_len, int cn, void* d_scr, float* d_out) {
-            msv_u8_batch_kernel<<<blocks, threads, 0, st>>>(
-                d_rbv, Kp, M, scale_b, base_b, bias_b, tbm_b, tec_b,
-                (const uint8_t*)d_strand, d_off, d_len, cn, (uint8_t*)d_scr, d_out);
+            size_t shmem = (size_t)(Kp + threads) * (M + 1);
+            if (use_smem && shmem <= SMEM_LIMIT) {
+                msv_u8_batch_kernel_smem<<<blocks, threads, shmem, st>>>(
+                    d_rbv, Kp, M, scale_b, base_b, bias_b, tbm_b, tec_b,
+                    (const uint8_t*)d_strand, d_off, d_len, cn, d_out);
+            } else {
+                msv_u8_batch_kernel<<<blocks, threads, 0, st>>>(
+                    d_rbv, Kp, M, scale_b, base_b, bias_b, tbm_b, tec_b,
+                    (const uint8_t*)d_strand, d_off, d_len, cn, (uint8_t*)d_scr, d_out);
+            }
         });
 
 cleanup:
