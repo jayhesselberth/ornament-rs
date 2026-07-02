@@ -6,6 +6,10 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[features]
+# Propagate GPU-accelerated filtering down to the scan engine (see ornament-scfg's `cuda`).
+cuda = ["ornament-scfg/cuda"]
+
 [dependencies]
 # Native Rust covariance-model search engine.
 ornament-alphabet = { workspace = true }
