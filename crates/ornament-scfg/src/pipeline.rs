@@ -132,16 +132,10 @@ pub fn cm_pipeline_search(
     let filt = fwdfilter::build(&prof);
     let msv = msvfilter::build(&prof); // cheap uint8 MSV prefilter (built once)
     let vit = vitfilter::build(&prof); // striped Viterbi filter (middle cascade stage, built once)
-
-    // Query-dependent bands for the CM stage, computed **lazily**: only when a strand actually has
-    // survivor windows to scan. The p7 cascade prunes the vast majority of models to zero survivors
-    // on a given genome, so eager band computation (an O(M·W·band) DP per model) was wasted work for
-    // ~all of them — the dominant per-model cost in an all-Rfam scan. Shared across both strands and
-    // every survivor window; `get_or_init` is thread-safe, so whichever strand first has survivors
-    // computes it exactly once. A safe `beta` keeps every real hit's optimal parse in-band, so the
-    // banded scan reports identical hits to the unbanded one — this is a pure speedup, not a result
-    // change.
-    let bands: std::sync::OnceLock<QdbBands> = std::sync::OnceLock::new();
+                                       // Query-dependent bands for the CM stage, computed once and shared across every survivor
+                                       // window (and both strands). A safe `beta` keeps every real hit's optimal parse in-band, so
+                                       // the banded scan reports identical hits to the unbanded one — just faster.
+    let bands = calc_qdb_bands(cm, QdbBands::DEFAULT_BETA);
     let w = w_max.min(l).max(1);
     let searched = 2.0 * l as f64;
     let do_inside = params.do_inside;
@@ -191,25 +185,21 @@ pub fn cm_pipeline_search(
             &tiles,
             plus_mask.as_deref(),
         );
-        let hits: Vec<Hit> = if surv.is_empty() {
-            Vec::new() // no CM work ⇒ never compute the QDB bands for this model
-        } else {
-            let b = bands.get_or_init(|| calc_qdb_bands(cm, QdbBands::DEFAULT_BETA));
-            surv.par_iter()
-                .flat_map_iter(|&(s, e)| {
-                    let sub = subseq(dsq, s, e);
-                    scan_subseq(cm, &sub, w_max, cutoff_bits, do_inside, Some(b))
-                        .into_iter()
-                        .map(move |(score, i, j)| Hit {
-                            score,
-                            evalue: evalue(cm, mode, score, searched),
-                            i: i + s - 1,
-                            j: j + s - 1,
-                            strand: Strand::Plus,
-                        })
-                })
-                .collect()
-        };
+        let hits: Vec<Hit> = surv
+            .par_iter()
+            .flat_map_iter(|&(s, e)| {
+                let sub = subseq(dsq, s, e);
+                scan_subseq(cm, &sub, w_max, cutoff_bits, do_inside, Some(&bands))
+                    .into_iter()
+                    .map(move |(score, i, j)| Hit {
+                        score,
+                        evalue: evalue(cm, mode, score, searched),
+                        i: i + s - 1,
+                        j: j + s - 1,
+                        strand: Strand::Plus,
+                    })
+            })
+            .collect();
         (surv, nw, hits)
     };
     let minus = || {
@@ -225,25 +215,21 @@ pub fn cm_pipeline_search(
             &tiles,
             minus_mask.as_deref(),
         );
-        let hits: Vec<Hit> = if surv.is_empty() {
-            Vec::new() // no CM work ⇒ never compute the QDB bands for this model
-        } else {
-            let b = bands.get_or_init(|| calc_qdb_bands(cm, QdbBands::DEFAULT_BETA));
-            surv.par_iter()
-                .flat_map_iter(|&(s, e)| {
-                    let sub = subseq(&rc, s, e);
-                    scan_subseq(cm, &sub, w_max, cutoff_bits, do_inside, Some(b))
-                        .into_iter()
-                        .map(move |(score, i, j)| Hit {
-                            score,
-                            evalue: evalue(cm, mode, score, searched),
-                            i: l - (i + s - 1) + 1,
-                            j: l - (j + s - 1) + 1,
-                            strand: Strand::Minus,
-                        })
-                })
-                .collect()
-        };
+        let hits: Vec<Hit> = surv
+            .par_iter()
+            .flat_map_iter(|&(s, e)| {
+                let sub = subseq(&rc, s, e);
+                scan_subseq(cm, &sub, w_max, cutoff_bits, do_inside, Some(&bands))
+                    .into_iter()
+                    .map(move |(score, i, j)| Hit {
+                        score,
+                        evalue: evalue(cm, mode, score, searched),
+                        i: l - (i + s - 1) + 1,
+                        j: l - (j + s - 1) + 1,
+                        strand: Strand::Minus,
+                    })
+            })
+            .collect();
         (surv, nw, hits)
     };
     let ((fsurv, fnw, fhits), (rsurv, rnw, rhits)) = rayon::join(plus, minus);
