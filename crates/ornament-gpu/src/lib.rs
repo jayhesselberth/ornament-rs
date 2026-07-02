@@ -71,6 +71,45 @@ impl FlatProfile {
     }
 }
 
+/// A model's Viterbi tables, flattened for the GPU Viterbi kernel: the transition log-odds
+/// `tsc[k*8+type]` ((M+1)×8, HMMER p7P order) and the match-emission log-odds `msc[x*(M+1)+k]`.
+/// Insert emissions are 0 (the profile hardwires them); the length model is recomputed on-device
+/// from each window's length and `nj`.
+#[derive(Debug, Clone)]
+pub struct VitFlatProfile {
+    /// Alphabet size (emission rows).
+    pub kp: usize,
+    /// Model length (match states).
+    pub m: usize,
+    /// Expected-hit count (`P7Profile::nj`), for the on-device length model.
+    pub nj: f32,
+    /// Transition log-odds `tsc[k*8+type]`, `(M+1)*8`.
+    pub tsc: Vec<f32>,
+    /// Row-major `[Kp][M+1]` match-emission log-odds.
+    pub msc: Vec<f32>,
+}
+
+impl VitFlatProfile {
+    /// Flatten a configured [`P7Profile`] for the Viterbi kernel (clones its transition vector and
+    /// flattens its match emissions; non-finite cells kept verbatim).
+    pub fn new(prof: &P7Profile) -> VitFlatProfile {
+        let (kp, m) = (prof.kp, prof.m);
+        let mut msc = vec![f32::NEG_INFINITY; kp * (m + 1)];
+        for (x, row) in prof.msc.iter().enumerate() {
+            for (k, &s) in row.iter().enumerate() {
+                msc[x * (m + 1) + k] = s;
+            }
+        }
+        VitFlatProfile {
+            kp,
+            m,
+            nj: prof.nj,
+            tsc: prof.tsc.clone(),
+            msc,
+        }
+    }
+}
+
 /// `unbiased_byteify`: round a log-prob score to a non-negative uint8 cost (`255` = -inf), the
 /// same quantization as `ornament-hmm::msv_simd`.
 fn unbiased_byteify(scale_b: f32, sc: f32) -> u8 {
@@ -277,6 +316,20 @@ extern "C" {
         bias_b: i32,
         tbm_b: i32,
         tec_b: i32,
+        d_strand: *const core::ffi::c_void,
+        starts: *const i32,
+        lengths: *const i32,
+        n: i32,
+        out: *mut f32,
+    ) -> i32;
+    #[allow(clippy::too_many_arguments)]
+    fn ornament_gpu_ctx_vit_f32(
+        ctx: *mut core::ffi::c_void,
+        tsc: *const f32,
+        msc: *const f32,
+        kp: i32,
+        m: i32,
+        nj: f32,
         d_strand: *const core::ffi::c_void,
         starts: *const i32,
         lengths: *const i32,
@@ -527,6 +580,52 @@ impl GpuContext {
         }
         Ok(out)
     }
+
+    /// Viterbi raw scores (nats) for `tiles` against a resident `strand`, reusing this context.
+    /// Matches the scalar [`ornament_hmm::viterbi_nats`] oracle to f32 rounding. Convert to bits
+    /// with [`nats_to_bits`].
+    pub fn vit_nats(
+        &self,
+        vp: &VitFlatProfile,
+        strand: &DeviceStrand,
+        tiles: &Tiles,
+    ) -> Result<Vec<f32>, GpuError> {
+        let n = tiles.len();
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        let mut out = vec![f32::NEG_INFINITY; n];
+        let rc = unsafe {
+            ornament_gpu_ctx_vit_f32(
+                self.ptr,
+                vp.tsc.as_ptr(),
+                vp.msc.as_ptr(),
+                vp.kp as i32,
+                vp.m as i32,
+                vp.nj,
+                strand.ptr,
+                tiles.starts.as_ptr(),
+                tiles.lengths.as_ptr(),
+                n as i32,
+                out.as_mut_ptr(),
+            )
+        };
+        if rc != 0 {
+            return Err(GpuError::Cuda(rc));
+        }
+        Ok(out)
+    }
+}
+
+/// Batch Viterbi raw scores (nats) on the GPU: score `tiles` against a resident `strand`. Spins
+/// up a one-shot [`GpuContext`]; for many-model scans reuse a context via [`GpuContext::vit_nats`].
+#[cfg(feature = "cuda")]
+pub fn vit_nats_gpu(
+    vp: &VitFlatProfile,
+    strand: &DeviceStrand,
+    tiles: &Tiles,
+) -> Result<Vec<f32>, GpuError> {
+    GpuContext::new()?.vit_nats(vp, strand, tiles)
 }
 
 #[cfg(feature = "cuda")]
@@ -750,6 +849,37 @@ mod tests {
                 "f32(reuse) span {i}"
             );
             assert_eq!(ctx_u8[i].to_bits(), free_u8[i].to_bits(), "u8 span {i}");
+        }
+    }
+
+    /// GPU Viterbi parity: the batched device kernel must match the scalar `viterbi_nats` oracle
+    /// per span to f32 rounding — validates the M/I/D recurrence, DD serial pass, and length model.
+    /// Skips when no `cuda` device is visible.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn gpu_viterbi_matches_scalar() {
+        let (prof, strand) = fixture();
+        match device_count() {
+            Ok(0) | Err(_) => return,
+            Ok(_) => {}
+        }
+
+        let vp = VitFlatProfile::new(&prof);
+        let dstrand = DeviceStrand::upload(&strand).expect("upload strand");
+        let tiles = Tiles::from_spans(SPANS);
+        let gpu = vit_nats_gpu(&vp, &dstrand, &tiles).expect("gpu viterbi");
+
+        for (i, &(s, e)) in SPANS.iter().enumerate() {
+            let win = padded_span(&strand, s, e);
+            // Scalar oracle: length-configure the profile for this window, then max-plus DP.
+            let mut p = prof.clone();
+            p.reconfig_length(e - s + 1);
+            let cpu = ornament_hmm::viterbi_nats(&p, &win);
+            assert!(
+                (gpu[i] - cpu).abs() < 0.02,
+                "span {i} ({s},{e}): gpu {} vs scalar {cpu}",
+                gpu[i]
+            );
         }
     }
 }

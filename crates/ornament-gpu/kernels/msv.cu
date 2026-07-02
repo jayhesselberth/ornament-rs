@@ -244,6 +244,103 @@ extern "C" __global__ void msv_u8_batch_kernel_smem(
     out[j] = (((float)xJ - (float)tjb) - (float)base_b) / scale_b - 3.0f;
 }
 
+// ---- Viterbi filter (f32 max-plus, full M/I/D model) ----------------------------------------
+// The middle cascade stage: the best single gapped local parse (`p7_GViterbi`), a faithful
+// transcription of the scalar `ornament-hmm/src/fwd.rs::viterbi_nats` (max-plus semiring) — same
+// transitions, same Dk→E folding, same length model — kept in f32 so it matches the scalar oracle
+// to rounding. One thread per window (like MSV); it runs only on MSV survivors, so its aggregate
+// volume is far lower.
+//
+// Memory: unlike MSV's single rolling row, Viterbi needs the previous *and* current rows of all
+// three states — M(i,k) reads M/I/D(i-1,k-1), I(i,k) reads M/I(i-1,k), D(i,k) reads M/D(i,k-1) —
+// so each thread keeps 6 rows of (M+1) floats in global scratch (stride 6*(M+1) per thread). This
+// is the correct-first global-memory version; a shared-memory Viterbi (6× MSV's footprint) is a
+// separate optimization.
+//
+// tsc: (M+1)*8 transition log-odds, tsc[k*8+type] with type MM=0,IM=1,DM=2,BM=3,MD=4,DD=5,MI=6,
+// II=7 (HMMER p7P order). msc: [Kp][M+1] match-emission log-odds. Insert emissions are 0 (profile
+// hardwires them). Length model (N/C/J loop/move) is recomputed on-device from L and nj; E move =
+// E loop = ln(1/2) (multihit local). out[j] = raw Viterbi nats (host null-corrects to bits).
+
+__device__ __forceinline__ float vmax(float a, float b) { return a >= b ? a : b; }
+
+extern "C" __global__ void viterbi_batch_kernel(
+    const float* __restrict__ tsc,   // (M+1)*8
+    const float* __restrict__ msc,   // Kp*(M+1)
+    int                        Kp,
+    int                        M,
+    float                      nj,
+    const uint8_t* __restrict__ dsq,
+    const int*     __restrict__ offsets,
+    const int*     __restrict__ lengths,
+    int                         n,
+    float*         __restrict__ scratch,   // 6*(M+1) floats per thread
+    float*         __restrict__ out)
+{
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= n) return;
+
+    int   L    = lengths[j];
+    int   base = offsets[j];
+    int   S    = M + 1;
+    float* buf = scratch + (size_t)j * 6 * S;
+    float* Mp = buf;             // prev row M
+    float* Ip = buf + S;         // prev row I
+    float* Dp = buf + 2 * S;     // prev row D
+    float* Mc = buf + 3 * S;     // cur row M
+    float* Ic = buf + 4 * S;     // cur row I
+    float* Dc = buf + 5 * S;     // cur row D
+
+    // Length model (p7_ReconfigLength) + multihit-local E exits.
+    float pmove = (2.0f + nj) / ((float)L + 2.0f + nj);
+    float nloop = logf(1.0f - pmove);   // N/C/J loop
+    float nmove = logf(pmove);          // N/C/J move
+    float emove = logf(0.5f);           // E->C move  (= E loop)
+    float eloop = emove;                // E->J loop
+
+    // Row 0: M/I/D = -inf; specials.
+    for (int k = 0; k <= M; ++k) { Mp[k] = NINF; Ip[k] = NINF; Dp[k] = NINF; }
+    float xN = 0.0f, xJ = NINF, xC = NINF;
+    float xB = nmove;   // S->N->B
+
+    for (int i = 1; i <= L; ++i) {
+        int          x  = (int)dsq[base + (i - 1)];
+        const float* ms = msc + (size_t)x * S;
+        float        xE = NINF;
+        Mc[0] = NINF; Ic[0] = NINF; Dc[0] = NINF;
+
+        for (int k = 1; k <= M; ++k) {
+            const float* t  = tsc + (size_t)(k - 1) * 8; // MM,IM,DM,BM indexed by k-1
+            const float* tk = tsc + (size_t)k * 8;       // MI,II indexed by k
+            // match: max(M[k-1]+MM, I[k-1]+IM, B+BM, D[k-1]+DM) + emission
+            float mv = vmax(vmax(Mp[k - 1] + t[0], Ip[k - 1] + t[1]),
+                            vmax(xB + t[3], Dp[k - 1] + t[2]));
+            Mc[k] = mv + ms[k];
+            // insert (isc = 0), impossible at k = M
+            Ic[k] = (k < M) ? vmax(Mp[k] + tk[6], Ip[k] + tk[7]) : NINF;
+            // delete: max(Mcur[k-1]+MD, Dcur[k-1]+DD)  (same row, ascending k)
+            Dc[k] = vmax(Mc[k - 1] + t[4], Dc[k - 1] + t[5]);
+            // E gets Mk and Dk exits (esc = 0)
+            xE = vmax(xE, vmax(Mc[k], Dc[k]));
+        }
+
+        // specials: J/C/N use prev-row values + this row's E; B uses this row's N and J.
+        float xJn = vmax(xJ + nloop, xE + eloop);
+        float xCn = vmax(xC + nloop, xE + emove);
+        float xNn = xN + nloop;
+        float xBn = vmax(xNn + nmove, xJn + nmove);
+        xJ = xJn; xC = xCn; xN = xNn; xB = xBn;
+
+        // swap prev/cur rows for the next iteration
+        float* tmp;
+        tmp = Mp; Mp = Mc; Mc = tmp;
+        tmp = Ip; Ip = Ic; Ic = tmp;
+        tmp = Dp; Dp = Dc; Dc = tmp;
+    }
+
+    out[j] = xC + nmove;   // + C->move; L == 0 ⇒ xC = -inf
+}
+
 // ---- Host wrappers (CUDA Runtime API) -------------------------------------------------------
 // Thin, synchronous launch helpers callable over FFI. They own the device allocations for one
 // batch call: upload inputs, launch, copy scores back, free. Return 0 on success, or the
@@ -330,6 +427,8 @@ struct GpuCtx {
     float*       h_out[MAX_STREAMS];
     void*        d_emit;                 // reusable emission table (msc/rbv), grows on demand
     size_t       emit_cap;               // bytes
+    void*        d_tsc;                  // reusable transition table (Viterbi), grows on demand
+    size_t       tsc_cap;                // bytes
     int          smem_optin;             // opted-in per-block dynamic-shared max (bytes) for the u8 kernel
 };
 
@@ -358,6 +457,7 @@ static void ctx_free_internal(GpuCtx* c) {
         if (c->stream[s]) cudaStreamDestroy(c->stream[s]);
     }
     if (c->d_emit) cudaFree(c->d_emit);
+    if (c->d_tsc) cudaFree(c->d_tsc);
     free(c);
 }
 
@@ -603,6 +703,59 @@ extern "C" int ornament_gpu_msv_u8_batch_resident(
     if (rc) return rc;
     rc = ornament_gpu_ctx_msv_u8(ctx, rbv, Kp, M, scale_b, base_b, bias_b, tbm_b, tec_b,
                                  d_strand, starts, lengths, n, out);
+    ornament_gpu_ctx_destroy(ctx);
+    return rc;
+}
+
+// Viterbi (f32) over a resident strand, using a reusable context. tsc: (M+1)*8 transition
+// log-odds; msc: Kp*(M+1) match-emission log-odds; nj: expected-hit count (length model). Both
+// tables are uploaded into growable context buffers; scratch is 6*(M+1) floats per tile.
+extern "C" int ornament_gpu_ctx_vit_f32(
+    void*          ctx_,
+    const float*   tsc,
+    const float*   msc,
+    int            Kp,
+    int            M,
+    float          nj,
+    const void*    d_strand,
+    const int*     starts,
+    const int*     lengths,
+    int            n,
+    float*         out)
+{
+    if (n <= 0) return 0;
+    GpuCtx* ctx = (GpuCtx*)ctx_;
+    size_t tsc_bytes = (size_t)(M + 1) * 8 * sizeof(float);
+    size_t msc_bytes = (size_t)Kp * (M + 1) * sizeof(float);
+    int rc = ensure_dev(&ctx->d_tsc, &ctx->tsc_cap, tsc_bytes);
+    if (rc) return rc;
+    rc = ensure_dev(&ctx->d_emit, &ctx->emit_cap, msc_bytes);
+    if (rc) return rc;
+    cudaError_t e;
+    if ((e = cudaMemcpy(ctx->d_tsc, tsc, tsc_bytes, cudaMemcpyHostToDevice))) return (int)e;
+    if ((e = cudaMemcpy(ctx->d_emit, msc, msc_bytes, cudaMemcpyHostToDevice))) return (int)e;
+    const float* d_tsc = (const float*)ctx->d_tsc;
+    const float* d_msc = (const float*)ctx->d_emit;
+
+    return ctx_stream_run(
+        ctx, n, M, 6 * sizeof(float), 128, starts, lengths, out,
+        [=](cudaStream_t st, int blocks, int threads,
+            const int* d_off, const int* d_len, int cn, void* d_scr, float* d_out) {
+            viterbi_batch_kernel<<<blocks, threads, 0, st>>>(
+                d_tsc, d_msc, Kp, M, nj, (const uint8_t*)d_strand, d_off, d_len, cn,
+                (float*)d_scr, d_out);
+        });
+}
+
+extern "C" int ornament_gpu_vit_batch_resident(
+    const float* tsc, const float* msc, int Kp, int M, float nj,
+    const void* d_strand, const int* starts, const int* lengths, int n, float* out)
+{
+    if (n <= 0) return 0;
+    void* ctx = nullptr;
+    int rc = ornament_gpu_ctx_create(0, 0, &ctx);
+    if (rc) return rc;
+    rc = ornament_gpu_ctx_vit_f32(ctx, tsc, msc, Kp, M, nj, d_strand, starts, lengths, n, out);
     ornament_gpu_ctx_destroy(ctx);
     return rc;
 }

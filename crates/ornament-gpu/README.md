@@ -34,10 +34,15 @@ See [`DESIGN.md`](DESIGN.md) for where the work is heaviest and the producer/con
 - [x] **Larger dynamic shared (~164 KB opt-in) + block-size dispatch {128/64/32}**: 4226/4227 Rfam
       models now run on shared memory (only M=3401 falls back). M336-999 bucket 19× faster, total
       Rfam sweep 3.5× faster (23.6→6.8 s). See DESIGN.md.
-- [ ] Warp-per-window — now scoped to just the ~10 M≥1000 models (still occupancy-starved at
-      bd=32); or leave those rRNA-scale models on the CPU filter.
-- [ ] Viterbi + Forward kernels (rest of the cascade).
-- [ ] Wire `GpuContext` into the `ornament-scfg` scan pipeline as an optional backend.
+- [x] Wired `GpuContext` into the `ornament-scfg` scan pipeline as an optional backend (the
+      `cuda` feature + `PipelineParams.gpu_msv` / `ORNAMENT_GPU=1`); GPU MSV pass-mask, CPU
+      Vit/Fwd/CYK on survivors, hits identical. `gpu_msv_pipeline_matches_cpu` passes on A30.
+- [x] Viterbi kernel (`viterbi_batch_kernel`): f32 max-plus M/I/D DP, one thread/window, global
+      scratch (6 rows/thread); parity vs scalar `viterbi_nats` (`gpu_viterbi_matches_scalar`).
+- [ ] Shared-memory / warp-per-window Viterbi (6× MSV's footprint; currently global-mem).
+- [ ] Forward kernel (last cascade stage; odds-space log-sum-exp, needs rescaling).
+- [ ] Warp-per-window MSV — scoped to the ~10 M≥1000 models; or leave those on the CPU filter.
+- [ ] Wire GPU Viterbi into the pipeline (after MSV survivors) once shared-mem Viterbi lands.
 - [ ] Wire into `ornament-scfg`'s scan pipeline as an optional backend.
 - [ ] Intra-DP (warp-per-window) for long models; multi-model batching.
 
