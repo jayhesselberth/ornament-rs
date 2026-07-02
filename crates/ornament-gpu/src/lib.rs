@@ -224,6 +224,19 @@ impl Tiles {
         t
     }
 
+    /// Append spans from one segment of a *concatenated* resident strand ([`DeviceStrand::upload_concat`]),
+    /// offsetting each 1-based span by the segment's residue `base` in the concatenation. This is how
+    /// tiles from many sequences/strands are **aggregated into one batch** so a single kernel launch
+    /// fills the GPU (a lone small sequence/model underfills it — see DESIGN.md). A tile stays within
+    /// its segment, so it never straddles a sequence boundary.
+    pub fn push_segment(&mut self, base: usize, spans: &[(usize, usize)]) {
+        for &(s, e) in spans {
+            debug_assert!(s >= 1 && e >= s, "1-based inclusive span, got ({s},{e})");
+            self.starts.push((base + s - 1) as i32);
+            self.lengths.push((e - s + 1) as i32);
+        }
+    }
+
     /// Number of windows.
     pub fn len(&self) -> usize {
         self.starts.len()
@@ -350,18 +363,20 @@ pub struct DeviceStrand {
 
 #[cfg(feature = "cuda")]
 impl DeviceStrand {
-    /// Upload a sentinel-padded 1-based `dsq` (as `Alphabet::digitize` returns). The surrounding
-    /// sentinels are stripped; the raw residues live on the device until this is dropped.
-    pub fn upload(dsq: &[Dsq]) -> Result<DeviceStrand, GpuError> {
-        if device_count()? == 0 {
-            return Err(GpuError::NoDevice);
-        }
-        // Strip the leading/trailing sentinel to get the raw residues.
-        let res: &[u8] = if dsq.len() >= 2 {
+    /// Strip a sentinel-padded 1-based `dsq` (as `Alphabet::digitize` returns) to its raw residues.
+    fn strip(dsq: &[Dsq]) -> &[u8] {
+        if dsq.len() >= 2 {
             &dsq[1..dsq.len() - 1]
         } else {
             &[]
-        };
+        }
+    }
+
+    /// Upload raw residues (no sentinels) to a fresh device buffer.
+    fn upload_raw(res: &[u8]) -> Result<DeviceStrand, GpuError> {
+        if device_count()? == 0 {
+            return Err(GpuError::NoDevice);
+        }
         let mut ptr: *mut core::ffi::c_void = core::ptr::null_mut();
         let rc = unsafe { ornament_gpu_strand_upload(res.as_ptr(), res.len() as i32, &mut ptr) };
         if rc != 0 {
@@ -371,6 +386,27 @@ impl DeviceStrand {
             ptr,
             len: res.len(),
         })
+    }
+
+    /// Upload a single sentinel-padded 1-based `dsq`. The sentinels are stripped; the raw residues
+    /// live on the device until this is dropped.
+    pub fn upload(dsq: &[Dsq]) -> Result<DeviceStrand, GpuError> {
+        Self::upload_raw(Self::strip(dsq))
+    }
+
+    /// Upload several sentinel-padded sequences **concatenated** into one resident buffer, returning
+    /// the strand plus the residue `base` offset of each segment. Tiles into segment `s` are built
+    /// with `Tiles::push_segment(bases[s], spans)`, so **one kernel launch scores tiles across all
+    /// segments** — the way to fill the GPU when a single sequence/model is too small (the ncu
+    /// "grid too small" case; see DESIGN.md). Each tile stays within its own segment.
+    pub fn upload_concat(segments: &[&[Dsq]]) -> Result<(DeviceStrand, Vec<usize>), GpuError> {
+        let mut res: Vec<u8> = Vec::new();
+        let mut bases: Vec<usize> = Vec::with_capacity(segments.len());
+        for seg in segments {
+            bases.push(res.len());
+            res.extend_from_slice(Self::strip(seg));
+        }
+        Ok((Self::upload_raw(&res)?, bases))
     }
 
     /// Residue length of the resident strand.
@@ -858,6 +894,50 @@ mod tests {
                 "f32(reuse) span {i}"
             );
             assert_eq!(ctx_u8[i].to_bits(), free_u8[i].to_bits(), "u8 span {i}");
+        }
+    }
+
+    /// Tile aggregation: scoring two segments concatenated into one resident strand (one kernel
+    /// launch, `push_segment` offsets) must give the same per-tile scores as scoring each segment
+    /// separately. This is the correctness guard for the GPU-fill optimization. Skips without a device.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn gpu_aggregation_matches_separate() {
+        let (prof, strand) = fixture();
+        match device_count() {
+            Ok(0) | Err(_) => return,
+            Ok(_) => {}
+        }
+        let bp = ByteMsvProfile::new(&prof);
+
+        // Two segments = the fixture strand and its first 600 residues (a distinct, shorter strand).
+        let seg_a = strand.clone();
+        let mut seg_b = strand[..602].to_vec(); // sentinel + 600 residues + ...
+        *seg_b.last_mut().unwrap() = ornament_alphabet::alphabet::SENTINEL;
+        let spans_a: &[(usize, usize)] = &[(1, 73), (200, 400), (900, 1200)];
+        let spans_b: &[(usize, usize)] = &[(1, 100), (300, 600)];
+
+        // Separate: two uploads, two batches.
+        let sa = DeviceStrand::upload(&seg_a).expect("a");
+        let sb = DeviceStrand::upload(&seg_b).expect("b");
+        let ra = msv_u8_nats_gpu(&bp, &sa, &Tiles::from_spans(spans_a)).expect("ra");
+        let rb = msv_u8_nats_gpu(&bp, &sb, &Tiles::from_spans(spans_b)).expect("rb");
+
+        // Aggregated: one concatenated upload, one batch with per-segment bases.
+        let (agg, bases) = DeviceStrand::upload_concat(&[&seg_a, &seg_b]).expect("concat");
+        let mut tiles = Tiles::default();
+        tiles.push_segment(bases[0], spans_a);
+        tiles.push_segment(bases[1], spans_b);
+        let ragg = msv_u8_nats_gpu(&bp, &agg, &tiles).expect("agg");
+
+        let expect: Vec<f32> = ra.iter().chain(rb.iter()).copied().collect();
+        assert_eq!(ragg.len(), expect.len());
+        for (i, (g, e)) in ragg.iter().zip(&expect).enumerate() {
+            assert_eq!(
+                g.to_bits(),
+                e.to_bits(),
+                "aggregated tile {i} differs from separate"
+            );
         }
     }
 

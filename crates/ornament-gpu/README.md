@@ -42,6 +42,11 @@ See [`DESIGN.md`](DESIGN.md) for where the work is heaviest and the producer/con
 - [x] **Shared-memory Viterbi** (`viterbi_batch_kernel_smem`): 3 in-place DP rows (2-pass:
       descending M/I, ascending D) + tables in shared; blockDim dispatch {128/64/32}. **57× the
       global kernel** (0.86→49.4 G cells/s), 0.1×→**7.0× one CPU core**; same parity test. See DESIGN.md.
+- [x] Tile aggregation (`DeviceStrand::upload_concat` + `Tiles::push_segment`): pack many
+      sequences/strands into one resident buffer + one launch (no kernel change — offsets already
+      work). Parity-tested (`gpu_aggregation_matches_separate`); `bench_agg` shows 178–469× over
+      per-sequence launches for many small sequences (eliminates per-launch overhead + fills the GPU).
+- [ ] Wire aggregation into the scan pipeline (both strands / all records per model in one launch).
 - [ ] Forward kernel (last cascade stage; odds-space log-sum-exp, needs rescaling).
 - [ ] Warp-per-window MSV — scoped to the ~10 M≥1000 models; or leave those on the CPU filter.
 - [ ] Wire GPU Viterbi into the pipeline (after MSV survivors) once shared-mem Viterbi lands.

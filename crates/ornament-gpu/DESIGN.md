@@ -160,6 +160,28 @@ too; DP rows interleaved to avoid bank conflicts; blockDim dispatched {128/64/32
   funnel (MSV→compact→Viterbi→Forward all on GPU) that avoids host round-trips. It is no longer a
   *regression* vs CPU (was 0.1×), which is what unblocks wiring it in.
 
+### Tile aggregation — filling the GPU (fix for the ncu underfill finding)
+
+ncu flagged that a lone small batch underfills the A30 (few blocks, ~0.2 waves). Because the kernel
+already indexes each tile by an arbitrary offset into a resident buffer, aggregation needs **no
+kernel change** — just host plumbing: `DeviceStrand::upload_concat(&[&[Dsq]])` packs many
+sequences/strands into one resident buffer (returning each segment's base), and
+`Tiles::push_segment(base, spans)` offsets each segment's tiles into it. One `GpuContext` call then
+scores tiles spanning all segments; each tile stays within its own segment. `bench_agg` (A30, many
+short sequences vs one model):
+
+| workload | separate (1 launch/seq) | aggregated (1 launch) | speedup |
+|----------|-------------------------|-----------------------|---------|
+| 256 × 4000 nt | 0.07 M tiles/s | 11.9 M tiles/s | **178×** |
+| 1024 × 2000 nt | 0.03 M tiles/s | 15.3 M tiles/s | **469×** |
+
+- The win is eliminating per-launch overhead (256–1024 tiny kernel launches + uploads → 1) *and*
+  filling the device. Bit-identical results (`gpu_aggregation_matches_separate`).
+- Directly targets the real pathology: an all-model / many-record scan issuing a tiny GPU batch per
+  (model, record, strand). *Not yet wired into the pipeline* — `cm_pipeline_search` still calls MSV
+  per strand; aggregating both strands (and, in the multi-model scan, all records) per model into
+  one launch is the follow-up.
+
 ### Profiling (A30, `examples/bench_msv.rs` with `BENCH_KERNEL`; nsys works, ncu blocked)
 
 Per-kernel throughput at 64 Mnt / 640k tiles, tRNA-scale model (M≈71):
