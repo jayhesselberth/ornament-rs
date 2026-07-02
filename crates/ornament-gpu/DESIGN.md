@@ -74,9 +74,26 @@ Stream A/B (chunk 32k) and chunk sweep (2 streams):
 - **57.6× one CPU core ⇒ ≈2.4× the full 24-core rayon CPU.** The GPU now genuinely beats the
   multicore CPU on this workload (tRNA-sized model). This is the result that makes offload viable.
 - Requires `(Kp + blockDim)*(M+1)` bytes of shared memory; the host launches the shared kernel only
-  when that fits in 48 KB (M ≲ 336 at blockDim 128 — covers most Rfam models) and falls back to the
-  global kernel for very long models. **Still to validate:** the full Rfam M distribution (many
-  models run larger; confirm the crossover and parity at scale — see README TODO).
+  when that fits in 48 KB (M ≲ 336 at blockDim 128) and falls back to the global kernel for very
+  long models.
+
+### All-Rfam validation (A30, `examples/sweep_rfam.rs`, full `Rfam.cm.gz` = 4227 models, 2 Mnt strand)
+
+- **4227/4227 models parsed + scored, 0 skipped, 0 parity failures** vs the CPU striped filter
+  (40 models spot-checked across the M range; max M = 3401). The kernel is correct across the
+  entire real collection, not just tRNA.
+- **Coverage: 4124/4227 (97.6%) fit the shared-mem kernel; 103 (M > 336) fall to the global
+  kernel.** So nearly all of Rfam gets the fast path today.
+- **The fallback is the bottleneck, quantified:** those 103 large models (2.4% of the collection)
+  consume ~19.6 s of the 28 s total kernel time — the `M336-999`/`M≥1000` buckets run at
+  0.13 / 0.03 M tiles/s, ~50–100× slower than the shared-mem buckets. This is the concrete,
+  data-driven case for **warp-per-window** (fix #3 extension): make large models use shared memory
+  cooperatively instead of the global fallback.
+- *Caveat:* per-bucket tiles/s here are **setup-dominated** — the sweep scores a small (20k-tile)
+  batch per model and each call re-allocates its streams + pinned buffers, which doesn't amortize.
+  The kernel's true ceiling is `bench_msv`'s 418 G cells/s. Next infra step: hoist the stream/
+  pinned-buffer setup out of the per-call path (a reusable device context) so many-model scans
+  don't pay it per model.
 
 ### Level 2 — on-device funnel (stream compaction)
 - MSV kernel writes a survivor mask → compact → Viterbi kernel consumes only survivors → compact

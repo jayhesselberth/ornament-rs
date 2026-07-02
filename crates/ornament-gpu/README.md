@@ -25,9 +25,12 @@ See [`DESIGN.md`](DESIGN.md) for where the work is heaviest and the producer/con
       kernel (18.7 → 418 G DP-cells/s on an A30), ≈2.4× the full 24-core CPU. Default when it fits
       in 48 KB shared (M ≲ 336 @ blockDim 128); falls back to the global kernel for very long models.
       `ORNAMENT_GPU_SMEM=0` forces global for A/B.
-- [ ] **Validate across the full Rfam CM collection** — sweep the real M distribution (many models
-      are large), confirm the shared/global crossover and parity at scale on a real genome.
-- [ ] Warp-per-window for long models (extend shared-mem past the 48 KB / M≈336 fallback).
+- [x] **Validated across the full Rfam CM collection** (`examples/sweep_rfam.rs`): 4227/4227 models
+      scored, 0 parity failures (max M=3401); 4124 (97.6%) fit shared-mem, 103 (M>336) fall to
+      global — and those 103 eat ~70% of kernel time. See DESIGN.md.
+- [ ] Warp-per-window for long models — the 103 fallback models are the measured bottleneck.
+- [ ] Reusable device context — hoist stream/pinned-buffer setup out of the per-call path so
+      many-model scans don't pay allocation per model.
 - [ ] Viterbi + Forward kernels (rest of the cascade).
 - [ ] Wire into `ornament-scfg`'s scan pipeline as an optional backend.
 - [ ] Intra-DP (warp-per-window) for long models; multi-model batching.
