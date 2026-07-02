@@ -1009,6 +1009,7 @@ dependencies = [
  "criterion",
  "flate2",
  "ornament-alphabet",
+ "ornament-gpu",
  "ornament-hmm",
  "rayon",
  "thiserror",

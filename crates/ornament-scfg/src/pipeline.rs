@@ -53,6 +53,11 @@ pub struct PipelineParams {
     pub f3: f64,
     /// Final CM stage: Inside (sum-over-parses) when `true`, CYK (best-parse) when `false`.
     pub do_inside: bool,
+    /// Offload the MSV prefilter to the GPU (batch all tiles of a strand in one kernel) when the
+    /// crate is built with the `cuda` feature and a device is available. A no-op otherwise, and
+    /// it never changes the reported hits: GPU MSV is bit-parity-equal to the CPU MSV filter, so
+    /// the survivor set (and thus the CM stage) is identical — only the prefilter runs faster.
+    pub gpu_msv: bool,
 }
 
 impl Default for PipelineParams {
@@ -62,6 +67,7 @@ impl Default for PipelineParams {
             f2: VIT_F2,
             f3: 1e-5,
             do_inside: false,
+            gpu_msv: false,
         }
     }
 }
@@ -134,6 +140,17 @@ pub fn cm_pipeline_search(
     let searched = 2.0 * l as f64;
     let do_inside = params.do_inside;
 
+    // GPU MSV prefilter: on only when built with `cuda` and requested (via the param or the
+    // `ORNAMENT_GPU=1` env override). Without the feature it's forced off; `strand_survivors`
+    // additionally falls back to the CPU filter if no device is available at runtime.
+    #[cfg(feature = "cuda")]
+    let use_gpu = params.gpu_msv || std::env::var("ORNAMENT_GPU").as_deref() == Ok("1");
+    #[cfg(not(feature = "cuda"))]
+    let use_gpu = {
+        let _ = params.gpu_msv;
+        false
+    };
+
     // Reverse-complement strand. A window survivor in revcomp coordinate `x` maps back to
     // original coordinate `L - x + 1`; the alignment's 5' end is the high coordinate, so a
     // hit `i..j` (i ≤ j in revcomp) is reported `i' > j'`, matching `cmsearch`.
@@ -145,7 +162,8 @@ pub fn cm_pipeline_search(
     // strands run concurrently via `rayon::join`. Output is order-independent: hits are sorted
     // below, so the result is identical regardless of thread count.
     let plus = || {
-        let (surv, nw) = strand_survivors(&msv, &vit, &filt, nj, &hmm, dsq, w, &params);
+        let (surv, nw) =
+            strand_survivors(&msv, &vit, &filt, nj, &hmm, &prof, dsq, w, &params, use_gpu);
         let hits: Vec<Hit> = surv
             .par_iter()
             .flat_map_iter(|&(s, e)| {
@@ -164,7 +182,8 @@ pub fn cm_pipeline_search(
         (surv, nw, hits)
     };
     let minus = || {
-        let (surv, nw) = strand_survivors(&msv, &vit, &filt, nj, &hmm, &rc, w, &params);
+        let (surv, nw) =
+            strand_survivors(&msv, &vit, &filt, nj, &hmm, &prof, &rc, w, &params, use_gpu);
         let hits: Vec<Hit> = surv
             .par_iter()
             .flat_map_iter(|&(s, e)| {
@@ -342,9 +361,11 @@ fn strand_survivors(
     filt: &fwdfilter::Profile,
     nj: f32,
     hmm: &P7Hmm,
+    prof: &P7Profile,
     dsq: &[Dsq],
     w: usize,
     params: &PipelineParams,
+    use_gpu: bool,
 ) -> (Vec<(usize, usize)>, usize) {
     let l = dsq.len().saturating_sub(2);
     let tile = (2 * w).max(1);
@@ -362,6 +383,12 @@ fn strand_survivors(
         start += step;
     }
 
+    // Optional GPU MSV prefilter: score every tile's MSV in one batched kernel and return the
+    // per-tile pass mask (indexed by tile position). `None` ⇒ score MSV per-tile on the CPU below.
+    // The mask is bit-parity-equal to the CPU filter, so survivors are unchanged; it just moves
+    // the cheapest, highest-volume stage off the CPU. Falls back to CPU if no device is available.
+    let msv_mask: Option<Vec<bool>> = gpu_msv_mask(prof, hmm, dsq, &tiles, params.f1, use_gpu);
+
     // Cascade each tile cheapest-first (HMMER's `cm_pipeline.c`): the uint8 MSV prunes the large
     // majority, its survivors pay for the striped Viterbi, and only *those* survivors pay for the
     // (costliest) striped Forward. Each task clones the length-independent profiles and resets
@@ -370,8 +397,13 @@ fn strand_survivors(
     let (f1, f2, f3) = (params.f1, params.f2, params.f3);
     let kept: Vec<Option<(usize, usize)>> = tiles
         .par_iter()
-        .map(|&(s, e)| {
-            if !msvfilter::passes(msv, hmm, dsq, s, e, f1) {
+        .enumerate()
+        .map(|(ti, &(s, e))| {
+            let msv_ok = match &msv_mask {
+                Some(mask) => mask[ti],                             // GPU batch decision
+                None => msvfilter::passes(msv, hmm, dsq, s, e, f1), // CPU per-tile
+            };
+            if !msv_ok {
                 return None; // MSV prefilter pruned this tile
             }
             if viterbi_pvalue(hmm, vitfilter::window_bits(vit, nj, dsq, s, e)) > f2 {
@@ -392,6 +424,54 @@ fn strand_survivors(
         push_merge(&mut survivors, ps, pe);
     }
     (survivors, tiles.len())
+}
+
+/// GPU MSV pass mask for `tiles` (1-based inclusive spans into `dsq`): one batched kernel over the
+/// whole strand, returning per-tile `P_MSV ≤ f1`. `None` when GPU is off/unbuilt or unavailable at
+/// runtime, so the caller uses the CPU per-tile filter. The mask matches the CPU MSV filter
+/// bit-for-bit (same uint8 recurrence + `msv_pvalue`), so it never changes the survivor set.
+#[cfg(feature = "cuda")]
+fn gpu_msv_mask(
+    prof: &P7Profile,
+    hmm: &P7Hmm,
+    dsq: &[Dsq],
+    tiles: &[(usize, usize)],
+    f1: f64,
+    use_gpu: bool,
+) -> Option<Vec<bool>> {
+    use ornament_hmm::msv_pvalue;
+    if !use_gpu || tiles.is_empty() {
+        return None;
+    }
+    // Any failure (no device, alloc error) → None → graceful CPU fallback.
+    let bp = ornament_gpu::ByteMsvProfile::new(prof);
+    let strand = ornament_gpu::DeviceStrand::upload(dsq).ok()?;
+    let ctx = ornament_gpu::GpuContext::new().ok()?;
+    let gtiles = ornament_gpu::Tiles::from_spans(tiles);
+    let raw = ctx.msv_u8_nats(&bp, &strand, &gtiles).ok()?;
+    Some(
+        tiles
+            .iter()
+            .zip(raw)
+            .map(|(&(s, e), r)| {
+                let bits = ornament_gpu::nats_to_bits(r, e - s + 1);
+                msv_pvalue(hmm, bits) <= f1
+            })
+            .collect(),
+    )
+}
+
+/// No-CUDA stub: always `None`, so the pipeline uses the CPU MSV filter.
+#[cfg(not(feature = "cuda"))]
+fn gpu_msv_mask(
+    _prof: &P7Profile,
+    _hmm: &P7Hmm,
+    _dsq: &[Dsq],
+    _tiles: &[(usize, usize)],
+    _f1: f64,
+    _use_gpu: bool,
+) -> Option<Vec<bool>> {
+    None
 }
 
 /// The p7 Forward filter, abstracted over its implementation: the striped-SSE odds-space

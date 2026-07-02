@@ -64,6 +64,7 @@ criterion = { version = "0.8", features = ["html_reports"] }
 ornament-alphabet = { path = "crates/ornament-alphabet" }
 ornament-stats = { path = "crates/ornament-stats" }
 ornament-hmm = { path = "crates/ornament-hmm" }
+ornament-gpu = { path = "crates/ornament-gpu" }
 ornament-scfg = { path = "crates/ornament-scfg" }
 ornament-core = { path = "crates/ornament-core" }
 

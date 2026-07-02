@@ -14,9 +14,16 @@ bench = false
 [dependencies]
 ornament-alphabet = { workspace = true }
 ornament-hmm = { workspace = true }
+ornament-gpu = { workspace = true, optional = true }
 thiserror = { workspace = true }
 rayon = { workspace = true }
 flate2 = { workspace = true }
+
+[features]
+# GPU-accelerated MSV prefilter (CUDA). Off by default so the workspace builds without a CUDA
+# toolchain; enabling it pulls in ornament-gpu's `cuda` feature (nvcc + libcudart). The final
+# hits are unchanged — GPU MSV is bit-parity-equal to the CPU MSV filter it replaces.
+cuda = ["dep:ornament-gpu", "ornament-gpu/cuda"]
 
 [dev-dependencies]
 criterion = { workspace = true }
