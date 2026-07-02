@@ -1,0 +1,26 @@
+[package]
+name = "ornament-gpu"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "CUDA-accelerated p7 filter kernels for the all-model / many-genomes scan (prototype)"
+
+# The `cuda` feature is OFF by default so the crate — and the whole workspace — builds on hosts
+# without an nvcc toolchain (login nodes). With `--features cuda`, build.rs compiles kernels/*.cu
+# with nvcc and links the CUDA runtime; only then are the GPU code paths present. The CPU
+# reference and the parity harness build unconditionally.
+[features]
+default = []
+cuda = []
+
+[dependencies]
+ornament-alphabet = { path = "../ornament-alphabet" }
+ornament-hmm = { path = "../ornament-hmm" }
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+ornament-scfg = { path = "../ornament-scfg" }

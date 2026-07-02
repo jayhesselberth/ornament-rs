@@ -254,3 +254,37 @@ fn measure_filter_prune_rates_matches_pipeline_tiling() {
     // The three strong tRNAs must clear every filter.
     assert!(m.n_fwd_pass >= 1 && m.n_msv_pass >= 1 && m.n_vit_pass >= 1);
 }
+
+/// GPU MSV backend parity: running the pipeline with `gpu_msv = true` must return exactly the
+/// same hits as the CPU MSV path. GPU MSV is bit-parity-equal to the CPU MSV filter, so it can
+/// only reproduce the same survivor set — this guards the pipeline integration end-to-end. On a
+/// host with no CUDA device the GPU path transparently falls back to the CPU filter, so both runs
+/// are identical there too (the test then trivially holds; it does real work on a `compgpu` node).
+#[cfg(feature = "cuda")]
+#[test]
+fn gpu_msv_pipeline_matches_cpu() {
+    let cm = load_cm();
+    let abc = Alphabet::rna();
+    let fa = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/trna_multi.fa");
+    let dsq = abc
+        .digitize(&read_fasta(fa).expect("read fasta")[0].seq)
+        .expect("digitize");
+    let w = cm.w as usize;
+
+    let cpu_params = PipelineParams::default();
+    let gpu_params = PipelineParams {
+        gpu_msv: true,
+        ..PipelineParams::default()
+    };
+    let (cpu_hits, cpu_stats) = cm_pipeline_search(&cm, &dsq, w, 20.0, cpu_params).expect("cpu");
+    let (gpu_hits, gpu_stats) = cm_pipeline_search(&cm, &dsq, w, 20.0, gpu_params).expect("gpu");
+
+    // Same survivors (the MSV mask is identical), hence identical hits.
+    assert_eq!(
+        cpu_stats.n_survivors, gpu_stats.n_survivors,
+        "survivor count: cpu {} vs gpu {}",
+        cpu_stats.n_survivors, gpu_stats.n_survivors
+    );
+    assert_same_hits(&gpu_hits, &cpu_hits);
+    assert_same_hits(&cpu_hits, &gpu_hits);
+}

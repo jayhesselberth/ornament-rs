@@ -53,6 +53,11 @@ pub struct PipelineParams {
     pub f3: f64,
     /// Final CM stage: Inside (sum-over-parses) when `true`, CYK (best-parse) when `false`.
     pub do_inside: bool,
+    /// Offload the MSV prefilter to the GPU (batch all tiles of a strand in one kernel) when the
+    /// crate is built with the `cuda` feature and a device is available. A no-op otherwise, and
+    /// it never changes the reported hits: GPU MSV is bit-parity-equal to the CPU MSV filter, so
+    /// the survivor set (and thus the CM stage) is identical — only the prefilter runs faster.
+    pub gpu_msv: bool,
 }
 
 impl Default for PipelineParams {
@@ -62,6 +67,7 @@ impl Default for PipelineParams {
             f2: VIT_F2,
             f3: 1e-5,
             do_inside: false,
+            gpu_msv: false,
         }
     }
 }
@@ -136,16 +142,49 @@ pub fn cm_pipeline_search(
 
     // Reverse-complement strand. A window survivor in revcomp coordinate `x` maps back to
     // original coordinate `L - x + 1`; the alignment's 5' end is the high coordinate, so a
-    // hit `i..j` (i ≤ j in revcomp) is reported `i' > j'`, matching `cmsearch`.
+    // hit `i..j` (i ≤ j in revcomp) is reported `i' > j'`, matching `cmsearch`. Same length `l`,
+    // so both strands tile identically.
     let mut rc = dsq.to_vec();
     cm.abc.revcomp(&mut rc)?;
+
+    // Tile spans (1-based inclusive), shared by both strands.
+    let tiles = enumerate_tiles(l, w);
+
+    // GPU MSV prefilter, computed for BOTH strands in ONE aggregated launch (the two strands are
+    // concatenated on-device and all tiles scored together) — halves the per-model GPU launches vs
+    // one call per strand and fills the device better. Enabled only with the `cuda` feature and when
+    // requested (`PipelineParams.gpu_msv` or `ORNAMENT_GPU=1`). `None` ⇒ each strand scores MSV
+    // per-tile on the CPU. The mask is bit-parity-equal to the CPU filter, so survivors (and the
+    // reported hits) are identical; falls back to CPU if no device is available at runtime.
+    #[cfg(feature = "cuda")]
+    let (plus_mask, minus_mask): (Option<Vec<bool>>, Option<Vec<bool>>) = {
+        let use_gpu = params.gpu_msv || std::env::var("ORNAMENT_GPU").as_deref() == Ok("1");
+        gpu_msv_mask_bothstrands(&prof, &hmm, dsq, &rc, &tiles, params.f1, use_gpu)
+            .map_or((None, None), |(p, m)| (Some(p), Some(m)))
+    };
+    #[cfg(not(feature = "cuda"))]
+    let (plus_mask, minus_mask): (Option<Vec<bool>>, Option<Vec<bool>>) = {
+        let _ = params.gpu_msv;
+        (None, None)
+    };
 
     // Each strand filters its survivors then CM-scans each survivor window; the windows are
     // independent (a hit reads only its own span), so they're scanned in parallel and the two
     // strands run concurrently via `rayon::join`. Output is order-independent: hits are sorted
     // below, so the result is identical regardless of thread count.
     let plus = || {
-        let (surv, nw) = strand_survivors(&msv, &vit, &filt, nj, &hmm, dsq, w, &params);
+        let (surv, nw) = strand_survivors(
+            &msv,
+            &vit,
+            &filt,
+            nj,
+            &hmm,
+            dsq,
+            w,
+            &params,
+            &tiles,
+            plus_mask.as_deref(),
+        );
         let hits: Vec<Hit> = surv
             .par_iter()
             .flat_map_iter(|&(s, e)| {
@@ -164,7 +203,18 @@ pub fn cm_pipeline_search(
         (surv, nw, hits)
     };
     let minus = || {
-        let (surv, nw) = strand_survivors(&msv, &vit, &filt, nj, &hmm, &rc, w, &params);
+        let (surv, nw) = strand_survivors(
+            &msv,
+            &vit,
+            &filt,
+            nj,
+            &hmm,
+            &rc,
+            w,
+            &params,
+            &tiles,
+            minus_mask.as_deref(),
+        );
         let hits: Vec<Hit> = surv
             .par_iter()
             .flat_map_iter(|&(s, e)| {
@@ -329,28 +379,12 @@ fn parse_filter_hmm(cm: &Cm) -> Result<P7Hmm, InfernalError> {
     parse_p7_hmm(text).map_err(|e| InfernalError::Parse(format!("filter HMM: {e}")))
 }
 
-/// Filter one strand through the full MSV → Viterbi → Forward cascade and return the merged,
-/// W-padded survivor windows (1-based inclusive `(start, end)` in this strand's coordinates)
-/// plus the number of tiles scored.
-///
-/// Tiling is length `2W`, step `W` (overlap `W`) so every length-`≤W` hit is contained in
-/// at least one tile. Survivors are padded by `W` and merged into maximal disjoint regions.
-#[allow(clippy::too_many_arguments)]
-fn strand_survivors(
-    msv: &msvfilter::Profile,
-    vit: &vitfilter::Profile,
-    filt: &fwdfilter::Profile,
-    nj: f32,
-    hmm: &P7Hmm,
-    dsq: &[Dsq],
-    w: usize,
-    params: &PipelineParams,
-) -> (Vec<(usize, usize)>, usize) {
-    let l = dsq.len().saturating_sub(2);
+/// Enumerate the tile spans (1-based inclusive) for a strand of length `l`: length `2W`, step `W`
+/// (overlap `W`), so every length-`≤W` hit is contained in at least one tile. Deterministic,
+/// left-to-right (the survivor merge assumes non-decreasing `start`). Both strands share this.
+fn enumerate_tiles(l: usize, w: usize) -> Vec<(usize, usize)> {
     let tile = (2 * w).max(1);
     let step = w.max(1);
-
-    // Enumerate the tile spans (1-based inclusive) left-to-right, deterministically.
     let mut tiles: Vec<(usize, usize)> = Vec::new();
     let mut start = 1usize;
     loop {
@@ -361,17 +395,43 @@ fn strand_survivors(
         }
         start += step;
     }
+    tiles
+}
 
-    // Cascade each tile cheapest-first (HMMER's `cm_pipeline.c`): the uint8 MSV prunes the large
-    // majority, its survivors pay for the striped Viterbi, and only *those* survivors pay for the
-    // (costliest) striped Forward. Each task clones the length-independent profiles and resets
-    // only their length model, so tiles run in parallel without contention; the order-preserving
-    // collect keeps the subsequent merge (assumes non-decreasing `start`) deterministic.
+/// Filter one strand through the full MSV → Viterbi → Forward cascade and return the merged,
+/// W-padded survivor windows (1-based inclusive `(start, end)` in this strand's coordinates)
+/// plus the number of tiles scored. `tiles` is the shared span list ([`enumerate_tiles`]);
+/// `msv_mask`, when `Some`, is the precomputed per-tile MSV pass decision (from the GPU batch) —
+/// otherwise MSV is scored per-tile on the CPU. Survivors are padded by `W` and merged.
+#[allow(clippy::too_many_arguments)]
+fn strand_survivors(
+    msv: &msvfilter::Profile,
+    vit: &vitfilter::Profile,
+    filt: &fwdfilter::Profile,
+    nj: f32,
+    hmm: &P7Hmm,
+    dsq: &[Dsq],
+    w: usize,
+    params: &PipelineParams,
+    tiles: &[(usize, usize)],
+    msv_mask: Option<&[bool]>,
+) -> (Vec<(usize, usize)>, usize) {
+    let l = dsq.len().saturating_sub(2);
+
+    // Cascade each tile cheapest-first (HMMER's `cm_pipeline.c`): MSV prunes the large majority
+    // (from the precomputed GPU mask, or scored per-tile on the CPU), its survivors pay for the
+    // striped Viterbi, and only *those* pay for the (costliest) striped Forward. Tiles run in
+    // parallel; the order-preserving collect keeps the merge (assumes non-decreasing `start`) sound.
     let (f1, f2, f3) = (params.f1, params.f2, params.f3);
     let kept: Vec<Option<(usize, usize)>> = tiles
         .par_iter()
-        .map(|&(s, e)| {
-            if !msvfilter::passes(msv, hmm, dsq, s, e, f1) {
+        .enumerate()
+        .map(|(ti, &(s, e))| {
+            let msv_ok = match msv_mask {
+                Some(mask) => mask[ti],                             // GPU batch decision
+                None => msvfilter::passes(msv, hmm, dsq, s, e, f1), // CPU per-tile
+            };
+            if !msv_ok {
                 return None; // MSV prefilter pruned this tile
             }
             if viterbi_pvalue(hmm, vitfilter::window_bits(vit, nj, dsq, s, e)) > f2 {
@@ -392,6 +452,44 @@ fn strand_survivors(
         push_merge(&mut survivors, ps, pe);
     }
     (survivors, tiles.len())
+}
+
+/// GPU MSV pass masks for both strands in ONE aggregated launch: the plus and minus strands (same
+/// length, same `tiles`) are concatenated on-device and all `2·|tiles|` windows scored together,
+/// then split into per-strand masks (`P_MSV ≤ f1`). `None` when GPU is off or unavailable at
+/// runtime, so the caller uses the CPU per-tile filter. Bit-parity-equal to the CPU MSV filter
+/// (same uint8 recurrence + `msv_pvalue`), so survivors — and reported hits — never change.
+#[cfg(feature = "cuda")]
+fn gpu_msv_mask_bothstrands(
+    prof: &P7Profile,
+    hmm: &P7Hmm,
+    plus: &[Dsq],
+    minus: &[Dsq],
+    tiles: &[(usize, usize)],
+    f1: f64,
+    use_gpu: bool,
+) -> Option<(Vec<bool>, Vec<bool>)> {
+    use ornament_hmm::msv_pvalue;
+    if !use_gpu || tiles.is_empty() {
+        return None;
+    }
+    // Any failure (no device, alloc error) → None → graceful CPU fallback.
+    let bp = ornament_gpu::ByteMsvProfile::new(prof);
+    let (strand, bases) = ornament_gpu::DeviceStrand::upload_concat(&[plus, minus]).ok()?;
+    let ctx = ornament_gpu::GpuContext::new().ok()?;
+    let mut gtiles = ornament_gpu::Tiles::default();
+    gtiles.push_segment(bases[0], tiles); // plus
+    gtiles.push_segment(bases[1], tiles); // minus
+    let raw = ctx.msv_u8_nats(&bp, &strand, &gtiles).ok()?;
+    let n = tiles.len();
+    let to_mask = |slice: &[f32]| -> Vec<bool> {
+        slice
+            .iter()
+            .zip(tiles)
+            .map(|(&r, &(s, e))| msv_pvalue(hmm, ornament_gpu::nats_to_bits(r, e - s + 1)) <= f1)
+            .collect()
+    };
+    Some((to_mask(&raw[..n]), to_mask(&raw[n..])))
 }
 
 /// The p7 Forward filter, abstracted over its implementation: the striped-SSE odds-space

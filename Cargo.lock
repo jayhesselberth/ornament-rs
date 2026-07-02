@@ -982,6 +982,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "ornament-gpu"
+version = "0.1.0"
+dependencies = [
+ "ornament-alphabet",
+ "ornament-hmm",
+ "ornament-scfg",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
 name = "ornament-hmm"
 version = "0.1.0"
 dependencies = [
@@ -998,6 +1009,7 @@ dependencies = [
  "criterion",
  "flate2",
  "ornament-alphabet",
+ "ornament-gpu",
  "ornament-hmm",
  "rayon",
  "thiserror",

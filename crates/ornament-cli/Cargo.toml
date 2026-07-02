@@ -10,6 +10,11 @@ authors.workspace = true
 name = "ornament"
 path = "src/main.rs"
 
+[features]
+# GPU-accelerated scan filtering (propagates to ornament-scfg's `cuda`). Build with
+# `--features cuda` on a CUDA node; enable at runtime with `ORNAMENT_GPU=1` (or the pipeline flag).
+cuda = ["ornament-core/cuda"]
+
 [dependencies]
 ornament-core = { workspace = true }
 clap = { workspace = true }
