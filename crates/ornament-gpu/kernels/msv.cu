@@ -330,6 +330,7 @@ struct GpuCtx {
     float*       h_out[MAX_STREAMS];
     void*        d_emit;                 // reusable emission table (msc/rbv), grows on demand
     size_t       emit_cap;               // bytes
+    int          smem_optin;             // opted-in per-block dynamic-shared max (bytes) for the u8 kernel
 };
 
 // Grow a device buffer to at least `need` bytes (free + realloc only when it must grow).
@@ -382,6 +383,28 @@ extern "C" int ornament_gpu_ctx_create(int streams, int chunk, void** out) {
         if ((rc = (int)cudaHostAlloc(&c->h_len[s], (size_t)chunk * sizeof(int), cudaHostAllocDefault))) goto fail;
         if ((rc = (int)cudaHostAlloc(&c->h_out[s], (size_t)chunk * sizeof(float), cudaHostAllocDefault))) goto fail;
     }
+
+    // Opt the shared-memory u8 kernel into the device's larger per-block dynamic-shared limit
+    // (sm_80: ~164 KB vs the 48 KB static default), so longer models can still run on shared
+    // memory. Best-effort: on any failure keep the safe 48 KB budget. Device 0 (single-GPU runs).
+    {
+        int optin = 48 * 1024;
+        int dev = 0;
+        cudaGetDevice(&dev);
+        int attr = 0;
+        if (cudaDeviceGetAttribute(&attr, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev)
+                == cudaSuccess
+            && attr > optin
+            && cudaFuncSetAttribute((const void*)msv_u8_batch_kernel_smem,
+                                    cudaFuncAttributeMaxDynamicSharedMemorySize, attr)
+                   == cudaSuccess) {
+            optin = attr;
+        } else {
+            cudaGetLastError(); // clear any sticky error from the probe
+        }
+        c->smem_optin = optin;
+    }
+
     *out = c;
     return 0;
 fail:
@@ -404,6 +427,7 @@ static int ctx_stream_run(
     int          n,
     int          M,
     size_t       elem_size,   // scratch bytes per DP cell (global-kernel fallback only)
+    int          threads,     // block size (chosen by the caller: 128 for f32/global, ≤128 for u8 smem)
     const int*   starts,
     const int*   lengths,
     float*       out,
@@ -438,8 +462,7 @@ static int ctx_stream_run(
                                  cudaMemcpyHostToDevice, ctx->stream[s]))) return (int)e;
         if ((e = cudaMemcpyAsync(ctx->d_len[s], ctx->h_len[s], (size_t)cn * sizeof(int),
                                  cudaMemcpyHostToDevice, ctx->stream[s]))) return (int)e;
-        int threads = 128;
-        int blocks  = (cn + threads - 1) / threads;
+        int blocks = (cn + threads - 1) / threads;
         launch(ctx->stream[s], blocks, threads, ctx->d_off[s], ctx->d_len[s], cn,
                ctx->d_scr[s], ctx->d_out[s]);
         if ((e = cudaGetLastError())) return (int)e;
@@ -484,13 +507,24 @@ extern "C" int ornament_gpu_ctx_msv_f32(
     const float* d_msc = (const float*)ctx->d_emit;
 
     return ctx_stream_run(
-        ctx, n, M, sizeof(float), starts, lengths, out,
+        ctx, n, M, sizeof(float), 128, starts, lengths, out,
         [=](cudaStream_t st, int blocks, int threads,
             const int* d_off, const int* d_len, int cn, void* d_scr, float* d_out) {
             msv_batch_kernel<<<blocks, threads, 0, st>>>(
                 d_msc, Kp, M, (const uint8_t*)d_strand, d_off, d_len, cn,
                 (float*)d_scr, d_out);
         });
+}
+
+// Pick the block size for the shared-memory uint8 kernel: the largest of {128,64,32} whose
+// footprint `(Kp+bd)*(M+1)` fits the opted-in shared limit. Smaller blocks cover longer models
+// (fewer per-block DP rows) at the cost of occupancy — still far faster than the global kernel.
+// Returns 0 if even 32 threads won't fit (caller falls back to the global kernel).
+static int pick_u8_threads(int Kp, int M, size_t smem_limit) {
+    for (int bd = 128; bd >= 32; bd >>= 1) {
+        if ((size_t)(Kp + bd) * (M + 1) <= smem_limit) return bd;
+    }
+    return 0;
 }
 
 // Reduced-precision (uint8) MSV over a resident strand, using a reusable context. rbv: Kp*(M+1)
@@ -521,19 +555,23 @@ extern "C" int ornament_gpu_ctx_msv_u8(
     const uint8_t* d_rbv = (const uint8_t*)ctx->d_emit;
 
     int use_smem = env_int("ORNAMENT_GPU_SMEM", 1, 0, 1);
-    const size_t SMEM_LIMIT = 48 * 1024;   // sm_80 default per-block shared without opt-in
+    // Shared-mem budget = the context's opted-in per-block max (sm_80: ~164 KB vs 48 KB default),
+    // set once at ctx_create. Choose the largest block size that fits; 0 ⇒ use the global kernel.
+    size_t smem_limit = (size_t)ctx->smem_optin;
+    int smem_threads = use_smem ? pick_u8_threads(Kp, M, smem_limit) : 0;
+    int threads = smem_threads ? smem_threads : 128;
 
     return ctx_stream_run(
-        ctx, n, M, sizeof(uint8_t), starts, lengths, out,
-        [=](cudaStream_t st, int blocks, int threads,
+        ctx, n, M, sizeof(uint8_t), threads, starts, lengths, out,
+        [=](cudaStream_t st, int blocks, int th,
             const int* d_off, const int* d_len, int cn, void* d_scr, float* d_out) {
-            size_t shmem = (size_t)(Kp + threads) * (M + 1);
-            if (use_smem && shmem <= SMEM_LIMIT) {
-                msv_u8_batch_kernel_smem<<<blocks, threads, shmem, st>>>(
+            if (smem_threads) {
+                size_t shmem = (size_t)(Kp + th) * (M + 1);
+                msv_u8_batch_kernel_smem<<<blocks, th, shmem, st>>>(
                     d_rbv, Kp, M, scale_b, base_b, bias_b, tbm_b, tec_b,
                     (const uint8_t*)d_strand, d_off, d_len, cn, d_out);
             } else {
-                msv_u8_batch_kernel<<<blocks, threads, 0, st>>>(
+                msv_u8_batch_kernel<<<blocks, th, 0, st>>>(
                     d_rbv, Kp, M, scale_b, base_b, bias_b, tbm_b, tec_b,
                     (const uint8_t*)d_strand, d_off, d_len, cn, (uint8_t*)d_scr, d_out);
             }

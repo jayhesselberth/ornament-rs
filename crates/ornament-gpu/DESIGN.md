@@ -108,7 +108,33 @@ Re-running the sweep with one shared context (A30, same 4227 models):
   real kernel throughput. This is the path many-model scans (and pipeline integration) must use.
 - **The 103 global-fallback models (M>336) now consume 82% of total kernel time (19.5 s of 23.6 s).**
   With setup removed, the long-model fallback is unambiguously *the* remaining bottleneck →
-  warp-per-window (fix #3).
+  larger-shared + block-size dispatch (below).
+
+### Larger dynamic shared + block-size dispatch — long models onto shared memory
+
+`GpuContext` opts the u8 shared kernel into the device's larger per-block dynamic-shared limit
+(sm_80: ~164 KB via `cudaFuncSetAttribute`, vs the 48 KB default), and the u8 dispatch picks the
+largest block size in {128, 64, 32} whose `(Kp+bd)*(M+1)` fits (smaller blocks hold fewer per-block
+DP rows → cover longer models, at lower occupancy). At 164 KB even 32-thread blocks reach M≈3337,
+so **4226/4227 Rfam models now run on shared memory** (only M=3401 falls back). Re-running the
+sweep (A30, reusable context):
+
+| bucket (M) | 48 KB / bd=128 only | 164 KB + bd dispatch |
+|-----------|---------------------|----------------------|
+| M<100 | 27.0 M tiles/s | 26.8 M |
+| M100-199 | 16.2 M | 16.1 M |
+| M200-335 | 9.2 M | 9.2 M |
+| M336-999 (was global) | 0.14 M | **2.68 M (19×)** |
+| M≥1000 (was global) | 0.03 M | **0.10 M (3.3×)** |
+| **total kernel time** | 23.6 s | **6.8 s (3.5× overall)** |
+
+- The two long-model buckets were the 82% bottleneck; moving them onto shared memory cut total
+  sweep time 3.5×. Parity still clean (0 failures across the 40-model spot-check incl. large M).
+- The `M≥1000` bucket (10 models) is still slow (0.10 M tiles/s): at bd=32 with ~164 KB shared it's
+  ~1 block / 32 threads per SM — correct but occupancy-starved. **This is the real (now narrow)
+  warp-per-window case:** keep block size high and split one window's DP row across a warp's lanes,
+  instead of one thread owning the whole row. Only ~10 Rfam models need it; the rest are already
+  fast. (Those rRNA-scale models could also simply stay on the CPU filter.)
 
 ### Level 2 — on-device funnel (stream compaction)
 - MSV kernel writes a survivor mask → compact → Viterbi kernel consumes only survivors → compact

@@ -44,8 +44,14 @@ fn main() {
     let parity_n = env_usize("SWEEP_PARITY", 40);
     let max_models = env_usize("SWEEP_MAX_MODELS", usize::MAX);
     let smem_off = std::env::var("ORNAMENT_GPU_SMEM").as_deref() == Ok("0");
-    // Shared kernel fits when (Kp + blockDim)*(M+1) <= 48 KiB; blockDim = 128 (kernel default).
-    let smem_fits = |m: usize, kp: usize| (kp + 128) * (m + 1) <= 48 * 1024;
+    // Mirror the kernel's real dispatch: the context opts into the sm_80 ~164 KB per-block shared
+    // limit and picks the largest block size {128,64,32} whose (Kp+bd)*(M+1) fits — so a model runs
+    // on shared memory unless even 32 threads overflow ~164 KB. (166912 = A30 opt-in max.)
+    let smem_fits = |m: usize, kp: usize| {
+        [128usize, 64, 32]
+            .iter()
+            .any(|&bd| (kp + bd) * (m + 1) <= 166_912)
+    };
 
     match ornament_gpu::device_count() {
         Ok(0) | Err(_) => {
